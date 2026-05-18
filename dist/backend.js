@@ -597,7 +597,7 @@ function parseLiteralValue(raw) {
 }
 
 // src/core/diagnostics.ts
-var VSH_VISHRUN_DIAG = true;
+var VSH_VISHRUN_DIAG = false;
 
 // src/backend/mvu-parser.ts
 function emptyMvuData() {

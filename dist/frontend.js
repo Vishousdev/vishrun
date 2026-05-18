@@ -320,7 +320,7 @@ function expand(html, script, allScripts, processing, depth) {
 }
 
 // src/core/diagnostics.ts
-var VSH_VISHRUN_DIAG = true;
+var VSH_VISHRUN_DIAG = false;
 
 // src/core/asset-injector.ts
 function isFetchExternalResponse(p, requestId) {
@@ -1363,35 +1363,6 @@ window.errorCatched = function(fn){
 
 // src/render/size-reporter.ts
 function buildSizeReporterShell() {
-  const diagPerChildCollect = VSH_VISHRUN_DIAG ? `
-        if (i < 6) {
-          var diagCls = String(child.className || '');
-          if (diagCls.length > 40) diagCls = diagCls.slice(0, 40) + '…';
-          childRectInfo.push({
-            tag: child.tagName,
-            cls: diagCls,
-            rectBottom: rect.bottom,
-            scrollY: window.scrollY,
-            marginBottom: marginBottom,
-            shadowDown: shadowDown,
-            computedBottom: bottom
-          });
-        }` : "";
-  const diagInit = VSH_VISHRUN_DIAG ? "var childRectInfo = [];" : "";
-  const diagEmit = VSH_VISHRUN_DIAG ? `
-      var diagDeltas = [];
-      for (var dj = 1; dj < history.length; dj++) diagDeltas.push(history[dj] - history[dj - 1]);
-      try {
-        console.log('[vishrun:size-reporter] tick', {
-          bodyChildCount: children.length,
-          childRects: childRectInfo,
-          bodyScrollHeight: document.body.scrollHeight,
-          computedHeight: h,
-          historyTail: history.slice(),
-          deltas: diagDeltas,
-          pinned: pinned
-        });
-      } catch (e) {}` : "";
   return `
 <script>
 (function() {
@@ -1403,7 +1374,6 @@ function buildSizeReporterShell() {
       if (!document.body) return;
       var maxBottom = 0;
       var children = document.body.children;
-      ${diagInit}
       for (var i = 0; i < children.length; i++) {
         var child = children[i];
         var rect = child.getBoundingClientRect();
@@ -1423,7 +1393,7 @@ function buildSizeReporterShell() {
           }
         }
         var bottom = rect.bottom + window.scrollY + marginBottom + shadowDown;
-        if (bottom > maxBottom) maxBottom = bottom;${diagPerChildCollect}
+        if (bottom > maxBottom) maxBottom = bottom;
       }
       if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
       var h = Math.ceil(maxBottom) + 4;
@@ -1436,11 +1406,9 @@ function buildSizeReporterShell() {
         var dd3 = history[3] - history[2];
         if (dd1 !== 0 && dd1 === dd2 && dd2 === dd3) {
           pinned = true;
+          return;
         }
       }
-${diagEmit}
-
-      if (pinned) return;
 
       if (window.spindleSandbox && typeof window.spindleSandbox.requestResize === 'function') {
         window.spindleSandbox.requestResize(h);
