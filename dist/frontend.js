@@ -1361,6 +1361,184 @@ window.errorCatched = function(fn){
 })();</script>`;
 }
 
+// src/render/size-reporter.ts
+function buildSizeReporterShell() {
+  const diagPerChildCollect = VSH_VISHRUN_DIAG ? `
+        if (i < 6) {
+          var diagCls = String(child.className || '');
+          if (diagCls.length > 40) diagCls = diagCls.slice(0, 40) + '…';
+          childRectInfo.push({
+            tag: child.tagName,
+            cls: diagCls,
+            rectBottom: rect.bottom,
+            scrollY: window.scrollY,
+            marginBottom: marginBottom,
+            shadowDown: shadowDown,
+            computedBottom: bottom
+          });
+        }` : "";
+  const diagInit = VSH_VISHRUN_DIAG ? "var childRectInfo = [];" : "";
+  const diagEmit = VSH_VISHRUN_DIAG ? `
+      var diagDeltas = [];
+      for (var dj = 1; dj < history.length; dj++) diagDeltas.push(history[dj] - history[dj - 1]);
+      try {
+        console.log('[vishrun:size-reporter] tick', {
+          bodyChildCount: children.length,
+          childRects: childRectInfo,
+          bodyScrollHeight: document.body.scrollHeight,
+          computedHeight: h,
+          historyTail: history.slice(),
+          deltas: diagDeltas,
+          pinned: pinned
+        });
+      } catch (e) {}` : "";
+  return `
+<script>
+(function() {
+  var history = [];
+  var pinned = false;
+  function postSize() {
+    if (pinned) return;
+    try {
+      if (!document.body) return;
+      var maxBottom = 0;
+      var children = document.body.children;
+      ${diagInit}
+      for (var i = 0; i < children.length; i++) {
+        var child = children[i];
+        var rect = child.getBoundingClientRect();
+        var cs = getComputedStyle(child);
+        var marginBottom = parseFloat(cs.marginBottom) || 0;
+        var shadowDown = 0;
+        var boxShadow = cs.boxShadow;
+        if (boxShadow && boxShadow !== 'none') {
+          var sm = boxShadow.match(/-?\\d+px\\s+(-?\\d+)px\\s+(-?\\d+)px(?:\\s+(-?\\d+)px)?/);
+          if (sm) {
+            var y = parseFloat(sm[1]) || 0;
+            if (y > 0) {
+              var blur = parseFloat(sm[2]) || 0;
+              var spread = parseFloat(sm[3] || '0') || 0;
+              shadowDown = y + blur + spread;
+            }
+          }
+        }
+        var bottom = rect.bottom + window.scrollY + marginBottom + shadowDown;
+        if (bottom > maxBottom) maxBottom = bottom;${diagPerChildCollect}
+      }
+      if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
+      var h = Math.ceil(maxBottom) + 4;
+
+      history.push(h);
+      if (history.length > 4) history.shift();
+      if (history.length === 4) {
+        var dd1 = history[1] - history[0];
+        var dd2 = history[2] - history[1];
+        var dd3 = history[3] - history[2];
+        if (dd1 !== 0 && dd1 === dd2 && dd2 === dd3) {
+          pinned = true;
+        }
+      }
+${diagEmit}
+
+      if (pinned) return;
+
+      if (window.spindleSandbox && typeof window.spindleSandbox.requestResize === 'function') {
+        window.spindleSandbox.requestResize(h);
+      }
+    } catch (e) {}
+  }
+  function init() {
+    postSize();
+    if (typeof ResizeObserver !== 'undefined' && document.body) {
+      try {
+        var ro = new ResizeObserver(postSize);
+        ro.observe(document.body);
+      } catch (e) {}
+    }
+    window.addEventListener('load', postSize);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>`;
+}
+
+// src/render/viewport-shim.ts
+var VIEWPORT_HEIGHT_PROPS = new Set(["min-height", "height"]);
+function buildViewportHeightShim() {
+  return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>" + buildRawViewportNeutralizerScript();
+}
+function buildRawViewportNeutralizerScript() {
+  return `<script>(function(){
+  function isLoopVal(v) {
+    if (typeof v !== 'string') return false;
+    var m = v.match(/^\\s*(\\d+(?:\\.\\d+)?)\\s*(vh|dvh|svh|lvh)\\s*$/i);
+    if (!m) return false;
+    var n = parseFloat(m[1]);
+    return isFinite(n) && n >= 100;
+  }
+  function neutralize(el, prop) {
+    try { el.style.setProperty(prop, 'auto', 'important'); } catch (e) {}
+  }
+  function scanInline() {
+    if (document.body) {
+      if (isLoopVal(document.body.style.minHeight)) neutralize(document.body, 'min-height');
+      if (isLoopVal(document.body.style.height)) neutralize(document.body, 'height');
+    }
+    var styled = document.querySelectorAll('[style]');
+    for (var i = 0; i < styled.length; i++) {
+      var el = styled[i];
+      if (isLoopVal(el.style.minHeight)) neutralize(el, 'min-height');
+      if (isLoopVal(el.style.height)) neutralize(el, 'height');
+    }
+  }
+  function walkRules(rules) {
+    if (!rules) return;
+    for (var j = 0; j < rules.length; j++) {
+      var rule = rules[j];
+      if (!rule) continue;
+      if (rule.cssRules && !rule.selectorText) {
+        try { walkRules(rule.cssRules); } catch (e) {}
+        continue;
+      }
+      if (!rule.style || !rule.selectorText) continue;
+      var mh = rule.style.getPropertyValue('min-height');
+      var h = rule.style.getPropertyValue('height');
+      var hitsMin = isLoopVal(mh);
+      var hitsH = isLoopVal(h);
+      if (!hitsMin && !hitsH) continue;
+      var matched;
+      try { matched = document.querySelectorAll(rule.selectorText); } catch (e) { continue; }
+      for (var k = 0; k < matched.length; k++) {
+        if (hitsMin) neutralize(matched[k], 'min-height');
+        if (hitsH) neutralize(matched[k], 'height');
+      }
+    }
+  }
+  function scanRules() {
+    var sheets = document.styleSheets;
+    for (var i = 0; i < sheets.length; i++) {
+      var rules;
+      try { rules = sheets[i].cssRules || sheets[i].rules; } catch (e) { continue; }
+      walkRules(rules);
+    }
+  }
+  function pass() {
+    try { scanInline(); } catch (e) {}
+    try { scanRules(); } catch (e) {}
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', pass, { once: true });
+  } else {
+    pass();
+  }
+  window.addEventListener('load', pass);
+})();</script>`;
+}
+
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
@@ -1547,7 +1725,7 @@ async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withoutCdnJQuery));
   const head = buildHeadInjection(iframeCtx);
   const withHead = injectIntoHead(stripped, head);
-  const shell = sizeReporterShell();
+  const shell = buildSizeReporterShell();
   const closeBody = withHead.lastIndexOf("</body>");
   if (closeBody >= 0) {
     return withHead.slice(0, closeBody) + shell + withHead.slice(closeBody);
@@ -1576,10 +1754,7 @@ function buildHeadInjection(iframeCtx) {
     messagesSnapshot: iframeCtx.messagesSnapshot
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
-}
-function viewportHeightShim() {
-  return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>";
+  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -1971,70 +2146,6 @@ function injectIntoHead(html, blob) {
     return html.slice(0, idx) + blob + html.slice(idx);
   }
   return blob + html;
-}
-function sizeReporterShell() {
-  return `
-<script>
-(function() {
-  function postSize() {
-    try {
-      if (!document.body) return;
-      // Measure the bottom edge of the body's last block-flow child via
-      // getBoundingClientRect, then add the iframe's own scrollY to make
-      // it document-relative.
-      //
-      // Why not body.scrollHeight: when the body's first child has a top
-      // margin (e.g. Vavesta intro's .vav-intro-wrapper has margin: 18px
-      // 0), that margin collapses out of body. body.scrollHeight excludes
-      // it, but the iframe still needs to reserve those pixels visually
-      // — otherwise the bottom 18-36px of content overflows the iframe
-      // and a scrollbar appears. lastChild.getBoundingClientRect().bottom
-      // gives the visual bottom edge directly, including the offset from
-      // any collapsed-out margins above.
-      //
-      // Defensive Math.max with scrollHeight: catches absolutely-positioned
-      // elements that may extend below the last block-flow child.
-      var h;
-      var last = document.body.lastElementChild;
-      if (last) {
-        var rect = last.getBoundingClientRect();
-        h = rect.bottom + window.scrollY;
-        if (document.body.scrollHeight > h) h = document.body.scrollHeight;
-      } else {
-        h = document.body.scrollHeight;
-      }
-      // 48px pragmatic buffer: after three measurement-strategy iterations
-      // (scrollHeight, padding-top margin-collapse trick, getBoundingClientRect)
-      // a sub-pixel residual still slips past for some widgets. JS-Slash-Runner
-      // uses the same trick for the same reason — measuring CSS-occupied
-      // space exhaustively isn't tractable. Successive bumps (12 → 32 → 48)
-      // after user reports that dense widgets (Vavesta Court Ledger expanded,
-      // Pacifica Pulse) still clipped at the bottom.
-      h += 48;
-      if (window.spindleSandbox && typeof window.spindleSandbox.requestResize === 'function') {
-        window.spindleSandbox.requestResize(h);
-      }
-    } catch (e) {}
-  }
-  function init() {
-    postSize();
-    if (typeof ResizeObserver !== 'undefined' && document.body) {
-      try {
-        var ro = new ResizeObserver(postSize);
-        ro.observe(document.body);
-      } catch (e) {}
-    }
-    // load fires after fonts/images have loaded — content height may
-    // change between DOMContentLoaded and load. Re-post then.
-    window.addEventListener('load', postSize);
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
-})();
-</script>`;
 }
 function routeChildMessage(frame, payload, ctx, iframeCtx) {
   if (!payload || typeof payload !== "object")
