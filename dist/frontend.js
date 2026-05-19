@@ -1640,6 +1640,7 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   iframe.setAttribute("data-vishrun-widget", scriptName);
   iframe.setAttribute("data-vishrun-script-id", scriptId);
   iframe.setAttribute("data-vishrun-message-id", messageId);
+  iframe.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-forms");
   iframe.style.margin = "12px 0";
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "none";
