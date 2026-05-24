@@ -110,6 +110,24 @@ test('triggerSlash -> tavern-slash (Zhou Fang shape)', () => {
   expect(classifyWidgetEnvironment(html)).toBe('tavern-slash');
 });
 
+test('helpers + triggerSlash fallback -> tavern-helpers-light (hybrid card gets the helpers shim)', () => {
+  const html = `<script>
+    async function go(i){
+      if (typeof getChatMessages === 'function' && typeof setChatMessage === 'function') {
+        const m = await getChatMessages("0");
+        await setChatMessage({ message: m[0].swipes[i] }, 0, { swipe_id: i });
+      } else {
+        sendSlashCommand('/swipe 0 ' + i);
+      }
+    }
+    function sendSlashCommand(msg){
+      if (typeof triggerSlash === 'function') { triggerSlash(msg); }
+    }
+  </script>`;
+  expect(classifyWidgetEnvironment(html)).toBe('tavern-helpers-light');
+  expect(shouldInjectThHelpersShim(classifyWidgetEnvironment(html))).toBe(true);
+});
+
 test('jQuery + getChatMessages -> tavern-jq (jq wins over helpers-light tier order)', () => {
   const html = `<script>
     const m = getChatMessages(0);

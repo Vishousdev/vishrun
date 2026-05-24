@@ -22,6 +22,11 @@ export interface ChatMessageNonSwiped {
   role: 'system' | 'user' | 'assistant';
   is_hidden: boolean;
   message: string;
+  // swipe_id/swipes carried on the default shape too: cards read .swipes
+  // without passing include_swipes (the strict JSR split is stricter than
+  // the live ST runtime, where message objects carry swipes regardless).
+  swipe_id: number;
+  swipes: string[];
   data: Record<string, unknown>;
   extra: Record<string, unknown>;
 }
@@ -95,6 +100,8 @@ function shapeFromSnapshot(
     role: msg.role,
     is_hidden: msg.is_hidden,
     message: msg.message,
+    swipe_id: msg.swipe_id,
+    swipes: msg.swipes,
     data: msg.data,
     extra: msg.extra,
   };
@@ -203,7 +210,7 @@ function shape(m, withSwipes){
   }
   return {
     message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
-    message: m.message, data: m.data, extra: m.extra
+    message: m.message, swipe_id: m.swipe_id, swipes: m.swipes, data: m.data, extra: m.extra
   };
 }
 window.getCurrentMessageId = function(){ return THC.currentMessageIndex; };

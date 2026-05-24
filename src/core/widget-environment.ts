@@ -83,11 +83,14 @@ function classifyImpl(html: string): WidgetEnvironment {
   const hasJq = JQUERY_TOKEN.test(body) || JQUERY_NAMED_TOKEN.test(body);
   if (hasJq) return 'tavern-jq';
 
-  const hasSlash = SLASH_TOKEN.test(body);
-  if (hasSlash) return 'tavern-slash';
-
+  // Helpers-light tested before slash so a card with both a JSR-helpers
+  // primary path and a triggerSlash fallback still gets the helpers shim
+  // and runs the primary path instead of dropping to the slash fallback.
   const hasHelpers = HELPERS_LIGHT_TOKENS.some((re) => re.test(body));
   if (hasHelpers) return 'tavern-helpers-light';
+
+  const hasSlash = SLASH_TOKEN.test(body);
+  if (hasSlash) return 'tavern-slash';
 
   return 'static';
 }

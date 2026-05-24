@@ -68,9 +68,9 @@ test('News Flash reproducer: getChatMessages(getCurrentMessageId()) returns [{me
   expect(first.message).toBe('<campus_gossip>[角色|X][评价|Y]</campus_gossip>');
 });
 
-test('canonical shape (non-swiped): message_id, name, role, is_hidden, message, data, extra', () => {
+test('canonical shape (non-swiped): message_id, name, role, is_hidden, message, swipe_id, swipes, data, extra', () => {
   const snap = makeSnapshot([
-    { message_id: 0, name: 'char', role: 'assistant', message: 'hi', extra: { foo: 1 } },
+    { message_id: 0, name: 'char', role: 'assistant', message: 'hi', swipes: ['hi', 'alt'], swipe_id: 0, extra: { foo: 1 } },
   ]);
   const helpers = createThHelpers(
     { currentMessageIndex: 0, currentMessageId: 'u', chatId: 'c', messagesSnapshot: snap },
@@ -78,15 +78,28 @@ test('canonical shape (non-swiped): message_id, name, role, is_hidden, message, 
   );
   const [m] = helpers.getChatMessages(0) as unknown as Array<Record<string, unknown>>;
   expect(Object.keys(m).sort()).toEqual(
-    ['message_id', 'name', 'role', 'is_hidden', 'message', 'data', 'extra'].sort(),
+    ['message_id', 'name', 'role', 'is_hidden', 'message', 'swipe_id', 'swipes', 'data', 'extra'].sort(),
   );
   expect(m.message_id).toBe(0);
   expect(m.name).toBe('char');
   expect(m.role).toBe('assistant');
   expect(m.is_hidden).toBe(false);
   expect(m.message).toBe('hi');
+  expect(m.swipe_id).toBe(0);
+  expect(m.swipes).toEqual(['hi', 'alt']);
   expect(m.data).toEqual({});
   expect(m.extra).toEqual({ foo: 1 });
+});
+
+test('non-swiped shape carries swipes without include_swipes (greeting-choice swipe contract)', () => {
+  const snap = makeSnapshot([{ message: 'g0', swipes: ['g0', 'g1', 'g2'], swipe_id: 0 }]);
+  const helpers = createThHelpers(
+    { currentMessageIndex: 0, currentMessageId: 'u', chatId: 'c', messagesSnapshot: snap },
+    noopBridge(),
+  );
+  const messages = helpers.getChatMessages('0') as unknown as Array<{ swipes: string[] }>;
+  expect(messages[0].swipes.length).toBe(3);
+  expect(messages[0].swipes[1]).toBe('g1');
 });
 
 test('canonical shape (swiped): message_id, name, role, is_hidden, swipe_id, swipes, swipes_data, swipes_info — Choi Opening contract', () => {
