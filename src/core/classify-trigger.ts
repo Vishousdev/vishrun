@@ -142,6 +142,13 @@ const DELIM_PAIRS: ReadonlyArray<readonly [open: string, close: string]> = [
   ['↦', '↤'],
 ];
 
+// Single-char literal-letter delimiters wrapping a `\{...\}` brace JSON
+// capture, with optional `\s*` decorations. Open/close letters may differ.
+// Tightest accepted form: rejects single-char delimiters around non-JSON
+// bodies and multi-char literal runs.
+const LITERAL_JSON_DELIM_RE =
+  /^([A-Za-z])(?:\\s[*+]?)*\(\\\{[\s\S]*\\\}\)(?:\\s[*+]?)*([A-Za-z])$/;
+
 /**
  * Heuristic: regex source contains a `(` that opens a real capturing group —
  * i.e. not `(?:`, `(?=`, `(?!`, or `(?<...` (lookbehind / named group). Skips
@@ -192,9 +199,11 @@ function textualMarkerName(src: string, kw: 'START OF' | 'END OF'): string | nul
 /**
  * Heuristic: regex carries real capture group(s) AND wraps them in a
  * recognized non-tag delimiter — a Unicode pair from `DELIM_PAIRS` (opener
- * before a matching closer) or symmetric `START OF X` / `END OF X` textual
- * markers. Tag-shaped sources are explicitly rejected (that's `pairedTag`'s
- * job, checked first). Conservative: anything else stays `unknown`.
+ * before a matching closer), symmetric `START OF X` / `END OF X` textual
+ * markers, or single-char literal-letter delimiters around a `\{...\}` brace
+ * JSON capture. Tag-shaped sources are explicitly rejected (that's
+ * `pairedTag`'s job, checked first). Conservative: anything else stays
+ * `unknown`.
  */
 export function isDelimitedCapture(re: RegExp): boolean {
   const src = re.source;
@@ -207,7 +216,8 @@ export function isDelimitedCapture(re: RegExp): boolean {
   }
   const n1 = textualMarkerName(src, 'START OF');
   const n2 = textualMarkerName(src, 'END OF');
-  return !!n1 && n1 === n2;
+  if (n1 && n1 === n2) return true;
+  return LITERAL_JSON_DELIM_RE.test(src);
 }
 
 /**

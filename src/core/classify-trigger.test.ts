@@ -60,6 +60,20 @@ test('capture with no recognized delimiter classifies as unknown', () => {
   expect(classifyTrigger(/foo(.*?)bar/)).toBe('unknown');
 });
 
+// ─── single-char literal delimiters around a brace JSON capture (Option A') ──
+
+test('single-char literal delimiters around a brace JSON capture classify as delimitedCaptureMultiLine', () => {
+  expect(classifyTrigger(new RegExp('S\\s*(\\{[\\s\\S]*?\\})\\s*E'))).toBe('delimitedCaptureMultiLine');
+});
+
+test('single-char delimiters with non-JSON body stay unknown', () => {
+  expect(classifyTrigger(/S(.*?)E/)).toBe('unknown');
+});
+
+test('single-char delimiters around a brace JSON capture accept differing letters', () => {
+  expect(classifyTrigger(new RegExp('A\\s*(\\{[\\s\\S]*?\\})\\s*Z'))).toBe('delimitedCaptureMultiLine');
+});
+
 // ─── delimitedCaptureMultiLine — additional heuristics ──────────────────
 // The unicode cases above with [\s\S] in the body now classify as
 // delimitedCaptureMultiLine (regression-checked); the remaining heuristics
