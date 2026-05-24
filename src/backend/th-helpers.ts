@@ -110,17 +110,79 @@ function shapeSnapshotMessage(
 }
 
 type ChatApi = SpindleAPI['chat'];
+type ChatsApi = SpindleAPI['chats'];
+type CharactersApi = SpindleAPI['characters'];
+
+// Resolve a chat's greeting set (first_mes + alternate_greetings, in order)
+// from the character metadata. Group greetings carry character_id on
+// msg.extra; single-character chats fall back to the chat row. Empty array
+// when unresolved. Shared by the initial-message swipes population and the
+// variables-snapshot recovery below.
+async function fetchCharacterGreetings(
+  messages: ChatMessageDTO[],
+  chatId: string,
+  userId: string,
+  chats: ChatsApi,
+  characters: CharactersApi,
+): Promise<string[]> {
+  const msg0 = messages[0] as (ChatMessageDTO & { extra?: Record<string, unknown> }) | undefined;
+  let charId: string | null = null;
+  const fromExtra = msg0?.extra?.character_id;
+  if (typeof fromExtra === 'string' && fromExtra.length > 0) {
+    charId = fromExtra;
+  } else {
+    // userId is required: chats/characters are operator-scoped (host injects
+    // userId as onFrontendMessage's 2nd arg).
+    const chatDto = await chats.get(chatId, userId);
+    if (chatDto && typeof chatDto.character_id === 'string') charId = chatDto.character_id;
+  }
+  if (!charId) return [];
+  const card = await characters.get(charId, userId);
+  if (!card) return [];
+  const first = typeof card.first_mes === 'string' ? card.first_mes : '';
+  const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
+  return [first, ...alt];
+}
 
 export async function handleGetMessagesSnapshot(
   chatId: string,
+  userId: string,
   chat: ChatApi = api.chat,
+  chats: ChatsApi = api.chats,
+  characters: CharactersApi = api.characters,
 ): Promise<SnapshotMessage[]> {
   const messages = await chat.getMessages(chatId);
-  return messages.map((m) => shapeSnapshotMessage(m as ChatMessageDTO));
+  const snapshot = messages.map((m) => shapeSnapshotMessage(m as ChatMessageDTO));
+  // Initial greeting message: when the chat has not stored real swipe
+  // alternatives yet (fresh chat), expose the full greeting set as swipes so
+  // greeting-selection widgets can index into it, AND persist that array to
+  // the DB so a later setChatMessage(swipe_id) validates against the same
+  // length. A chat that already holds multiple swipes keeps them (no clobber).
+  if (snapshot.length > 0 && snapshot[0].role !== 'user' && snapshot[0].swipes.length <= 1) {
+    try {
+      const greetings = await fetchCharacterGreetings(messages as ChatMessageDTO[], chatId, userId, chats, characters);
+      if (greetings.length > 1) {
+        // Keep the active slot equal to the currently displayed content so the
+        // persist does not rewrite the visible greeting (macros, prior edits).
+        const activeIdx = snapshot[0].swipe_id >= 0 && snapshot[0].swipe_id < greetings.length ? snapshot[0].swipe_id : 0;
+        const aligned = greetings.slice();
+        aligned[activeIdx] = snapshot[0].message;
+        snapshot[0].swipes = aligned;
+        try {
+          // chat.updateMessage is not operator-scoped (owner derived from chatId,
+          // like getMessages); auto-pads swipe_dates. Idempotent: the next read
+          // sees length > 1 and skips. On failure the read still serves derived.
+          await chat.updateMessage(chatId, (messages[0] as ChatMessageDTO).id, { swipes: aligned, swipe_id: activeIdx });
+        } catch (persistErr) {
+          log.warn('initial-message swipes persist failed (read serves derived):', persistErr instanceof Error ? persistErr.message : String(persistErr));
+        }
+      }
+    } catch (err) {
+      log.warn('initial-message swipes derive failed:', err instanceof Error ? err.message : String(err));
+    }
+  }
+  return snapshot;
 }
-
-type ChatsApi = SpindleAPI['chats'];
-type CharactersApi = SpindleAPI['characters'];
 
 // Variables snapshot is computed by replaying all chat messages through
 // the recognizer pipeline. Pure function of chat content — no persistence
@@ -136,34 +198,16 @@ type CharactersApi = SpindleAPI['characters'];
 // replay match by stripped-content hash.
 export async function handleGetVariablesSnapshot(
   chatId: string,
+  userId: string,
   chat: ChatApi = api.chat,
   chats: ChatsApi = api.chats,
   characters: CharactersApi = api.characters,
 ): Promise<MvuData> {
   try {
     const messages = await chat.getMessages(chatId);
-    return await computeVariablesSnapshot(messages, async () => {
-      // Resolve character id. Group-chat greetings carry their own
-      // character_id on msg.extra; single-character chats fall back to
-      // the chat row.
-      const msg0 = messages[0] as ChatMessageDTO & { extra?: Record<string, unknown> } | undefined;
-      let charId: string | null = null;
-      const fromExtra = msg0?.extra?.character_id;
-      if (typeof fromExtra === 'string' && fromExtra.length > 0) {
-        charId = fromExtra;
-      } else {
-        const chatDto = await chats.get(chatId);
-        if (chatDto && typeof chatDto.character_id === 'string') {
-          charId = chatDto.character_id;
-        }
-      }
-      if (!charId) return [];
-      const card = await characters.get(charId);
-      if (!card) return [];
-      const first = typeof card.first_mes === 'string' ? card.first_mes : '';
-      const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
-      return [first, ...alt];
-    });
+    return await computeVariablesSnapshot(messages, () =>
+      fetchCharacterGreetings(messages as ChatMessageDTO[], chatId, userId, chats, characters),
+    );
   } catch (err) {
     log.warn('getVariablesSnapshot failed:', err instanceof Error ? err.message : String(err));
     return emptyMvuData();
@@ -216,10 +260,10 @@ export function installThHelpersHandler(): void {
       let response: ThHelpersResponse;
       try {
         if (op === 'th-get-messages-snapshot') {
-          const result = await handleGetMessagesSnapshot(chatId);
+          const result = await handleGetMessagesSnapshot(chatId, userId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-get-variables-snapshot') {
-          const result = await handleGetVariablesSnapshot(chatId);
+          const result = await handleGetVariablesSnapshot(chatId, userId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

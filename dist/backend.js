@@ -815,34 +815,53 @@ function shapeSnapshotMessage(msg) {
     extra: msg.extra ?? {}
   };
 }
-async function handleGetMessagesSnapshot(chatId, chat = api.chat) {
-  const messages = await chat.getMessages(chatId);
-  return messages.map((m) => shapeSnapshotMessage(m));
+async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
+  const msg0 = messages[0];
+  let charId = null;
+  const fromExtra = msg0?.extra?.character_id;
+  if (typeof fromExtra === "string" && fromExtra.length > 0) {
+    charId = fromExtra;
+  } else {
+    const chatDto = await chats.get(chatId, userId);
+    if (chatDto && typeof chatDto.character_id === "string")
+      charId = chatDto.character_id;
+  }
+  if (!charId)
+    return [];
+  const card = await characters.get(charId, userId);
+  if (!card)
+    return [];
+  const first = typeof card.first_mes === "string" ? card.first_mes : "";
+  const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
+  return [first, ...alt];
 }
-async function handleGetVariablesSnapshot(chatId, chat = api.chat, chats = api.chats, characters = api.characters) {
-  try {
-    const messages = await chat.getMessages(chatId);
-    return await computeVariablesSnapshot(messages, async () => {
-      const msg0 = messages[0];
-      let charId = null;
-      const fromExtra = msg0?.extra?.character_id;
-      if (typeof fromExtra === "string" && fromExtra.length > 0) {
-        charId = fromExtra;
-      } else {
-        const chatDto = await chats.get(chatId);
-        if (chatDto && typeof chatDto.character_id === "string") {
-          charId = chatDto.character_id;
+async function handleGetMessagesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters) {
+  const messages = await chat.getMessages(chatId);
+  const snapshot = messages.map((m) => shapeSnapshotMessage(m));
+  if (snapshot.length > 0 && snapshot[0].role !== "user" && snapshot[0].swipes.length <= 1) {
+    try {
+      const greetings = await fetchCharacterGreetings(messages, chatId, userId, chats, characters);
+      if (greetings.length > 1) {
+        const activeIdx = snapshot[0].swipe_id >= 0 && snapshot[0].swipe_id < greetings.length ? snapshot[0].swipe_id : 0;
+        const aligned = greetings.slice();
+        aligned[activeIdx] = snapshot[0].message;
+        snapshot[0].swipes = aligned;
+        try {
+          await chat.updateMessage(chatId, messages[0].id, { swipes: aligned, swipe_id: activeIdx });
+        } catch (persistErr) {
+          log.warn("initial-message swipes persist failed (read serves derived):", persistErr instanceof Error ? persistErr.message : String(persistErr));
         }
       }
-      if (!charId)
-        return [];
-      const card = await characters.get(charId);
-      if (!card)
-        return [];
-      const first = typeof card.first_mes === "string" ? card.first_mes : "";
-      const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
-      return [first, ...alt];
-    });
+    } catch (err) {
+      log.warn("initial-message swipes derive failed:", err instanceof Error ? err.message : String(err));
+    }
+  }
+  return snapshot;
+}
+async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters) {
+  try {
+    const messages = await chat.getMessages(chatId);
+    return await computeVariablesSnapshot(messages, () => fetchCharacterGreetings(messages, chatId, userId, chats, characters));
   } catch (err) {
     log.warn("getVariablesSnapshot failed:", err instanceof Error ? err.message : String(err));
     return emptyMvuData();
@@ -884,10 +903,10 @@ function installThHelpersHandler() {
       let response;
       try {
         if (op === "th-get-messages-snapshot") {
-          const result = await handleGetMessagesSnapshot(chatId);
+          const result = await handleGetMessagesSnapshot(chatId, userId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-get-variables-snapshot") {
-          const result = await handleGetVariablesSnapshot(chatId);
+          const result = await handleGetVariablesSnapshot(chatId, userId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

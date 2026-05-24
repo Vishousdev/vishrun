@@ -86,6 +86,7 @@ var DELIM_PAIRS = [
   ["『", "』"],
   ["↦", "↤"]
 ];
+var LITERAL_JSON_DELIM_RE = /^([A-Za-z])(?:\\s[*+]?)*\(\\\{[\s\S]*\\\}\)(?:\\s[*+]?)*([A-Za-z])$/;
 function hasRealCapture(src) {
   let i = 0;
   while (i < src.length) {
@@ -137,7 +138,9 @@ function isDelimitedCapture(re) {
   }
   const n1 = textualMarkerName(src, "START OF");
   const n2 = textualMarkerName(src, "END OF");
-  return !!n1 && n1 === n2;
+  if (n1 && n1 === n2)
+    return true;
+  return LITERAL_JSON_DELIM_RE.test(src);
 }
 function classifyTrigger(re) {
   if (isPairedTag(re))
@@ -838,12 +841,12 @@ function classifyImpl(html) {
   const hasJq = JQUERY_TOKEN.test(body) || JQUERY_NAMED_TOKEN.test(body);
   if (hasJq)
     return "tavern-jq";
-  const hasSlash = SLASH_TOKEN.test(body);
-  if (hasSlash)
-    return "tavern-slash";
   const hasHelpers = HELPERS_LIGHT_TOKENS.some((re) => re.test(body));
   if (hasHelpers)
     return "tavern-helpers-light";
+  const hasSlash = SLASH_TOKEN.test(body);
+  if (hasSlash)
+    return "tavern-slash";
   return "static";
 }
 function shouldInjectThHelpersShim(env) {
@@ -928,7 +931,7 @@ function shape(m, withSwipes){
   }
   return {
     message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
-    message: m.message, data: m.data, extra: m.extra
+    message: m.message, swipe_id: m.swipe_id, swipes: m.swipes, data: m.data, extra: m.extra
   };
 }
 window.getCurrentMessageId = function(){ return THC.currentMessageIndex; };
