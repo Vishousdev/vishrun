@@ -432,67 +432,70 @@ async function transformHtmlForTailwind(html, ctx) {
   const textColorOverride = detectCardColorScheme(html) === null ? "<style>:root{color:#000 !important}</style>" : "";
   return textColorOverride + inline + stripped;
 }
-var UNPKG_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/unpkg\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
-function classifyUnpkgUrl(url) {
-  const m = url.match(/^https?:\/\/unpkg\.com(\/[^"'?#]*)/i);
-  if (!m)
-    return null;
-  const path = m[1];
-  if (/^\/(?:@babel\/standalone|babel-standalone)(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "babel";
-  if (/^\/react-dom(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "reactDom";
-  if (/^\/react(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "react";
-  return null;
+var CDN_SCRIPT_HOSTS = new Set([
+  "unpkg.com",
+  "cdn.jsdelivr.net",
+  "cdnjs.cloudflare.com",
+  "esm.sh",
+  "esm.run",
+  "cdn.skypack.dev"
+]);
+var CDN_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>\s*<\/script>/gi;
+function isCdnScriptUrl(url) {
+  let host;
+  try {
+    host = new URL(url).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return CDN_SCRIPT_HOSTS.has(host);
 }
-var REACT_BABEL_ORDER = ["react", "reactDom", "babel"];
-function extractReactBabelUrls(html) {
-  if (html.indexOf("unpkg.com") === -1)
-    return {};
-  const out = {};
-  UNPKG_SCRIPT_RE.lastIndex = 0;
+function escapeScriptBody(body) {
+  return body.replace(/<\/script\b/gi, "<\\/script").replace(/<!--/g, "<\\!--");
+}
+function inlineScriptTag(originalTag, body) {
+  const type = originalTag.match(/\btype\s*=\s*["']([^"']+)["']/i);
+  return `<script${type ? ` type="${type[1]}"` : ""}>${escapeScriptBody(body)}</script>`;
+}
+function extractCdnScriptUrls(html) {
+  if (html.indexOf("<script") === -1)
+    return [];
+  const out = [];
+  const seen = new Set;
+  CDN_SCRIPT_RE.lastIndex = 0;
   let m;
-  while ((m = UNPKG_SCRIPT_RE.exec(html)) !== null) {
+  while ((m = CDN_SCRIPT_RE.exec(html)) !== null) {
     const url = m[1];
-    const slot = classifyUnpkgUrl(url);
-    if (slot && out[slot] === undefined)
-      out[slot] = url;
+    if (isCdnScriptUrl(url) && !seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
   }
   return out;
 }
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function stripScriptTagBySrc(html, url) {
-  return html.replace(new RegExp(`<script\\b[^>]*\\bsrc\\s*=\\s*["']${escapeRegExp(url)}["'][^>]*>\\s*</script>`, "gi"), "");
-}
-async function transformHtmlForReactBabel(html, ctx) {
-  const urls = extractReactBabelUrls(html);
-  const slots = REACT_BABEL_ORDER.filter((slot) => urls[slot] !== undefined);
-  if (slots.length === 0)
+async function transformHtmlForCdnScripts(html, ctx) {
+  const urls = extractCdnScriptUrls(html);
+  if (urls.length === 0)
     return html;
-  const fetched = await Promise.all(slots.map(async (slot) => {
-    const url = urls[slot];
+  const bodyByUrl = new Map;
+  await Promise.all(urls.map(async (url) => {
     try {
-      return { url, body: await getCachedBundle(url, ctx) };
+      bodyByUrl.set(url, await getCachedBundle(url, ctx));
     } catch (err) {
-      console.warn("[vishrun] React/Babel fetch failed:", url, err instanceof Error ? err.message : String(err));
-      return { url, body: "" };
+      console.warn("[vishrun] CDN script fetch failed:", url, err instanceof Error ? err.message : String(err));
     }
   }));
-  const ok = fetched.filter((f) => f.body !== "");
-  if (ok.length === 0)
+  if (bodyByUrl.size === 0)
     return html;
-  let stripped = html;
-  for (const f of ok)
-    stripped = stripScriptTagBySrc(stripped, f.url);
-  const inline = ok.map((f) => `<script>${f.body}</script>`).join("");
-  return inline + stripped;
+  CDN_SCRIPT_RE.lastIndex = 0;
+  return html.replace(CDN_SCRIPT_RE, (full, url) => {
+    const body = bodyByUrl.get(url);
+    return body !== undefined ? inlineScriptTag(full, body) : full;
+  });
 }
 async function transformHtmlForExternalScripts(html, ctx) {
   const withTailwind = await transformHtmlForTailwind(html, ctx);
-  return transformHtmlForReactBabel(withTailwind, ctx);
+  return transformHtmlForCdnScripts(withTailwind, ctx);
 }
 
 // src/core/font-proxy.ts
@@ -1634,7 +1637,8 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     autoResize: false,
     minHeight: 1,
     maxHeight: 4000,
-    initialHeight: 1
+    initialHeight: 1,
+    allowEval: true
   });
   frame.onMessage((payload) => {
     routeChildMessage(frame, payload, ctx, { chatId, messageId, currentMessageIndex });

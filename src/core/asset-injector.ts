@@ -16,8 +16,8 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
  * proxy, so the download is routed through the backend worker module, which
  * does have `spindle.cors`. The protocol (`fetch_external` → backend →
  * `fetch_external_response`) is generic and is also used by Approach B
- * (React + Babel UMDs — see `transformHtmlForReactBabel`). See `src/backend.ts`
- * for the worker side.
+ * (any CDN library bundle, see `transformHtmlForCdnScripts`). See
+ * `src/backend.ts` for the worker side.
  *
  * Bundles are cached in memory keyed by URL. A failed fetch is dropped from the
  * cache so a later render can retry; a card that referenced an unreachable URL
@@ -129,6 +129,11 @@ function getCachedBundle(url: string, ctx: SpindleFrontendContext): Promise<stri
   return pending;
 }
 
+// Test-only.
+export function __resetBundleCacheForTests(): void {
+  bundleCache.clear();
+}
+
 // ─── HTML transform ────────────────────────────────────────────────────────
 
 /**
@@ -223,102 +228,127 @@ export async function transformHtmlForTailwind(
   return textColorOverride + inline + stripped;
 }
 
-// ─── React + Babel transform (Approach B) ──────────────────────────────────
+// ─── Generic CDN script transform (Approach B) ──────────────────────────────
 
-// `<script [type=...] src="https://unpkg.com/...">…</script>`. Same defensive
-// lookahead as TAILWIND_SCRIPT_RE so a decoy host (`unpkg.com.evil.com`) misses.
-// Slot assignment (if any) is `classifyUnpkgUrl`'s job.
-const UNPKG_SCRIPT_RE =
-  /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/unpkg\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
+// Public CDN hosts whose `<script src>` bundles we fetch backend-side and inline
+// (any client-side library: React/ReactDOM/Babel, Vue, lodash, d3, etc.).
+// Excludes cdn.tailwindcss.com (JIT, handled above), code.jquery.com (vendored
+// shim path), and fonts.googleapis.com (font-proxy path). Each has its own
+// mechanism. Exact-host membership; a decoy like `unpkg.com.evil.com` misses.
+const CDN_SCRIPT_HOSTS: ReadonlySet<string> = new Set([
+  'unpkg.com',
+  'cdn.jsdelivr.net',
+  'cdnjs.cloudflare.com',
+  'esm.sh',
+  'esm.run',
+  'cdn.skypack.dev',
+]);
 
-type ReactBabelSlot = 'react' | 'reactDom' | 'babel';
+// Any external `<script [type=...] src="https://...">…</script>`. Host
+// membership is checked in JS (`isCdnScriptUrl`) against the exact parsed host,
+// so the regex stays simple and decoy hosts are rejected by comparison.
+const CDN_SCRIPT_RE =
+  /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>\s*<\/script>/gi;
 
-// Which slot a unpkg.com URL fills, by path: `/react[@v]/…`, `/react-dom[@v]/…`,
-// `/@babel/standalone[@v]/…` or `/babel-standalone[@v]/…`. `null` otherwise.
-function classifyUnpkgUrl(url: string): ReactBabelSlot | null {
-  const m = url.match(/^https?:\/\/unpkg\.com(\/[^"'?#]*)/i);
-  if (!m) return null;
-  const path = m[1];
-  if (/^\/(?:@babel\/standalone|babel-standalone)(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'babel';
-  if (/^\/react-dom(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'reactDom';
-  if (/^\/react(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'react';
-  return null;
+// True when `url`'s exact host is a CDN we inline from.
+export function isCdnScriptUrl(url: string): boolean {
+  let host: string;
+  try {
+    host = new URL(url).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return CDN_SCRIPT_HOSTS.has(host);
 }
 
-const REACT_BABEL_ORDER: readonly ReactBabelSlot[] = ['react', 'reactDom', 'babel'];
+// Neutralize substrings that would make the inlined body break out of its
+// wrapping `<script>` element in the HTML parser. Two vectors:
+//   1. `</script` ends the element directly.
+//   2. `<!--` switches the tokenizer to script-data-escaped state; a later
+//      `<script` then pushes it to double-escaped state, where the wrap's real
+//      `</script>` no longer closes it (libraries shipping an HTML tokenizer,
+//      e.g. Vue's template parser, hit this). Breaking `<!--` keeps the
+//      tokenizer in plain script-data state, where only `</script>` is special.
+// `<\/`, `<\!--` are identical to `</`, `<!--` inside JS string/regex literals
+// (the only place these appear in real bundles), so JS semantics are preserved.
+// `\b` on `</script` so `</scriptfoo` (not a real close) is left alone.
+function escapeScriptBody(body: string): string {
+  return body
+    .replace(/<\/script\b/gi, '<\\/script')
+    .replace(/<!--/g, '<\\!--');
+}
 
-// First unpkg.com `<script src>` for each slot; absent slots omitted, `{}` when
-// the card uses none (cheap `indexOf` short-circuit first).
-export function extractReactBabelUrls(html: string): { react?: string; reactDom?: string; babel?: string } {
-  if (html.indexOf('unpkg.com') === -1) return {};
-  const out: { react?: string; reactDom?: string; babel?: string } = {};
-  UNPKG_SCRIPT_RE.lastIndex = 0;
+// Inline replacement for an external `<script src>` tag. Preserves `type` (so
+// `type="module"` stays a module); crossorigin/integrity/defer/async are
+// meaningless once the body is inline and are dropped.
+function inlineScriptTag(originalTag: string, body: string): string {
+  const type = originalTag.match(/\btype\s*=\s*["']([^"']+)["']/i);
+  return `<script${type ? ` type="${type[1]}"` : ''}>${escapeScriptBody(body)}</script>`;
+}
+
+// Every distinct CDN `<script src>` URL in `html`, in document order. Empty when
+// there are none (cheap `<script` short-circuit first).
+export function extractCdnScriptUrls(html: string): string[] {
+  if (html.indexOf('<script') === -1) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  CDN_SCRIPT_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
-  while ((m = UNPKG_SCRIPT_RE.exec(html)) !== null) {
+  while ((m = CDN_SCRIPT_RE.exec(html)) !== null) {
     const url = m[1];
-    const slot = classifyUnpkgUrl(url);
-    if (slot && out[slot] === undefined) out[slot] = url;
+    if (isCdnScriptUrl(url) && !seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
   }
   return out;
 }
 
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Remove every `<script ... src="<url>">…</script>` for an exact `url`.
-function stripScriptTagBySrc(html: string, url: string): string {
-  return html.replace(
-    new RegExp(`<script\\b[^>]*\\bsrc\\s*=\\s*["']${escapeRegExp(url)}["'][^>]*>\\s*</script>`, 'gi'),
-    '',
-  );
-}
-
-// Inline React/ReactDOM/Babel UMD bundles fetched via the backend, dropping the
-// original `<script src>` for each one that downloaded. Order react → reactDom →
-// babel: ReactDOM needs React; Babel's `text/babel` scanner runs on load and the
-// JSX scripts it consumes are further down in the card HTML. Silent fallback per
-// bundle; idempotent (no matching `<script src>` ⇒ `html` returned untouched).
-export async function transformHtmlForReactBabel(
+// Inline CDN `<script src>` bundles fetched via the backend, replacing each tag
+// in place so authoring order and position are preserved. Library-agnostic:
+// React/ReactDOM/Babel load in the order the card wrote them (ReactDOM after
+// React), and Babel's `text/babel` scanner still runs on load against the JSX
+// scripts left untouched in the HTML. Silent fallback per bundle: a failed
+// fetch leaves the original `<script src>` (which the sandbox CSP then blocks,
+// same as before). Idempotent (no matching `<script src>` ⇒ `html` untouched).
+export async function transformHtmlForCdnScripts(
   html: string,
   ctx: SpindleFrontendContext,
 ): Promise<string> {
-  const urls = extractReactBabelUrls(html);
-  const slots = REACT_BABEL_ORDER.filter((slot) => urls[slot] !== undefined);
-  if (slots.length === 0) return html;
+  const urls = extractCdnScriptUrls(html);
+  if (urls.length === 0) return html;
 
-  // Parallel fetch, kept in REACT_BABEL_ORDER; per-URL silent fallback to ''.
-  const fetched = await Promise.all(
-    slots.map(async (slot) => {
-      const url = urls[slot]!;
+  const bodyByUrl = new Map<string, string>();
+  await Promise.all(
+    urls.map(async (url) => {
       try {
-        return { url, body: await getCachedBundle(url, ctx) };
+        bodyByUrl.set(url, await getCachedBundle(url, ctx));
       } catch (err: unknown) {
         console.warn(
-          '[vishrun] React/Babel fetch failed:',
+          '[vishrun] CDN script fetch failed:',
           url,
           err instanceof Error ? err.message : String(err),
         );
-        return { url, body: '' };
       }
     }),
   );
 
-  const ok = fetched.filter((f) => f.body !== '');
-  if (ok.length === 0) return html;
+  if (bodyByUrl.size === 0) return html;
 
-  let stripped = html;
-  for (const f of ok) stripped = stripScriptTagBySrc(stripped, f.url);
-  const inline = ok.map((f) => `<script>${f.body}</script>`).join('');
-  return inline + stripped;
+  CDN_SCRIPT_RE.lastIndex = 0;
+  return html.replace(CDN_SCRIPT_RE, (full: string, url: string) => {
+    const body = bodyByUrl.get(url);
+    return body !== undefined ? inlineScriptTag(full, body) : full;
+  });
 }
 
 // Run every host-side external-`<script>` transform in order: Tailwind, then
-// React/Babel. Each is a silent-fallback no-op when its tags aren't present.
+// generic CDN scripts. Each is a silent-fallback no-op when its tags aren't
+// present.
 export async function transformHtmlForExternalScripts(
   html: string,
   ctx: SpindleFrontendContext,
 ): Promise<string> {
   const withTailwind = await transformHtmlForTailwind(html, ctx);
-  return transformHtmlForReactBabel(withTailwind, ctx);
+  return transformHtmlForCdnScripts(withTailwind, ctx);
 }
