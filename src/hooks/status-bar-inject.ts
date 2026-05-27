@@ -1,5 +1,9 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
+import { parseMessagesResponse } from '../lumiverse/fetch-message';
+
+// Re-export for callers/tests that imported it from here historically.
+export { parseMessagesResponse };
 
 // On GENERATION_ENDED, write `<StatusPlaceHolderImpl></StatusPlaceHolderImpl>`
 // into the assistant message so the Status Bar widget has a mount point.
@@ -89,24 +93,6 @@ export async function maybeInjectStatusPlaceholder(
     logInjectError(messageId, err);
     return 'error';
   }
-}
-
-// Unwrap `GET /api/v1/chats/:chatId/messages`: Lumiverse returns
-// `PaginatedResult<Message>` (`{ data, total, limit, offset }`).
-// Tolerant of a bare array shape too.
-interface RawMessageRow {
-  id: string;
-  content: string;
-  is_user: boolean;
-  role?: 'system' | 'user' | 'assistant';
-}
-
-export function parseMessagesResponse(json: unknown): RawMessageRow[] {
-  if (Array.isArray(json)) return json as RawMessageRow[];
-  if (json && typeof json === 'object' && Array.isArray((json as { data?: unknown }).data)) {
-    return (json as { data: RawMessageRow[] }).data;
-  }
-  return [];
 }
 
 // Default IO: same-origin REST against Lumiverse. PUT {content} updates

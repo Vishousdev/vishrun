@@ -1,5 +1,18 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
+import { fetchMessageContentById } from '../lumiverse/fetch-message';
+
+/**
+ * Recovery hooks for multi-tag paired patterns. The host tag interceptor is
+ * single-tag: it delivers a fullMatch scoped to the registered tag only, so a
+ * multi-tag findRe can't re-match it. When that happens onCapture fetches the
+ * full stored content and rebuilds captures from it, then re-renders.
+ */
+export interface CaptureRecovery {
+  compiled: CompiledScript[];
+  fetchContent: (chatId: string, messageId: string) => Promise<string | null>;
+  reprocess: (messageId: string) => void;
+}
 
 /**
  * Paired-tag pipeline. ctx.messages.registerTagInterceptor fires during
@@ -60,25 +73,46 @@ let activeTagNames = new Set<string>();
  * messageId (UUID), so accumulation across chat switches is bounded by
  * total tags ever rendered in the session and harmless.
  */
+type RegRole = 'capture' | 'strip';
+interface Registration {
+  script: CompiledScript;
+  role: RegRole;
+}
+
 export function syncTagInterceptors(
   ctx: SpindleFrontendContext,
   compiled: CompiledScript[],
+  recovery?: CaptureRecovery,
 ): void {
-  const desired = new Map<string, CompiledScript>();
+  // First tag of each paired-tag pattern is the capture anchor; the host
+  // delivers a fullMatch scoped to it. For multi-tag patterns the remaining
+  // tags need their own interceptors with removeFromMessage so the host
+  // strips them from display too (otherwise they show as raw text). Anchors
+  // always win a tag name; non-anchor tags only claim a name left unclaimed.
+  const desired = new Map<string, Registration>();
+
   for (const s of compiled) {
     if (s.kind !== 'pairedTag') continue;
-    const tagName = extractTagName(s.findRe.source);
-    if (!tagName) {
-      // Should be unreachable if classify-trigger and extractTagName stay
-      // in sync — both share the same "tolerant of \s* decoration" rule.
+    const tags = extractAllTagNames(s.findRe.source);
+    if (tags.length === 0) {
+      // Should be unreachable if classify-trigger and the tag-name extractors
+      // stay in sync — all share the "tolerant of \s* decoration" rule.
       // Logging anyway in case they drift.
       console.debug(
         `[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` +
-        `extractTagName failed — skipping. findRegex source: ${s.findRe.source}`,
+        `no tag name extractable — skipping. findRegex source: ${s.findRe.source}`,
       );
       continue;
     }
-    desired.set(tagName.toLowerCase(), s);
+    desired.set(tags[0].toLowerCase(), { script: s, role: 'capture' });
+  }
+  for (const s of compiled) {
+    if (s.kind !== 'pairedTag') continue;
+    const tags = extractAllTagNames(s.findRe.source);
+    for (let i = 1; i < tags.length; i++) {
+      const key = tags[i].toLowerCase();
+      if (!desired.has(key)) desired.set(key, { script: s, role: 'strip' });
+    }
   }
 
   // Same set as currently active? No-op.
@@ -97,10 +131,17 @@ export function syncTagInterceptors(
   activeTagNames = new Set(desired.keys());
 
   // Register fresh.
-  for (const [tagName, script] of desired) {
+  for (const [tagName, reg] of desired) {
+    const handler =
+      reg.role === 'capture'
+        ? (payload: InterceptorPayload) => onCapture(payload, reg.script, recovery)
+        : // Strip-only: the host removes the tag from display via
+          // removeFromMessage; we don't capture it (its groups come from the
+          // anchor script's full re-match).
+          () => { /* strip-only */ };
     const unsub = ctx.messages.registerTagInterceptor(
       { tagName, removeFromMessage: true },
-      (payload: InterceptorPayload) => onCapture(payload, script),
+      handler,
     );
     activeUnsubs.push(unsub);
   }
@@ -193,42 +234,122 @@ export function rebuildCapturesFromContent(
   return changed;
 }
 
-function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
+// messageIds with an in-flight full-content recovery, to coalesce the
+// per-tag interceptor fires of one message into a single fetch+rebuild.
+const recoveryInFlight = new Set<string>();
+
+function onCapture(
+  payload: InterceptorPayload,
+  script: CompiledScript,
+  recovery?: CaptureRecovery,
+): void {
   // No streaming guard: the paired-tag regex doesn't match until the close
   // tag arrives, by which point the captured inner is final.
   if (!payload.messageId) return;
 
+  // The host delivers a fullMatch scoped to the registered (first) tag only.
+  // If the script's full findRe matches it, this is a single-tag pattern and
+  // the span is complete, so store directly (synchronous, unchanged path).
+  script.findRe.lastIndex = 0;
+  const selfMatches = script.findRe.test(payload.fullMatch);
+  script.findRe.lastIndex = 0;
+  if (selfMatches) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+
+  // Multi-tag pattern: the host span is a truncated prefix. Recover the full
+  // span from the stored message content. Fire-and-forget: rebuild triggers
+  // its own re-render. Fall back to the truncated store if recovery isn't
+  // wired or the fetch fails, so $1 still renders (no worse than before).
+  if (!recovery || !payload.chatId) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+  void recoverFullCapture(payload.messageId, payload.chatId, script, payload, recovery);
+}
+
+function storeCapture(
+  messageId: string,
+  script: CompiledScript,
+  fullMatch: string,
+  attrs: Record<string, string>,
+): void {
   // Drop any prior capture for this scriptId — only the latest fullMatch
   // is canonical. Trade-off: the same paired tag emitted multiple times
   // in one message renders only the last instance (no card in scope hits this).
-  const existing = capturesByMessage.get(payload.messageId) || [];
+  const existing = capturesByMessage.get(messageId) || [];
   const list = existing.filter((c) => c.scriptId !== script.id);
-
   list.push({
     scriptId: script.id,
     scriptName: script.scriptName,
     replaceString: script.replaceString,
     findRe: script.findRe,
-    fullMatch: payload.fullMatch,
-    attrs: payload.attrs,
+    fullMatch,
+    attrs,
   });
-  capturesByMessage.set(payload.messageId, list);
+  capturesByMessage.set(messageId, list);
 }
 
+async function recoverFullCapture(
+  messageId: string,
+  chatId: string,
+  script: CompiledScript,
+  payload: InterceptorPayload,
+  recovery: CaptureRecovery,
+): Promise<void> {
+  if (recoveryInFlight.has(messageId)) return;
+  recoveryInFlight.add(messageId);
+  try {
+    let content: string | null = null;
+    try {
+      content = await recovery.fetchContent(chatId, messageId);
+    } catch {
+      content = null;
+    }
+    if (content == null) {
+      // Fetch failed: keep the truncated capture so $1 still renders.
+      storeCapture(messageId, script, payload.fullMatch, payload.attrs);
+      recovery.reprocess(messageId);
+      return;
+    }
+    // rebuildCapturesFromContent re-runs every paired-tag findRe against the
+    // full content and rewrites capturesByMessage with the true spans.
+    const changed = rebuildCapturesFromContent(messageId, content, recovery.compiled);
+    if (changed) recovery.reprocess(messageId);
+  } finally {
+    recoveryInFlight.delete(messageId);
+  }
+}
+
+// Opening-tag matcher: `<` then optional `\s*`-decoration / whitespace, then
+// an identifier. Closing tags (`<\/TAG>`) don't match — the char after `<` is
+// `\`, not an identifier or decoration. Global for repeated scanning.
+const OPEN_TAG_RE = /<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/g;
+
 /**
- * Pull the tag name out of a paired-tag findRegex source.
+ * Pull the tag names out of a paired-tag findRegex source, in source order,
+ * deduped (case-insensitive). The first entry is the capture anchor.
  *
  * Tolerates whitespace-allowance decorations between `<` and the tag name —
  * card authors sometimes pad with `\s*` for paranoia (Pacifica:
- * `<\s*PACIFICA_UI\s*>...`). The optional `(?:\\s\*|\s)*` group accepts
- * either the literal 3-char sequence `\s*` or actual whitespace. Returns
- * null only when there's no recognizable tag name at the start.
+ * `<\s*PACIFICA_UI\s*>...`). Multi-tag patterns yield every distinct tag the
+ * pattern spans (status bars: ID, Time, Location, ...).
  *
  * Stays in sync with `isPairedTag` in `classify-trigger.ts` — both must
  * accept the same shapes, otherwise classification routes to pairedTag but
  * registration silently fails.
  */
-function extractTagName(reSource: string): string | null {
-  const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
-  return m ? m[1] : null;
+export function extractAllTagNames(reSource: string): string[] {
+  OPEN_TAG_RE.lastIndex = 0;
+  const names: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = OPEN_TAG_RE.exec(reSource)) !== null) {
+    const lower = m[1].toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    names.push(m[1]);
+  }
+  return names;
 }

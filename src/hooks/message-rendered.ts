@@ -3,6 +3,7 @@ import { compileScripts, type CompiledScript } from '../core/parse-regex-script'
 import { processNode, clearEditingMessageIds } from '../render/inject-into-message';
 import { getActiveCard } from '../state/active-card';
 import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor';
+import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
 import { allSelf } from '../render/self-mutation';
 
@@ -231,7 +232,11 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     // existing tags. Doing it inside the rAF would race the next render.
     const compiledNow = compiledForActiveCard();
     if (compiledNow) {
-      syncTagInterceptors(ctx, compiledNow);
+      syncTagInterceptors(ctx, compiledNow, {
+        compiled: compiledNow,
+        fetchContent: fetchMessageContentById,
+        reprocess: (id) => processMessageById(id),
+      });
     } else {
       teardownTagInterceptors();
     }

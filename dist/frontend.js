@@ -2238,17 +2238,27 @@ function getCapturesForMessage(messageId) {
 }
 var activeUnsubs = [];
 var activeTagNames = new Set;
-function syncTagInterceptors(ctx, compiled) {
+function syncTagInterceptors(ctx, compiled, recovery) {
   const desired = new Map;
   for (const s of compiled) {
     if (s.kind !== "pairedTag")
       continue;
-    const tagName = extractTagName(s.findRe.source);
-    if (!tagName) {
-      console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `extractTagName failed — skipping. findRegex source: ${s.findRe.source}`);
+    const tags = extractAllTagNames(s.findRe.source);
+    if (tags.length === 0) {
+      console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `no tag name extractable — skipping. findRegex source: ${s.findRe.source}`);
       continue;
     }
-    desired.set(tagName.toLowerCase(), s);
+    desired.set(tags[0].toLowerCase(), { script: s, role: "capture" });
+  }
+  for (const s of compiled) {
+    if (s.kind !== "pairedTag")
+      continue;
+    const tags = extractAllTagNames(s.findRe.source);
+    for (let i = 1;i < tags.length; i++) {
+      const key = tags[i].toLowerCase();
+      if (!desired.has(key))
+        desired.set(key, { script: s, role: "strip" });
+    }
   }
   if (desired.size === activeTagNames.size && [...desired.keys()].every((t) => activeTagNames.has(t))) {
     return;
@@ -2260,8 +2270,9 @@ function syncTagInterceptors(ctx, compiled) {
   });
   activeUnsubs = [];
   activeTagNames = new Set(desired.keys());
-  for (const [tagName, script] of desired) {
-    const unsub = ctx.messages.registerTagInterceptor({ tagName, removeFromMessage: true }, (payload) => onCapture(payload, script));
+  for (const [tagName, reg] of desired) {
+    const handler = reg.role === "capture" ? (payload) => onCapture(payload, reg.script, recovery) : () => {};
+    const unsub = ctx.messages.registerTagInterceptor({ tagName, removeFromMessage: true }, handler);
     activeUnsubs.push(unsub);
   }
 }
@@ -2322,24 +2333,73 @@ function rebuildCapturesFromContent(messageId, content, compiled, _eventName) {
   }
   return changed;
 }
-function onCapture(payload, script) {
+var recoveryInFlight = new Set;
+function onCapture(payload, script, recovery) {
   if (!payload.messageId)
     return;
-  const existing = capturesByMessage.get(payload.messageId) || [];
+  script.findRe.lastIndex = 0;
+  const selfMatches = script.findRe.test(payload.fullMatch);
+  script.findRe.lastIndex = 0;
+  if (selfMatches) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+  if (!recovery || !payload.chatId) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+  recoverFullCapture(payload.messageId, payload.chatId, script, payload, recovery);
+}
+function storeCapture(messageId, script, fullMatch, attrs) {
+  const existing = capturesByMessage.get(messageId) || [];
   const list = existing.filter((c) => c.scriptId !== script.id);
   list.push({
     scriptId: script.id,
     scriptName: script.scriptName,
     replaceString: script.replaceString,
     findRe: script.findRe,
-    fullMatch: payload.fullMatch,
-    attrs: payload.attrs
+    fullMatch,
+    attrs
   });
-  capturesByMessage.set(payload.messageId, list);
+  capturesByMessage.set(messageId, list);
 }
-function extractTagName(reSource) {
-  const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
-  return m ? m[1] : null;
+async function recoverFullCapture(messageId, chatId, script, payload, recovery) {
+  if (recoveryInFlight.has(messageId))
+    return;
+  recoveryInFlight.add(messageId);
+  try {
+    let content = null;
+    try {
+      content = await recovery.fetchContent(chatId, messageId);
+    } catch {
+      content = null;
+    }
+    if (content == null) {
+      storeCapture(messageId, script, payload.fullMatch, payload.attrs);
+      recovery.reprocess(messageId);
+      return;
+    }
+    const changed = rebuildCapturesFromContent(messageId, content, recovery.compiled);
+    if (changed)
+      recovery.reprocess(messageId);
+  } finally {
+    recoveryInFlight.delete(messageId);
+  }
+}
+var OPEN_TAG_RE = /<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/g;
+function extractAllTagNames(reSource) {
+  OPEN_TAG_RE.lastIndex = 0;
+  const names = [];
+  const seen = new Set;
+  let m;
+  while ((m = OPEN_TAG_RE.exec(reSource)) !== null) {
+    const lower = m[1].toLowerCase();
+    if (seen.has(lower))
+      continue;
+    seen.add(lower);
+    names.push(m[1]);
+  }
+  return names;
 }
 
 // src/core/macro-detection.ts
@@ -2989,6 +3049,24 @@ function hashKey(s) {
   return (h >>> 0).toString(36);
 }
 
+// src/lumiverse/fetch-message.ts
+function parseMessagesResponse(json) {
+  if (Array.isArray(json))
+    return json;
+  if (json && typeof json === "object" && Array.isArray(json.data)) {
+    return json.data;
+  }
+  return [];
+}
+async function fetchMessageContentById(chatId, messageId) {
+  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
+  if (!r.ok)
+    throw new Error(`messages fetch failed: HTTP ${r.status}`);
+  const json = await r.json();
+  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
+  return m ? m.content : null;
+}
+
 // src/core/chat-changed-filter.ts
 var VAR_PATH_RE = /^metadata\.(macro_variables|chat_variables)(\.|$)/;
 function shouldRescanForChangedFields(changedFields) {
@@ -3188,7 +3266,11 @@ function installMessageHooks(ctx) {
   function rescanAll() {
     const compiledNow = compiledForActiveCard();
     if (compiledNow) {
-      syncTagInterceptors(ctx, compiledNow);
+      syncTagInterceptors(ctx, compiledNow, {
+        compiled: compiledNow,
+        fetchContent: fetchMessageContentById,
+        reprocess: (id) => processMessageById(id)
+      });
     } else {
       teardownTagInterceptors();
     }
@@ -3293,14 +3375,6 @@ async function maybeInjectStatusPlaceholder(chatId, messageId, io) {
     logInjectError(messageId, err);
     return "error";
   }
-}
-function parseMessagesResponse(json) {
-  if (Array.isArray(json))
-    return json;
-  if (json && typeof json === "object" && Array.isArray(json.data)) {
-    return json.data;
-  }
-  return [];
 }
 function defaultIO() {
   return {
