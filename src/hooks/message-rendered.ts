@@ -6,6 +6,7 @@ import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor'
 import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
 import { allSelf } from '../render/self-mutation';
+import { setGenerating } from '../state/generation';
 
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -111,14 +112,28 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     // its own injections.
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving) observer!.disconnect();
+    // While paused, host re-renders (e.g. the final message swap after
+    // streaming) would otherwise go unnoticed until a reload. Record them and
+    // replay after the scan; self mutations are filtered as usual.
+    const missed: MutationRecord[] = [];
+    const watchTarget = wasObserving ? observedTarget : null;
+    const pausedWatcher = watchTarget
+      ? new MutationObserver((records) => { missed.push(...records); })
+      : null;
+    pausedWatcher?.observe(watchTarget!, OBSERVE_OPTS);
     try {
       const nodes = document.querySelectorAll('[data-message-id]');
       const tasks: Promise<unknown>[] = [];
       nodes.forEach((n) => { tasks.push(processNode(n as HTMLElement, compiled, ctx).catch(() => {})); });
       await Promise.all(tasks);
     } finally {
+      if (pausedWatcher) {
+        missed.push(...pausedWatcher.takeRecords());
+        pausedWatcher.disconnect();
+      }
       if (wasObserving && observedTarget && document.contains(observedTarget)) {
         observer!.observe(observedTarget, OBSERVE_OPTS);
+        if (missed.length > 0 && !allSelf(missed)) handleMutations(missed);
       }
     }
   }
@@ -254,7 +269,13 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     }));
   }
 
+  const unsubGenStarted = ctx.events.on('GENERATION_STARTED', () => { setGenerating(true); });
+  const unsubGenStopped = ctx.events.on('GENERATION_STOPPED', () => {
+    setGenerating(false);
+    rescanAll();
+  });
   const unsubGenEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
+    setGenerating(false);
     const p = (payload || {}) as GenerationEndedPayload;
     if (p.error) return;
     if (!isActiveChat(p.chatId)) return;
@@ -281,6 +302,8 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       teardownTagInterceptors();
       clearEditingMessageIds();
       unsubGenEnded();
+      unsubGenStarted();
+      unsubGenStopped();
       unsubChatChanged();
     },
   };

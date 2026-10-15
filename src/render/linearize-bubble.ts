@@ -10,6 +10,8 @@
 //   - inline tags    → contents flattened, no separator
 //   - data-vishrun-widget subtrees → SKIPPED (already-rendered widgets stay put)
 
+import { deepTextContent, isNonTextElement, renderedChildNodes } from './shadow-dom';
+
 export interface OffsetMapEntry {
   node: Text;
   /** Offset within `node.nodeValue`. */
@@ -53,6 +55,7 @@ export function linearizeBubble(root: HTMLElement): LinearResult {
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const el = node as HTMLElement;
     if (el.hasAttribute && el.hasAttribute('data-vishrun-widget')) return;
+    if (isNonTextElement(el)) return;
     if (el.tagName === 'BR') {
       text += '\n';
       return;
@@ -63,7 +66,7 @@ export function linearizeBubble(root: HTMLElement): LinearResult {
       prevText = text.endsWith('\n') ? '\n' : '\n\n';
       text += prevText;
     }
-    for (const child of Array.from(el.childNodes)) walk(child);
+    for (const child of renderedChildNodes(el)) walk(child);
     if (isBlock && text.length > 0 && !text.endsWith('\n\n')) {
       text += text.endsWith('\n') ? '\n' : '\n\n';
     }
@@ -82,7 +85,7 @@ interface CacheEntry { hash: string; result: LinearResult }
 const cache = new WeakMap<HTMLElement, CacheEntry>();
 
 export function getLinearizedBubble(root: HTMLElement): LinearResult {
-  const tc = root.textContent ?? '';
+  const tc = deepTextContent(root);
   const hash = quickHash(tc);
   const cached = cache.get(root);
   if (cached && cached.hash === hash) return cached.result;

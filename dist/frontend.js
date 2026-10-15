@@ -124,6 +124,7 @@ function textualMarkerName(src, kw) {
   const name = rest.slice(0, end).replace(/\\s[*+]?/g, "").replace(/\\/g, "").replace(/\s+/g, " ").trim();
   return name || null;
 }
+var BRACKET_MARKERS_RE = /^\\\[[\w ]+\\\][\s\S]*\\\[[\w ]+\\\]$/;
 function isDelimitedCapture(re) {
   const src = re.source;
   if (!hasRealCapture(src))
@@ -136,11 +137,22 @@ function isDelimitedCapture(re) {
     if (oi >= 0 && src.indexOf(close, oi + open.length) >= 0)
       return true;
   }
+  if (BRACKET_MARKERS_RE.test(src))
+    return true;
   const n1 = textualMarkerName(src, "START OF");
   const n2 = textualMarkerName(src, "END OF");
   if (n1 && n1 === n2)
     return true;
   return LITERAL_JSON_DELIM_RE.test(src);
+}
+var ANGLE_PIPE_RE = /^\\?<[A-Za-z][\w ]*\\?\|[\s\S]*\\?>$/;
+function isAnglePipeCapture(re) {
+  const src = re.source.replace(/^(?:\\s[*+]?|\s)+/, "").replace(/(?:\\s[*+]?|\s)+$/, "");
+  if (!hasRealCapture(src))
+    return false;
+  if (/<\\?\//.test(src))
+    return false;
+  return ANGLE_PIPE_RE.test(src);
 }
 function classifyTrigger(re) {
   if (isPairedTag(re))
@@ -149,6 +161,8 @@ function classifyTrigger(re) {
     return "placeholder";
   if (isDelimitedCapture(re))
     return isMultiLineRegex(re) ? "delimitedCaptureMultiLine" : "delimitedCapture";
+  if (isAnglePipeCapture(re))
+    return "delimitedCaptureMultiLine";
   return "unknown";
 }
 function escapeRegex(s) {
@@ -322,6 +336,248 @@ function expand(html, script, allScripts, processing, depth) {
   return out;
 }
 
+// src/render/shadow-dom.ts
+function parentAcrossShadow(node) {
+  if (node.parentNode) {
+    const p = node.parentNode;
+    return p.nodeType === 11 && p.host ? p.host : p;
+  }
+  return null;
+}
+function deepContains(root, node) {
+  let cur = node;
+  while (cur) {
+    if (cur === root)
+      return true;
+    cur = parentAcrossShadow(cur);
+  }
+  return false;
+}
+function deepClosest(el, selector) {
+  let cur = el;
+  while (cur) {
+    if (cur.nodeType === 1 && cur.matches(selector))
+      return cur;
+    cur = parentAcrossShadow(cur);
+  }
+  return null;
+}
+function deepQuerySelectorAll(root, selector) {
+  const out = [];
+  const visit = (scope) => {
+    scope.querySelectorAll(selector).forEach((el) => out.push(el));
+    scope.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot)
+        visit(el.shadowRoot);
+    });
+  };
+  visit(root);
+  return out;
+}
+function deepQuerySelector(root, selector) {
+  return deepQuerySelectorAll(root, selector)[0] ?? null;
+}
+function hasShadowHost(root) {
+  for (const el of Array.from(root.querySelectorAll("*"))) {
+    if (el.shadowRoot)
+      return true;
+  }
+  return false;
+}
+function renderedChildNodes(node) {
+  const sr = node.nodeType === 1 ? node.shadowRoot : null;
+  return Array.from((sr ?? node).childNodes);
+}
+var NON_TEXT_TAGS = new Set(["STYLE", "SCRIPT", "TEMPLATE", "NOSCRIPT"]);
+function isNonTextElement(el) {
+  return NON_TEXT_TAGS.has(el.tagName);
+}
+function deepTextContent(root) {
+  let s = "";
+  const walk = (n) => {
+    if (n.nodeType === 3) {
+      s += n.nodeValue ?? "";
+      return;
+    }
+    if (n.nodeType !== 1 && n.nodeType !== 11)
+      return;
+    if (n.nodeType === 1 && isNonTextElement(n))
+      return;
+    for (const c of renderedChildNodes(n))
+      walk(c);
+  };
+  walk(root);
+  return s;
+}
+
+// src/core/dispatch-slash.ts
+function isDispatchSlashResponse(p, requestId) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "dispatch_slash_text_response" && r.requestId === requestId && typeof r.handled === "boolean" && typeof r.kind === "string";
+}
+var requestCounter = 0;
+function nextRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `vishrun-ds-${Date.now()}-${++requestCounter}`;
+}
+var DISPATCH_TIMEOUT_MS = 5000;
+function dispatchSlashViaBackend(ctx, chatId, text, timeoutMs = DISPATCH_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const requestId = nextRequestId();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (run) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      run();
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isDispatchSlashResponse(payload, requestId))
+        return;
+      finish(() => resolve({ handled: payload.handled, kind: payload.kind, error: payload.error }));
+    });
+    timer = setTimeout(() => {
+      finish(() => reject(new Error("dispatch_slash_text timeout")));
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({ type: "dispatch_slash_text", requestId, text, chatId });
+    } catch (err) {
+      finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+    }
+  });
+}
+
+// src/render/clipboard-shim.ts
+var DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys)\b/i;
+var DISPATCH_CORRELATION_WINDOW_MS = 1000;
+var DISPATCH_CLEANUP_INTERVAL_MS = 2000;
+var recentlyDispatched = new Map;
+var cleanupTimer = null;
+function ensureCleanupTimer() {
+  if (cleanupTimer !== null)
+    return;
+  cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [text, ts] of recentlyDispatched) {
+      if (now - ts > DISPATCH_CLEANUP_INTERVAL_MS)
+        recentlyDispatched.delete(text);
+    }
+  }, DISPATCH_CLEANUP_INTERVAL_MS);
+}
+async function handleClipboardWriteText(payload, ctx, deps = {}) {
+  const text = payload && typeof payload === "object" ? payload.text : undefined;
+  if (typeof text !== "string")
+    return;
+  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
+  const now = deps.now ?? Date.now;
+  if (DISPATCH_PREFIX_RE.test(text)) {
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId) {
+      console.warn("[vishrun] dispatch_slash_text: no active chatId, falling back to clipboard");
+    } else {
+      if (!deps.recentlyDispatched)
+        ensureCleanupTimer();
+      dispatched.set(text, now());
+      try {
+        const dispatch = deps.dispatch ?? dispatchSlashViaBackend;
+        const result = await dispatch(ctx, chatId, text);
+        if (result.handled) {
+          dispatched.set(text, now());
+          return;
+        }
+        dispatched.delete(text);
+      } catch (e) {
+        console.warn("[vishrun] dispatch_slash_text failed, falling back to clipboard:", e instanceof Error ? e.message : String(e));
+        dispatched.delete(text);
+      }
+    }
+  }
+  const writeText = deps.clipboardWriteText ?? (typeof navigator !== "undefined" && navigator.clipboard ? navigator.clipboard.writeText.bind(navigator.clipboard) : null);
+  if (!writeText)
+    return;
+  try {
+    await writeText(text);
+  } catch (e) {
+    console.warn("[vishrun] clipboard writeText failed:", e);
+  }
+}
+function handleHostAlert(payload, deps = {}) {
+  const message = payload && typeof payload === "object" ? payload.message : undefined;
+  if (typeof message !== "string")
+    return;
+  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
+  const now = deps.now ?? Date.now;
+  const tNow = now();
+  for (const ts of dispatched.values()) {
+    if (tNow - ts < DISPATCH_CORRELATION_WINDOW_MS)
+      return;
+  }
+  const alertFn = deps.alert ?? (typeof window !== "undefined" && typeof window.alert === "function" ? window.alert.bind(window) : null);
+  if (!alertFn)
+    return;
+  try {
+    alertFn(message);
+  } catch (e) {
+    console.warn("[vishrun] alert failed:", e);
+  }
+}
+
+// src/render/slash-runner.ts
+var COMPOSER_SELECTOR = '[data-component="InputArea"] textarea';
+function setComposerText(text, doc = document) {
+  const ta = doc.querySelector(COMPOSER_SELECTOR);
+  if (!ta)
+    return false;
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  if (setter)
+    setter.call(ta, text);
+  else
+    ta.value = text;
+  ta.dispatchEvent(new Event("input", { bubbles: true }));
+  ta.focus();
+  return true;
+}
+function parseSlash(command) {
+  const m = /^\s*\/([A-Za-z][\w-]*)\b\s?([\s\S]*)$/.exec(command);
+  return m ? { name: m[1].toLowerCase(), rest: m[2] } : null;
+}
+async function handleTriggerSlash(payload, ctx, deps = {}) {
+  const command = payload && typeof payload === "object" ? payload.command : undefined;
+  if (typeof command !== "string")
+    return;
+  const parsed = parseSlash(command);
+  const setComposer = deps.setComposer ?? setComposerText;
+  if (parsed && (parsed.name === "setinput" || parsed.name === "input")) {
+    if (!setComposer(parsed.rest))
+      console.warn("[vishrun] triggerSlash: composer not found");
+    return;
+  }
+  if (parsed && parsed.name === "echo") {
+    console.info("[vishrun] /echo", parsed.rest);
+    return;
+  }
+  await (deps.fallback ?? handleClipboardWriteText)({ text: command }, ctx);
+}
+function triggerSlashShim() {
+  return `<script>(function(){` + `if(typeof window.triggerSlash==='function')return;` + `window.triggerSlash=function(cmd){` + `try{window.spindleSandbox.postMessage({kind:'trigger-slash',payload:{command:String(cmd)}});}catch(e){}` + `return Promise.resolve('');` + `};` + `})();</script>`;
+}
+
 // src/core/diagnostics.ts
 var VSH_VISHRUN_DIAG = false;
 
@@ -329,16 +585,16 @@ var VSH_VISHRUN_DIAG = false;
 function isFetchExternalResponse(p, requestId) {
   return !!p && typeof p === "object" && p.type === "fetch_external_response" && p.requestId === requestId;
 }
-var requestCounter = 0;
-function nextRequestId() {
+var requestCounter2 = 0;
+function nextRequestId2() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
-  return `vishrun-fx-${Date.now()}-${++requestCounter}`;
+  return `vishrun-fx-${Date.now()}-${++requestCounter2}`;
 }
 function fetchViaBackend(url, ctx, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    const requestId = nextRequestId();
+    const requestId = nextRequestId2();
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -654,134 +910,6 @@ async function transformHtmlForGoogleFonts(html, ctx) {
     out = out.split(ib.fullStyleBlock).join(scripts.join("") + stripped);
   }
   return out;
-}
-
-// src/core/dispatch-slash.ts
-function isDispatchSlashResponse(p, requestId) {
-  if (!p || typeof p !== "object")
-    return false;
-  const r = p;
-  return r.type === "dispatch_slash_text_response" && r.requestId === requestId && typeof r.handled === "boolean" && typeof r.kind === "string";
-}
-var requestCounter2 = 0;
-function nextRequestId2() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `vishrun-ds-${Date.now()}-${++requestCounter2}`;
-}
-var DISPATCH_TIMEOUT_MS = 5000;
-function dispatchSlashViaBackend(ctx, chatId, text, timeoutMs = DISPATCH_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const requestId = nextRequestId2();
-    let settled = false;
-    let unsub = null;
-    let timer = null;
-    const finish = (run) => {
-      if (settled)
-        return;
-      settled = true;
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      if (unsub) {
-        try {
-          unsub();
-        } catch {}
-        unsub = null;
-      }
-      run();
-    };
-    unsub = ctx.onBackendMessage((payload) => {
-      if (!isDispatchSlashResponse(payload, requestId))
-        return;
-      finish(() => resolve({ handled: payload.handled, kind: payload.kind, error: payload.error }));
-    });
-    timer = setTimeout(() => {
-      finish(() => reject(new Error("dispatch_slash_text timeout")));
-    }, timeoutMs);
-    try {
-      ctx.sendToBackend({ type: "dispatch_slash_text", requestId, text, chatId });
-    } catch (err) {
-      finish(() => reject(err instanceof Error ? err : new Error(String(err))));
-    }
-  });
-}
-
-// src/render/clipboard-shim.ts
-var DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys)\b/i;
-var DISPATCH_CORRELATION_WINDOW_MS = 1000;
-var DISPATCH_CLEANUP_INTERVAL_MS = 2000;
-var recentlyDispatched = new Map;
-var cleanupTimer = null;
-function ensureCleanupTimer() {
-  if (cleanupTimer !== null)
-    return;
-  cleanupTimer = setInterval(() => {
-    const now = Date.now();
-    for (const [text, ts] of recentlyDispatched) {
-      if (now - ts > DISPATCH_CLEANUP_INTERVAL_MS)
-        recentlyDispatched.delete(text);
-    }
-  }, DISPATCH_CLEANUP_INTERVAL_MS);
-}
-async function handleClipboardWriteText(payload, ctx, deps = {}) {
-  const text = payload && typeof payload === "object" ? payload.text : undefined;
-  if (typeof text !== "string")
-    return;
-  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
-  const now = deps.now ?? Date.now;
-  if (DISPATCH_PREFIX_RE.test(text)) {
-    const chatId = ctx.getActiveChat().chatId;
-    if (!chatId) {
-      console.warn("[vishrun] dispatch_slash_text: no active chatId, falling back to clipboard");
-    } else {
-      if (!deps.recentlyDispatched)
-        ensureCleanupTimer();
-      dispatched.set(text, now());
-      try {
-        const dispatch = deps.dispatch ?? dispatchSlashViaBackend;
-        const result = await dispatch(ctx, chatId, text);
-        if (result.handled) {
-          dispatched.set(text, now());
-          return;
-        }
-        dispatched.delete(text);
-      } catch (e) {
-        console.warn("[vishrun] dispatch_slash_text failed, falling back to clipboard:", e instanceof Error ? e.message : String(e));
-        dispatched.delete(text);
-      }
-    }
-  }
-  const writeText = deps.clipboardWriteText ?? (typeof navigator !== "undefined" && navigator.clipboard ? navigator.clipboard.writeText.bind(navigator.clipboard) : null);
-  if (!writeText)
-    return;
-  try {
-    await writeText(text);
-  } catch (e) {
-    console.warn("[vishrun] clipboard writeText failed:", e);
-  }
-}
-function handleHostAlert(payload, deps = {}) {
-  const message = payload && typeof payload === "object" ? payload.message : undefined;
-  if (typeof message !== "string")
-    return;
-  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
-  const now = deps.now ?? Date.now;
-  const tNow = now();
-  for (const ts of dispatched.values()) {
-    if (tNow - ts < DISPATCH_CORRELATION_WINDOW_MS)
-      return;
-  }
-  const alertFn = deps.alert ?? (typeof window !== "undefined" && typeof window.alert === "function" ? window.alert.bind(window) : null);
-  if (!alertFn)
-    return;
-  try {
-    alertFn(message);
-  } catch (e) {
-    console.warn("[vishrun] alert failed:", e);
-  }
 }
 
 // src/core/widget-environment.ts
@@ -1554,7 +1682,7 @@ function cleanupOrphansForMessage(messageId, target) {
     if (!set)
       continue;
     for (const iframe of [...set]) {
-      if (target && target.contains(iframe))
+      if (target && deepContains(target, iframe))
         continue;
       destroyWidgetIframe(iframe, "cleanup-orphans");
     }
@@ -1730,7 +1858,7 @@ function buildHeadInjection(iframeCtx) {
     messagesSnapshot: iframeCtx.messagesSnapshot
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -2131,6 +2259,8 @@ function routeChildMessage(frame, payload, ctx, iframeCtx) {
     handleSetChatMessages(frame.element, p.payload, ctx);
   } else if (p.kind === "clipboard-write-text") {
     handleClipboardWriteText(p.payload, ctx);
+  } else if (p.kind === "trigger-slash") {
+    handleTriggerSlash(p.payload, ctx);
   } else if (p.kind === "alert") {
     handleHostAlert(p.payload);
   } else if (isThRequest(payload)) {
@@ -2146,7 +2276,7 @@ async function handleSetChatMessages(iframe, payload, ctx) {
     console.warn("[vishrun] setChatMessages: payload is not an array, ignoring");
     return;
   }
-  const messageEl = iframe.closest("[data-message-id]");
+  const messageEl = deepClosest(iframe, "[data-message-id]");
   const messageId = messageEl?.getAttribute("data-message-id");
   if (!messageId) {
     console.warn("[vishrun] setChatMessages: cannot resolve messageId from iframe ancestry, ignoring");
@@ -2513,6 +2643,8 @@ function linearizeBubble(root) {
     const el = node;
     if (el.hasAttribute && el.hasAttribute("data-vishrun-widget"))
       return;
+    if (isNonTextElement(el))
+      return;
     if (el.tagName === "BR") {
       text += `
 `;
@@ -2530,7 +2662,7 @@ function linearizeBubble(root) {
 `;
       text += prevText;
     }
-    for (const child of Array.from(el.childNodes))
+    for (const child of renderedChildNodes(el))
       walk(child);
     if (isBlock && text.length > 0 && !text.endsWith(`
 
@@ -2551,7 +2683,7 @@ function linearizeBubble(root) {
 }
 var cache2 = new WeakMap;
 function getLinearizedBubble(root) {
-  const tc = root.textContent ?? "";
+  const tc = deepTextContent(root);
   const hash = quickHash(tc);
   const cached = cache2.get(root);
   if (cached && cached.hash === hash)
@@ -2570,6 +2702,223 @@ function quickHash(s) {
     h = Math.imul(h, 16777619);
   }
   return (h >>> 0).toString(36);
+}
+
+// src/render/paired-anchor.ts
+var MARKER = "vishrun-anchor-marker";
+function cssEsc(s) {
+  return typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(s) : s.replace(/[^\w-]/g, (c) => "\\" + c);
+}
+function signature(el) {
+  const classes = Array.from(el.classList).filter(Boolean);
+  if (classes.length === 0)
+    return null;
+  return el.tagName.toLowerCase() + classes.map((c) => "." + cssEsc(c)).join("");
+}
+function computePairedAnchor(rawContentIn, fullMatchIn) {
+  const rawContent = rawContentIn.replace(/\r\n?/g, `
+`);
+  const fullMatch = fullMatchIn.replace(/\r\n?/g, `
+`);
+  const idx = rawContent.indexOf(fullMatch);
+  if (idx < 0 || typeof DOMParser === "undefined")
+    return null;
+  const marked = rawContent.slice(0, idx) + `<${MARKER}></${MARKER}>` + rawContent.slice(idx + fullMatch.length);
+  const doc = new DOMParser().parseFromString(marked, "text/html");
+  const marker = doc.querySelector(MARKER);
+  if (!marker)
+    return null;
+  let anchor = marker.parentElement;
+  let sel = null;
+  while (anchor && anchor !== doc.body) {
+    sel = signature(anchor);
+    if (sel)
+      break;
+    anchor = anchor.parentElement;
+  }
+  if (!anchor || !sel || anchor === doc.body)
+    return null;
+  const occurrence = Array.from(doc.querySelectorAll(sel)).indexOf(anchor);
+  let beforeSelector = null;
+  if (marker.parentElement === anchor) {
+    for (let n = marker.nextElementSibling;n; n = n.nextElementSibling) {
+      beforeSelector = signature(n);
+      if (beforeSelector)
+        break;
+    }
+  }
+  return { selector: sel, occurrence, beforeSelector };
+}
+function placeAtAnchor(root, anchor, widget) {
+  const candidates = deepQuerySelectorAll(root, anchor.selector).filter((el) => !el.closest("[data-vishrun-widget]"));
+  const target = candidates[anchor.occurrence];
+  if (!target)
+    return false;
+  if (anchor.beforeSelector) {
+    const ref = Array.from(target.children).find((c) => c.matches(anchor.beforeSelector));
+    if (ref) {
+      target.insertBefore(widget, ref);
+      return true;
+    }
+  }
+  target.appendChild(widget);
+  return true;
+}
+
+// src/lumiverse/fetch-message.ts
+function parseMessagesResponse(json) {
+  if (Array.isArray(json))
+    return json;
+  if (json && typeof json === "object" && Array.isArray(json.data)) {
+    return json.data;
+  }
+  return [];
+}
+async function fetchMessageContentById(chatId, messageId) {
+  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
+  if (!r.ok)
+    throw new Error(`messages fetch failed: HTTP ${r.status}`);
+  const json = await r.json();
+  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
+  return m ? m.content : null;
+}
+async function fetchMessageContent(chatId, messageId) {
+  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages?tail=true&limit=1000`, { credentials: "same-origin" });
+  if (!r.ok)
+    return null;
+  const m = parseMessagesResponse(await r.json()).find((mm) => mm.id === messageId);
+  return m ? m.content : null;
+}
+
+// src/render/pending-hide.ts
+var PENDING_ATTR = "data-vishrun-pending";
+var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
+function literalPrefix(source) {
+  let out = "";
+  for (let i = 0;i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      const next = source[i + 1];
+      if (next === undefined || /[A-Za-z0-9]/.test(next))
+        break;
+      out += next;
+      i++;
+      continue;
+    }
+    if (META.has(ch))
+      break;
+    out += ch;
+  }
+  const after = source.slice(out.length);
+  return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
+}
+function literalSuffix(source) {
+  let out = "";
+  let i = source.length - 1;
+  while (i >= 0) {
+    const ch = source[i];
+    const escaped = i > 0 && source[i - 1] === "\\" && !(i > 1 && source[i - 2] === "\\");
+    if (escaped) {
+      if (/[A-Za-z0-9]/.test(ch))
+        break;
+      out = ch + out;
+      i -= 2;
+      continue;
+    }
+    if (META.has(ch))
+      break;
+    out = ch + out;
+    i--;
+  }
+  return out;
+}
+function unterminatedRanges(text, open, close) {
+  const out = [];
+  if (open.length < 3 || close.length === 0)
+    return out;
+  let from = 0;
+  for (;; ) {
+    const o = text.indexOf(open, from);
+    if (o < 0)
+      break;
+    const c = text.indexOf(close, o + open.length);
+    if (c < 0) {
+      out.push([o, text.length]);
+      break;
+    }
+    from = c + close.length;
+  }
+  return out;
+}
+function hide(el) {
+  if (el.hasAttribute(PENDING_ATTR))
+    return;
+  el.setAttribute(PENDING_ATTR, el.style.getPropertyValue("display") || "");
+  el.style.setProperty("display", "none", "important");
+}
+function unhide(el) {
+  const prev = el.getAttribute(PENDING_ATTR);
+  el.removeAttribute(PENDING_ATTR);
+  if (prev)
+    el.style.setProperty("display", prev);
+  else
+    el.style.removeProperty("display");
+}
+function clearPending(root) {
+  deepQuerySelectorAll(root, `[${PENDING_ATTR}]`).forEach(unhide);
+}
+function hideRange(bubble, offsetMap, start, end) {
+  const byNode = new Map;
+  for (const e of offsetMap)
+    byNode.set(e.node, e);
+  const span = (el) => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    const walk = (n) => {
+      const e = byNode.get(n);
+      if (e) {
+        lo = Math.min(lo, e.sourceStart);
+        hi = Math.max(hi, e.sourceEnd);
+      }
+      for (const c of renderedChildNodes(n))
+        walk(c);
+    };
+    walk(el);
+    return lo === Infinity ? null : [lo, hi];
+  };
+  const hidden = new Set;
+  for (const e of offsetMap) {
+    if (e.sourceEnd <= start || e.sourceStart >= end)
+      continue;
+    let el = e.node.parentElement;
+    let best = null;
+    while (el && el !== bubble) {
+      const s = span(el);
+      if (!s || s[0] < start || s[1] > end)
+        break;
+      best = el;
+      const p = el.parentNode;
+      el = p && p.nodeType === 11 ? null : p;
+    }
+    if (best && ![...hidden].some((h) => h.contains(best)))
+      hidden.add(best);
+  }
+  hidden.forEach((el) => hide(el));
+  return hidden.size;
+}
+
+// src/state/generation.ts
+var generating = false;
+function setGenerating(v) {
+  generating = v;
+}
+function isGenerating() {
+  return generating;
+}
+function isLatestMessage(messageId, doc = document) {
+  const all = doc.querySelectorAll("[data-message-id]");
+  const last = all[all.length - 1];
+  return !!last && last.getAttribute("data-message-id") === messageId;
 }
 
 // src/render/inject-into-message.ts
@@ -2622,6 +2971,7 @@ async function processNode(root, scripts, ctx) {
   cleanupOrphansForMessage(messageId, target);
   const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
   let total = 0;
+  clearPending(target);
   try {
     for (const script of scripts) {
       if (!isPlaceholderLikeKind(script.kind))
@@ -2726,8 +3076,17 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
     if (m[0].length === 0)
       script.findRe.lastIndex++;
   }
+  if (isGenerating() && isLatestMessage(messageId)) {
+    const open = literalPrefix(script.findRe.source);
+    const close = literalSuffix(script.findRe.source);
+    for (const [s, e] of unterminatedRanges(linear.text, open, close)) {
+      hideRange(bubble, linear.offsetMap, s, e);
+    }
+  }
   if (matches.length === 0)
     return 0;
+  for (const { start, end } of matches)
+    hideRange(bubble, linear.offsetMap, start, end);
   if (hasRegisteredWidgetsFor(messageId, script.id)) {
     destroyRegisteredWidgetsFor(messageId, script.id);
   }
@@ -2755,6 +3114,7 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
       if (widget.tagName === "IFRAME") {
         destroyWidgetIframe(widget);
       }
+      clearPending(bubble);
     }
   }
   invalidateLinearizedBubble(bubble);
@@ -2771,7 +3131,7 @@ function replaceLinearRange(bubble, offsetMap, start, end, widget) {
   }
   if (!startEntry || !endEntry)
     return false;
-  if (!bubble.contains(startEntry.node) || !bubble.contains(endEntry.node))
+  if (!deepContains(bubble, startEntry.node) || !deepContains(bubble, endEntry.node))
     return false;
   const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
   const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
@@ -2803,13 +3163,14 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H5",
   "H6"
 ]);
+var INLINE_RESIDUE_TAGS = new Set(["A", "SPAN", "EM", "STRONG", "B", "I", "U", "S", "CODE"]);
 function cleanupEmptyAroundWidget(widget, stopAt) {
-  let current2 = widget;
+  let current = widget;
   for (;; ) {
-    const parent = current2.parentElement;
+    const parent = current.parentElement;
     if (!parent)
       break;
-    let prev = current2.previousSibling;
+    let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
       if (isEmptyResidue(prev))
@@ -2818,7 +3179,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
         break;
       prev = next;
     }
-    let nxt = current2.nextSibling;
+    let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
       if (isEmptyResidue(nxt))
@@ -2829,12 +3190,12 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     }
     if (parent === stopAt)
       break;
-    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current2;
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
     if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
       const gparent = parent.parentNode;
       if (!gparent)
         break;
-      gparent.replaceChild(current2, parent);
+      gparent.replaceChild(current, parent);
       continue;
     }
     break;
@@ -2848,6 +3209,9 @@ function isEmptyResidue(node) {
     const el = node;
     if (el.tagName === "BR")
       return true;
+    if (INLINE_RESIDUE_TAGS.has(el.tagName)) {
+      return (el.textContent ?? "").length === 0 && !el.querySelector("img,svg,video,audio,iframe");
+    }
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
       return false;
     return (el.textContent ?? "").length === 0;
@@ -2937,7 +3301,7 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
   const target = findContentRoot(root);
   let added = 0;
   let removed = 0;
-  const existingPaired = target.querySelectorAll("[data-vishrun-widget][data-vishrun-paired-fullmatch]");
+  const existingPaired = deepQuerySelectorAll(target, "[data-vishrun-widget][data-vishrun-paired-fullmatch]");
   existingPaired.forEach((el) => {
     const sid = el.getAttribute("data-vishrun-script-id");
     const fmHash = el.getAttribute("data-vishrun-paired-fullmatch");
@@ -2953,7 +3317,7 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
   });
   for (const cap of captures) {
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
-    if (target.querySelector(sel))
+    if (deepQuerySelector(target, sel))
       continue;
     cap.findRe.lastIndex = 0;
     const m = cap.findRe.exec(cap.fullMatch);
@@ -2985,9 +3349,23 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
     const fromMap = resolvedMap.get(expanded);
     const fromCache = fromMap ?? resolutionCache.get(expanded);
     const finalHtml = fromCache ?? expanded;
+    if (finalHtml.trim() === "") {
+      const marker = ctx.dom.createElement("span", {
+        "data-vishrun-widget": cap.scriptName,
+        "data-vishrun-script-id": cap.scriptId,
+        "data-vishrun-paired-fullmatch": hashKey(cap.fullMatch),
+        hidden: ""
+      });
+      if (target.isConnected && !deepQuerySelector(target, sel)) {
+        target.appendChild(marker);
+        added++;
+      }
+      continue;
+    }
+    const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
     const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
-    if (!target.isConnected || target.querySelector(sel)) {
+    if (!target.isConnected || deepQuerySelector(target, sel)) {
       if (VSH_VISHRUN_DIAG) {
         console.log("[vishrun:render] placeholder-skipped", JSON.stringify({
           messageId,
@@ -2998,10 +3376,33 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
       destroyWidgetIframe(iframe);
       continue;
     }
-    target.appendChild(iframe);
+    if (!anchor || !placeAtAnchor(target, anchor, iframe))
+      target.appendChild(iframe);
     added++;
   }
   return added;
+}
+var anchorCache = new Map;
+async function resolvePairedAnchor(target, messageId, fullMatch, ctx) {
+  if (!hasShadowHost(target))
+    return null;
+  const key = messageId + "\x01" + hashKey(fullMatch);
+  if (anchorCache.has(key))
+    return anchorCache.get(key) ?? null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId)
+    return null;
+  let anchor = null;
+  try {
+    const raw = await fetchMessageContent(chatId, messageId);
+    anchor = raw ? computePairedAnchor(raw, fullMatch) : null;
+  } catch {
+    anchor = null;
+  }
+  if (anchorCache.size > 256)
+    anchorCache.clear();
+  anchorCache.set(key, anchor);
+  return anchor;
 }
 function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
@@ -3021,21 +3422,19 @@ async function buildWidget(html, scriptName, scriptId, messageId, ctx) {
 }
 function collectTextNodes(root) {
   const out = [];
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      let p = node.parentElement;
-      while (p && p !== root) {
-        if (p.hasAttribute("data-vishrun-widget"))
-          return NodeFilter.FILTER_REJECT;
-        p = p.parentElement;
+  const walk = (node) => {
+    for (const child of renderedChildNodes(node)) {
+      if (child.nodeType === 3) {
+        out.push(child);
+      } else if (child.nodeType === 1) {
+        const el = child;
+        if (el.hasAttribute("data-vishrun-widget") || isNonTextElement(el))
+          continue;
+        walk(el);
       }
-      return NodeFilter.FILTER_ACCEPT;
     }
-  });
-  let n;
-  while ((n = walker.nextNode()) !== null) {
-    out.push(n);
-  }
+  };
+  walk(root);
   return out;
 }
 function cssEscape(s) {
@@ -3047,24 +3446,6 @@ function hashKey(s) {
     h = (h << 5) + h + s.charCodeAt(i) | 0;
   }
   return (h >>> 0).toString(36);
-}
-
-// src/lumiverse/fetch-message.ts
-function parseMessagesResponse(json) {
-  if (Array.isArray(json))
-    return json;
-  if (json && typeof json === "object" && Array.isArray(json.data)) {
-    return json.data;
-  }
-  return [];
-}
-async function fetchMessageContentById(chatId, messageId) {
-  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
-  if (!r.ok)
-    throw new Error(`messages fetch failed: HTTP ${r.status}`);
-  const json = await r.json();
-  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
-  return m ? m.content : null;
 }
 
 // src/core/chat-changed-filter.ts
@@ -3159,6 +3540,12 @@ function installMessageHooks(ctx) {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving)
       observer.disconnect();
+    const missed = [];
+    const watchTarget = wasObserving ? observedTarget : null;
+    const pausedWatcher = watchTarget ? new MutationObserver((records) => {
+      missed.push(...records);
+    }) : null;
+    pausedWatcher?.observe(watchTarget, OBSERVE_OPTS);
     try {
       const nodes = document.querySelectorAll("[data-message-id]");
       const tasks = [];
@@ -3167,8 +3554,14 @@ function installMessageHooks(ctx) {
       });
       await Promise.all(tasks);
     } finally {
+      if (pausedWatcher) {
+        missed.push(...pausedWatcher.takeRecords());
+        pausedWatcher.disconnect();
+      }
       if (wasObserving && observedTarget && document.contains(observedTarget)) {
         observer.observe(observedTarget, OBSERVE_OPTS);
+        if (missed.length > 0 && !allSelf(missed))
+          handleMutations(missed);
       }
     }
   }
@@ -3284,7 +3677,15 @@ function installMessageHooks(ctx) {
       scanAllNow(compiled);
     }));
   }
+  const unsubGenStarted = ctx.events.on("GENERATION_STARTED", () => {
+    setGenerating(true);
+  });
+  const unsubGenStopped = ctx.events.on("GENERATION_STOPPED", () => {
+    setGenerating(false);
+    rescanAll();
+  });
   const unsubGenEnded = ctx.events.on("GENERATION_ENDED", (payload) => {
+    setGenerating(false);
     const p = payload || {};
     if (p.error)
       return;
@@ -3309,6 +3710,8 @@ function installMessageHooks(ctx) {
       teardownTagInterceptors();
       clearEditingMessageIds();
       unsubGenEnded();
+      unsubGenStarted();
+      unsubGenStopped();
       unsubChatChanged();
     }
   };
@@ -3412,6 +3815,84 @@ function installStatusBarInjectHook(ctx, io = defaultIO()) {
   });
 }
 
+// src/core/takeover-policy.ts
+var SCRIPT_RE = /<script\b/i;
+var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
+var JS_URL_RE = /javascript\s*:/i;
+var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
+var DOLLAR_ZERO_RE = /\$0(?!\d)/;
+function takeoverReasons(replaceString) {
+  const r = [];
+  if (SCRIPT_RE.test(replaceString))
+    r.push("script");
+  if (EVENT_HANDLER_RE.test(replaceString))
+    r.push("event-handler");
+  if (JS_URL_RE.test(replaceString))
+    r.push("js-url");
+  if (BLOCKED_TAG_RE.test(replaceString))
+    r.push("blocked-tag");
+  if (hasMacros(replaceString))
+    r.push("macro");
+  if (DOLLAR_ZERO_RE.test(replaceString))
+    r.push("dollar-zero");
+  return r;
+}
+function selectTakeoverCandidates(scripts) {
+  const renderable = new Set(compileScripts(scripts).filter((c) => c.kind !== "unknown").map((c) => c.sourceIndex));
+  const out = [];
+  scripts.forEach((s, i) => {
+    if (!renderable.has(i))
+      return;
+    if (typeof s.findRegex !== "string" || typeof s.replaceString !== "string")
+      return;
+    const reasons = takeoverReasons(s.replaceString);
+    if (reasons.length === 0)
+      return;
+    out.push({ name: s.scriptName ?? "", findRegex: s.findRegex, replaceString: s.replaceString, reasons });
+  });
+  return out;
+}
+
+// src/core/regex-takeover-client.ts
+var TIMEOUT_MS = 8000;
+var done = new Set;
+var counter = 0;
+function requestRegexTakeover(ctx, characterId, scripts) {
+  if (done.has(characterId))
+    return Promise.resolve(0);
+  const candidates = selectTakeoverCandidates(scripts);
+  if (candidates.length === 0) {
+    done.add(characterId);
+    return Promise.resolve(0);
+  }
+  done.add(characterId);
+  const requestId = `vishrun-rt-${Date.now()}-${++counter}`;
+  return new Promise((resolve) => {
+    let unsub = null;
+    const timer = setTimeout(() => {
+      unsub?.();
+      done.delete(characterId);
+      resolve(0);
+    }, TIMEOUT_MS);
+    unsub = ctx.onBackendMessage((payload) => {
+      const p = payload;
+      if (!p || p.type !== "regex_takeover_response" || p.requestId !== requestId)
+        return;
+      clearTimeout(timer);
+      unsub?.();
+      if (p.error)
+        done.delete(characterId);
+      resolve(typeof p.disabled === "number" ? p.disabled : 0);
+    });
+    ctx.sendToBackend({
+      type: "regex_takeover",
+      requestId,
+      characterId,
+      scripts: candidates.map((c) => ({ findRegex: c.findRegex, replaceString: c.replaceString }))
+    });
+  });
+}
+
 // src/frontend.ts
 function setup(ctx) {
   const hooks = installMessageHooks(ctx);
@@ -3448,11 +3929,34 @@ function setup(ctx) {
       setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
       hooks.rescanAll();
+      requestRegexTakeover(ctx, characterId, scripts).then((disabled) => {
+        if (disabled === 0)
+          return;
+        ctx.display?.invalidate?.(["*"]);
+        hooks.rescanAll();
+      });
     } catch (err) {
       console.debug("[vishrun] fetchCharacter failed:", err);
     } finally {
       if (inflightCharacterId === characterId)
         inflightCharacterId = null;
+    }
+  }
+  async function resolveActiveCharacterId() {
+    const active = ctx.getActiveChat();
+    if (active.characterId || !active.chatId)
+      return active.characterId ?? null;
+    try {
+      const r = await fetch(`/api/v1/chats/${encodeURIComponent(active.chatId)}?messages=false`, { credentials: "same-origin" });
+      if (!r.ok)
+        return null;
+      const chat = await r.json();
+      const now = ctx.getActiveChat();
+      if (now.chatId !== active.chatId)
+        return now.characterId ?? null;
+      return now.characterId ?? chat.character_id ?? null;
+    } catch {
+      return null;
     }
   }
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
@@ -3466,8 +3970,8 @@ function setup(ctx) {
     const msg = p.message;
     if (!msg || typeof msg.id !== "string" || typeof msg.content !== "string")
       return;
-    const active2 = ctx.getActiveChat();
-    if (active2.chatId && p.chatId && active2.chatId !== p.chatId)
+    const active = ctx.getActiveChat();
+    if (active.chatId && p.chatId && active.chatId !== p.chatId)
       return;
     const destroyReason = eventName === "MESSAGE_EDITED" ? "message-edited" : "message-swiped";
     destroyAllRegisteredWidgetsForMessage(msg.id, destroyReason);
@@ -3483,11 +3987,14 @@ function setup(ctx) {
     const p = payload || {};
     if (p.key !== "activeChatId" && p.key !== "activeCharacterId")
       return;
-    loadFor(ctx.getActiveChat().characterId ?? null);
+    resolveActiveCharacterId().then(loadFor);
   });
   const active = ctx.getActiveChat();
-  if (active.characterId) {
-    loadFor(active.characterId);
+  if (active.characterId || active.chatId) {
+    resolveActiveCharacterId().then((id) => {
+      if (id)
+        loadFor(id);
+    });
   }
   return () => {
     unsubChatChanged();

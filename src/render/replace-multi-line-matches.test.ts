@@ -91,3 +91,18 @@ test('out-of-range start/end returns false (defensive)', () => {
   expect(replaceLinearRange(b, linear.offsetMap, 999, 1000, makeWidget('Z'))).toBe(false);
   expect(b.textContent).toBe('foo');
 });
+
+test('angle-pipe marker split by a markdown autolink is replaced as one range', () => {
+  const b = bubble(
+    '<p>&lt;Music Play|The Verdict|<a href="https://x.test/a.mp3&gt;">https://x.test/a.mp3&gt;</a></p>' +
+    '<p>story</p>',
+  );
+  const linear = linearizeBubble(b);
+  const re = new RegExp('\\<Music Play\\|(.*?)\\|(.*?)\\>');
+  const m = re.exec(linear.text)!;
+  expect(m[1]).toBe('The Verdict');
+  expect(m[2]).toBe('https://x.test/a.mp3');
+  expect(replaceLinearRange(b, linear.offsetMap, m.index, m.index + m[0].length, makeWidget('MUSIC'))).toBe(true);
+  expect(b.textContent).toBe('MUSICstory');
+  expect(b.querySelector('a')).toBeNull();
+});

@@ -643,8 +643,8 @@ var InitvarYamlRecognizer = {
 var LodashSetRecognizer = {
   name: "lodash-set",
   extract(block, ctx) {
-    const calls = parseLodashSetCalls(block, (snippet2, reason) => {
-      ctx?.onDiagnostic?.("unknown-command", { snippet: snippet2, reason });
+    const calls = parseLodashSetCalls(block, (snippet, reason) => {
+      ctx?.onDiagnostic?.("unknown-command", { snippet, reason });
     });
     return calls.map((c) => ({
       kind: "set_path",
@@ -923,12 +923,90 @@ function installThHelpersHandler() {
   });
 }
 
+// src/core/takeover-policy.ts
+function hostPatternOf(findRegex) {
+  const m = findRegex.match(/^\/(.+)\/([dgimsuvy]*)$/s);
+  return m ? m[1] : findRegex;
+}
+
+// src/backend/regex-takeover.ts
+var REQUIRED = ["regex_scripts", "regex_scripts_unrestricted"];
+function isTakeoverRequest(p) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "regex_takeover" && typeof r.requestId === "string" && typeof r.characterId === "string" && Array.isArray(r.scripts);
+}
+function targetsOf(t) {
+  return Array.isArray(t) ? t : [t];
+}
+async function takeoverCharacterRows(regex, characterId, scripts, userId, now = Date.now) {
+  const wanted = new Set(scripts.map((s) => hostPatternOf(s.findRegex) + "\x00" + s.replaceString));
+  if (wanted.size === 0)
+    return 0;
+  const rows = [];
+  for (let offset = 0;; offset += 200) {
+    const page = await regex.list({ scope: "character", scopeId: characterId, limit: 200, offset, userId });
+    rows.push(...page.data);
+    if (page.data.length < 200 || rows.length >= page.total)
+      break;
+  }
+  let disabled = 0;
+  for (const row of rows) {
+    if (row.disabled || row.can_mutate === false)
+      continue;
+    if (!wanted.has(row.find_regex + "\x00" + row.replace_string))
+      continue;
+    if (targetsOf(row.target).includes("prompt"))
+      continue;
+    const meta = row.metadata ?? {};
+    if (meta.vishrun && typeof meta.vishrun === "object")
+      continue;
+    await regex.update(row.id, {
+      disabled: true,
+      metadata: { ...meta, vishrun: { takeover: true, at: now() } }
+    }, userId);
+    disabled++;
+  }
+  return disabled;
+}
+var warnedMissing = false;
+function installRegexTakeoverHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (!isTakeoverRequest(payload))
+      return;
+    const { requestId, characterId, scripts } = payload;
+    (async () => {
+      const response = { type: "regex_takeover_response", requestId, disabled: 0 };
+      try {
+        const granted = await api.permissions.getGranted();
+        const missing = REQUIRED.filter((p) => !granted.includes(p));
+        if (missing.length > 0) {
+          response.missingPermissions = missing;
+          if (!warnedMissing) {
+            warnedMissing = true;
+            console.warn(`[vishrun] grant ${missing.join(" + ")} so imported card scripts do not override Vishrun widgets`);
+          }
+        } else {
+          const regex = api.regex_scripts;
+          response.disabled = await takeoverCharacterRows(regex, characterId, scripts, userId);
+        }
+      } catch (err) {
+        response.error = err instanceof Error ? err.message : String(err);
+        console.warn("[vishrun] regex takeover failed:", response.error);
+      }
+      api.sendToFrontend(response, userId);
+    })();
+  });
+}
+
 // src/backend/index.ts
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
 installDispatchSlashHandler();
 installThHelpersHandler();
+installRegexTakeoverHandler();
 function setup() {}
 export {
   setup
