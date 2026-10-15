@@ -7,6 +7,7 @@ import { registerMvuDisplayStrip } from './hooks/mvu-display-strip';
 import { installStatusBarInjectHook } from './hooks/status-bar-inject';
 import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
+import { requestRegexTakeover } from './core/regex-takeover-client';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -71,10 +72,33 @@ export function setup(ctx: SpindleFrontendContext) {
       setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
       hooks.rescanAll();
+      void requestRegexTakeover(ctx, characterId, scripts).then((disabled) => {
+        if (disabled === 0) return;
+        (ctx as { display?: { invalidate?: (vars: string[]) => void } }).display?.invalidate?.(['*']);
+        hooks.rescanAll();
+      });
     } catch (err) {
       console.debug('[vishrun] fetchCharacter failed:', err);
     } finally {
       if (inflightCharacterId === characterId) inflightCharacterId = null;
+    }
+  }
+
+  // The host sets activeChatId before activeCharacterId when a chat is opened
+  // without a navigation snapshot, so SETTINGS_UPDATED can arrive while the
+  // character is still unknown. Resolve it from the chat record in that case.
+  async function resolveActiveCharacterId(): Promise<string | null> {
+    const active = ctx.getActiveChat();
+    if (active.characterId || !active.chatId) return active.characterId ?? null;
+    try {
+      const r = await fetch(`/api/v1/chats/${encodeURIComponent(active.chatId)}?messages=false`, { credentials: 'same-origin' });
+      if (!r.ok) return null;
+      const chat = (await r.json()) as { character_id?: string | null };
+      const now = ctx.getActiveChat();
+      if (now.chatId !== active.chatId) return now.characterId ?? null;
+      return now.characterId ?? chat.character_id ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -140,7 +164,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
-    void loadFor(ctx.getActiveChat().characterId ?? null);
+    void resolveActiveCharacterId().then(loadFor);
   });
 
   // If Lumiverse already hydrated by the time setup() runs, kick the load
@@ -149,8 +173,8 @@ export function setup(ctx: SpindleFrontendContext) {
   // branch (observer detached) which is correct as a runtime cleanup but
   // wrong as a setup-time default.
   const active = ctx.getActiveChat();
-  if (active.characterId) {
-    void loadFor(active.characterId);
+  if (active.characterId || active.chatId) {
+    void resolveActiveCharacterId().then((id) => { if (id) void loadFor(id); });
   }
 
   return () => {

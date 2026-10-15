@@ -88,3 +88,29 @@ test('explicit \\\\n in source classifies as delimitedCaptureMultiLine', () => {
   const re = new RegExp('【capt】([^\\n]+)\\n([^\\n]+)');
   expect(classifyTrigger(re)).toBe('delimitedCaptureMultiLine');
 });
+
+// ─── angle-pipe markers ─────────────────────────────────────────────────
+
+test('angle-pipe marker with captures classifies as delimitedCaptureMultiLine', () => {
+  expect(classifyTrigger(new RegExp('\\<Music Play\\|(.*?)\\|(.*?)\\>'))).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(new RegExp('<BGM\\|(.*?)>'))).toBe('delimitedCaptureMultiLine');
+});
+
+test('angle-pipe marker without captures stays placeholder', () => {
+  expect(classifyTrigger(new RegExp('\\<Music Play\\|stop\\>'))).toBe('placeholder');
+});
+
+test('tag with attribute capture is not an angle-pipe marker', () => {
+  expect(classifyTrigger(new RegExp('<img src="(.*?)">'))).toBe('unknown');
+});
+
+// ─── square-bracket block markers ───────────────────────────────────────
+
+test('[X_START]…[X_END] markers with a capture classify as delimited', () => {
+  expect(classifyTrigger(new RegExp('\\[ST_START\\]([\\s\\S]*?)\\[ST_END\\]'))).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(new RegExp('\\[HUD\\](.*?)\\[/HUD\\]'))).toBe('unknown');
+});
+
+test('bracketed pipe status line is not a block marker', () => {
+  expect(classifyTrigger(new RegExp('\\[Status Bar\\|(.*?)\\|(.*?)\\]'))).toBe('unknown');
+});

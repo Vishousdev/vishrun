@@ -196,6 +196,9 @@ function textualMarkerName(src: string, kw: 'START OF' | 'END OF'): string | nul
   return name || null;
 }
 
+// Literal square-bracket block markers on both ends, e.g. `\[ST_START\]…\[ST_END\]`.
+const BRACKET_MARKERS_RE = /^\\\[[\w ]+\\\][\s\S]*\\\[[\w ]+\\\]$/;
+
 /**
  * Heuristic: regex carries real capture group(s) AND wraps them in a
  * recognized non-tag delimiter — a Unicode pair from `DELIM_PAIRS` (opener
@@ -214,10 +217,23 @@ export function isDelimitedCapture(re: RegExp): boolean {
     const oi = src.indexOf(open);
     if (oi >= 0 && src.indexOf(close, oi + open.length) >= 0) return true;
   }
+  if (BRACKET_MARKERS_RE.test(src)) return true;
   const n1 = textualMarkerName(src, 'START OF');
   const n2 = textualMarkerName(src, 'END OF');
   if (n1 && n1 === n2) return true;
   return LITERAL_JSON_DELIM_RE.test(src);
+}
+
+// `<Name|cap|cap>` pipe-delimited angle markers (e.g. `<Music Play|(.*?)|(.*?)>`).
+// The pipe after the name keeps them out of HTML tag syntax, so the sanitizer
+// escapes them as text instead of stripping them.
+const ANGLE_PIPE_RE = /^\\?<[A-Za-z][\w ]*\\?\|[\s\S]*\\?>$/;
+
+export function isAnglePipeCapture(re: RegExp): boolean {
+  const src = re.source.replace(/^(?:\\s[*+]?|\s)+/, '').replace(/(?:\\s[*+]?|\s)+$/, '');
+  if (!hasRealCapture(src)) return false;
+  if (/<\\?\//.test(src)) return false;
+  return ANGLE_PIPE_RE.test(src);
 }
 
 /**
@@ -230,6 +246,8 @@ export function classifyTrigger(re: RegExp): TriggerKind {
   if (isPairedTag(re)) return 'pairedTag';
   if (isPlaceholder(re)) return 'placeholder';
   if (isDelimitedCapture(re)) return isMultiLineRegex(re) ? 'delimitedCaptureMultiLine' : 'delimitedCapture';
+  // Linearized path: markdown autolinks URL captures, splitting the match across nodes.
+  if (isAnglePipeCapture(re)) return 'delimitedCaptureMultiLine';
   return 'unknown';
 }
 

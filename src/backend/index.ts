@@ -3,6 +3,7 @@ import { installMacroResolveHandler } from './macro-resolve';
 import { installMessageContentProcessor } from './message-content-processor';
 import { installDispatchSlashHandler } from './dispatch-slash';
 import { installThHelpersHandler } from './th-helpers';
+import { installRegexTakeoverHandler } from './regex-takeover';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -20,6 +21,7 @@ installMacroResolveHandler();
 installMessageContentProcessor();
 installDispatchSlashHandler();
 installThHelpersHandler();
+installRegexTakeoverHandler();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).
