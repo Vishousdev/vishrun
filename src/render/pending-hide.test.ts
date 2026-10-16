@@ -28,3 +28,11 @@ test('whole paragraphs inside the block are hidden and restored', () => {
   clearPending(b);
   expect((ps[1] as HTMLElement).style.display).toBe('');
 });
+
+test('leading and trailing alternations yield each side', async () => {
+  const { leadingLiterals, trailingLiterals } = await import('./pending-hide');
+  const src = /(?:<Status Bar>|<状态栏>)\s*(.*?)\s*(?:<\/Status Bar>|<\/状态栏>)/s.source;
+  expect(leadingLiterals(src)).toEqual(['<Status Bar>', '<状态栏>']);
+  expect(trailingLiterals(src)).toEqual(['</Status Bar>', '</状态栏>']);
+  expect(leadingLiterals('\\[ST_START\\](.*)')).toEqual(['[ST_START]']);
+});

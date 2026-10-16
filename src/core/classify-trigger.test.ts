@@ -143,3 +143,8 @@ test('non-ASCII tag blocks stay text on screen and classify as multi-line', () =
   expect(classifyTrigger(/<简介>\s*([\s\S]*?)\s*<\/简介>\s*<原文>\s*([\s\S]*?)\s*<\/原文>/)).toBe('delimitedCaptureMultiLine');
   expect(classifyTrigger(/<div>(.*?)/)).toBe('unknown');
 });
+
+test('a leading bilingual alternation counts when one side stays text', () => {
+  expect(classifyTrigger(/(?:<Status Bar>|<状态栏>)\s*(?:<Time>|<时间>)(.*?)(?:<\/Time>|<\/时间>)/s)).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(/(?:<div>|<span>)(.*?)/)).toBe('unknown');
+});

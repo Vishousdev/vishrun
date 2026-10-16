@@ -35,7 +35,7 @@
  * The two axes are independent. Step 6 split them; Fix B added the fourth bucket.
  */
 
-import { literalPrefix } from '../render/pending-hide';
+import { leadingLiterals } from '../render/pending-hide';
 
 export type TriggerKind = 'placeholder' | 'pairedTag' | 'strippedTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
 
@@ -244,13 +244,17 @@ export function isAnglePipeCapture(re: RegExp): boolean {
 export function isLiteralAnchoredCapture(re: RegExp): boolean {
   const src = re.source;
   if (!hasRealCapture(src)) return false;
-  const prefix = literalPrefix(src);
+  return leadingLiterals(src).some(isTextAnchor);
+}
+
+// `<` is fine unless markdown would read it as an HTML tag (ASCII name,
+// closing tag, comment or declaration); `<简介>` stays text on screen.
+function isTextAnchor(prefix: string): boolean {
   if (prefix.length < 3) return false;
-  // `<` is fine unless markdown would read it as an HTML tag (ASCII name,
-  // closing tag, comment or declaration); `<简介>` stays text on screen.
   if (/^<[A-Za-z/!?]/.test(prefix)) return false;
   return !/^[\p{L}\p{N}\s]/u.test(prefix);
 }
+
 
 /**
  * Four-bucket classification. Order matters: `pairedTag` wins over `placeholder`
