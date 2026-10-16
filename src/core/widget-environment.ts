@@ -32,6 +32,8 @@ const HELPERS_LIGHT_TOKENS: readonly RegExp[] = [
   /\bsetChatMessage\s*\(/,
   /\bgetCurrentMessageId\s*\(/,
   /\bgetChatId\s*\(/,
+  /\bSillyTavern\s*\.\s*(?:chat|getContext|saveChat|reloadCurrentChat)\b/,
+  /\bwindow\.SillyTavern\b/,
 ];
 
 const SLASH_TOKEN = /\btriggerSlash\s*\(/;

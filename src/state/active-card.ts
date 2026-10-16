@@ -12,6 +12,8 @@ export interface ActiveCard {
   // via PUT /chats/:id/messages/:id sourced from these fields.
   firstMes: string | null;
   alternateGreetings: string[];
+  /** Rows (pattern + NUL + replacement) the host renders itself; Vishrun yields. */
+  nativeKeys?: Set<string>;
 }
 
 let current: ActiveCard | null = null;

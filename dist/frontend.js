@@ -155,10 +155,17 @@ var PENDING_ATTR = "data-vishrun-pending";
 var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
 function literalPrefix(source) {
   let out = "";
-  for (let i = 0;i < source.length; i++) {
+  let i = 0;
+  for (;i < source.length; i++) {
     const ch = source[i];
     if (ch === "\\") {
       const next = source[i + 1];
+      const hex = next === "u" ? /^[0-9A-Fa-f]{4}/.exec(source.slice(i + 2)) : next === "x" ? /^[0-9A-Fa-f]{2}/.exec(source.slice(i + 2)) : null;
+      if (hex) {
+        out += String.fromCharCode(parseInt(hex[0], 16));
+        i += 1 + hex[0].length;
+        continue;
+      }
       if (next === undefined || /[A-Za-z0-9]/.test(next))
         break;
       out += next;
@@ -169,7 +176,7 @@ function literalPrefix(source) {
       break;
     out += ch;
   }
-  const after = source.slice(out.length);
+  const after = source.slice(i);
   return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
 }
 function literalSuffix(source) {
@@ -404,21 +411,26 @@ function isLiteralAnchoredCapture(re) {
   const prefix = literalPrefix(src);
   if (prefix.length < 3)
     return false;
-  return !/^[\p{L}\p{N}\s<]/u.test(prefix);
+  if (/^<[A-Za-z/!?]/.test(prefix))
+    return false;
+  return !/^[\p{L}\p{N}\s]/u.test(prefix);
 }
-function isSelfClosingTag(re) {
+var HTML_TAGS = new Set(("a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col " + "colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 " + "h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark menu meta " + "meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s samp script " + "search section select slot small source span strong style sub summary sup table tbody td template textarea " + "tfoot th thead time title tr track u ul var video wbr font center svg math").split(" "));
+var OPEN_TAG_RE = /^\s*<([A-Za-z][A-Za-z0-9-]*)((?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:"[\s\S]*?"|'[\s\S]*?'|[^\s"'=<>`]+))?)*)\s*\/?>\s*$/;
+function isStrippedTag(re) {
   const src = re.source.replace(/\\s[*+?]/g, " ").replace(/\\([^A-Za-z0-9])/g, "$1");
   if (src.includes("</"))
     return false;
-  return /^\s*<\s*[A-Za-z_][\w-]*(?:\s[\s\S]*)?\/\s*>\s*$/.test(src);
+  const m = OPEN_TAG_RE.exec(src);
+  return !!m && !HTML_TAGS.has(m[1].toLowerCase());
 }
 function classifyTrigger(re) {
   if (isPairedTag(re))
     return "pairedTag";
+  if (isStrippedTag(re))
+    return "strippedTag";
   if (isPlaceholder(re))
     return "placeholder";
-  if (isSelfClosingTag(re))
-    return "selfClosingTag";
   if (isDelimitedCapture(re))
     return isMultiLineRegex(re) ? "delimitedCaptureMultiLine" : "delimitedCapture";
   if (isAnglePipeCapture(re))
@@ -515,11 +527,6 @@ function substitute(template, fullMatch, groups) {
       continue;
     }
     const next = template[i + 1];
-    if (next === "$") {
-      out += "$";
-      i += 2;
-      continue;
-    }
     if (next >= "0" && next <= "9") {
       let endNum = i + 2;
       while (endNum < template.length && template[endNum] >= "0" && template[endNum] <= "9")
@@ -1228,7 +1235,9 @@ var HELPERS_LIGHT_TOKENS = [
   /\bgetChatMessages\s*\(/,
   /\bsetChatMessage\s*\(/,
   /\bgetCurrentMessageId\s*\(/,
-  /\bgetChatId\s*\(/
+  /\bgetChatId\s*\(/,
+  /\bSillyTavern\s*\.\s*(?:chat|getContext|saveChat|reloadCurrentChat)\b/,
+  /\bwindow\.SillyTavern\b/
 ];
 var SLASH_TOKEN = /\btriggerSlash\s*\(/;
 function extractScriptBodies(html) {
@@ -1296,7 +1305,8 @@ function thHelpersShim(consts) {
     currentMessageIndex: consts.currentMessageIndex,
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
-    messagesSnapshot: consts.messagesSnapshot
+    messagesSnapshot: consts.messagesSnapshot,
+    greetings: consts.greetings ?? []
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -1375,6 +1385,51 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
+// SillyTavern global (ST.chat + saveChat). Cards mutate chat[] in place and
+// save; saveChat diffs against the snapshot and routes the changes: a new
+// swipe_id on the greeting goes to setChatMessages, an edited mes to
+// setChatMessage. reloadCurrentChat is a no-op: the host re-renders on save.
+if (!window.SillyTavern) {
+  var stChat = THC.messagesSnapshot.map(function(m){
+    return {
+      name: m.name, is_user: m.role === 'user', is_system: false,
+      mes: m.message, swipe_id: m.swipe_id, swipes: (m.swipes || []).slice(), extra: m.extra || {}
+    };
+  });
+  // The greeting lives in slot 0 with its text swapped, so the snapshot cannot
+  // tell which greeting is shown. Use the card greetings and match the text.
+  var greetings = THC.greetings || [];
+  if (stChat[0] && !stChat[0].is_user && greetings.length > 1) {
+    var norm = function(s){ return String(s == null ? '' : s).replace(/\\r\\n?/g, '\\n').trim(); };
+    var shown = norm(stChat[0].mes);
+    stChat[0].swipes = greetings.slice();
+    stChat[0].swipe_id = -1;
+    for (var g = 0; g < greetings.length; g++) {
+      if (norm(greetings[g]) === shown) { stChat[0].swipe_id = g; break; }
+    }
+  }
+  var stBase = stChat.map(function(m){ return { swipe_id: m.swipe_id, mes: m.mes }; });
+  var saveChat = function(){
+    var jobs = [];
+    for (var i = 0; i < stChat.length; i++) {
+      var m = stChat[i], b = stBase[i];
+      if (!m || !b) continue;
+      if (i === 0 && m.swipe_id !== b.swipe_id && typeof window.setChatMessages === 'function') {
+        window.setChatMessages([{ message_id: 0, swipe_id: m.swipe_id }]);
+      } else if (m.mes !== b.mes) {
+        jobs.push(window.setChatMessage({ message: m.mes }, i));
+      }
+      stBase[i] = { swipe_id: m.swipe_id, mes: m.mes };
+    }
+    return Promise.all(jobs).then(function(){});
+  };
+  var reloadCurrentChat = function(){ return Promise.resolve(); };
+  var stContext = function(){
+    return { chat: stChat, chatId: THC.chatId, getCurrentChatId: function(){ return THC.chatId; },
+      saveChat: saveChat, reloadCurrentChat: reloadCurrentChat };
+  };
+  window.SillyTavern = { chat: stChat, saveChat: saveChat, reloadCurrentChat: reloadCurrentChat, getContext: stContext };
+}
 })();</script>`;
 }
 
@@ -1824,6 +1879,12 @@ function buildSizeReporterShell() {
           }
         }
         var bottom = rect.bottom + window.scrollY + marginBottom + shadowDown;
+        // Fixed elements sit against the frame viewport and add no height of
+        // their own: reserve their size plus offsets. Viewport-sized ones
+        // (overlays) follow the frame and are skipped.
+        if (cs.position === 'fixed' && rect.height > 0 && Math.abs(rect.height - window.innerHeight) > 1) {
+          bottom = rect.height + Math.max(0, parseFloat(cs.top) || 0) + Math.max(0, parseFloat(cs.bottom) || 0);
+        }
         if (bottom > maxBottom) maxBottom = bottom;
       }
       if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
@@ -1855,6 +1916,8 @@ function buildSizeReporterShell() {
       } catch (e) {}
     }
     window.addEventListener('load', postSize);
+    // Proxied images arrive after window load; fixed elements do not resize body.
+    document.addEventListener('load', function(e) { if (e.target && e.target.tagName === 'IMG') postSize(); }, true);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
@@ -2163,10 +2226,17 @@ function buildHeadInjection(iframeCtx) {
     currentMessageIndex: iframeCtx.currentMessageIndex,
     currentMessageId: iframeCtx.messageId,
     chatId: iframeCtx.chatId,
-    messagesSnapshot: iframeCtx.messagesSnapshot
+    messagesSnapshot: iframeCtx.messagesSnapshot,
+    greetings: cardGreetings()
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
   return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + audioProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+}
+function cardGreetings() {
+  const card = getActiveCard();
+  if (!card)
+    return [];
+  return [card.firstMes ?? "", ...card.alternateGreetings];
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -2667,7 +2737,7 @@ var activeTagNames = new Set;
 function syncTagInterceptors(ctx, compiled, recovery) {
   const desired = new Map;
   for (const s of compiled) {
-    if (s.kind !== "pairedTag")
+    if (s.kind !== "pairedTag" || s.native)
       continue;
     const tags = extractAllTagNames(s.findRe.source);
     if (tags.length === 0) {
@@ -2677,7 +2747,7 @@ function syncTagInterceptors(ctx, compiled, recovery) {
     desired.set(tags[0].toLowerCase(), { script: s, role: "capture" });
   }
   for (const s of compiled) {
-    if (s.kind !== "pairedTag")
+    if (s.kind !== "pairedTag" || s.native)
       continue;
     const tags = extractAllTagNames(s.findRe.source);
     for (let i = 1;i < tags.length; i++) {
@@ -2711,15 +2781,15 @@ function teardownTagInterceptors() {
   activeUnsubs = [];
   activeTagNames = new Set;
 }
-function syncSelfClosingCaptures(messageId, content, compiled) {
+function syncStrippedTagCaptures(messageId, content, compiled) {
   const text = content.replace(/\r\n?/g, `
 `);
-  const isSelfClosing = (id) => compiled.some((s) => s.id === id && s.kind === "selfClosingTag");
+  const isStripped = (id) => compiled.some((s) => s.id === id && s.kind === "strippedTag");
   const current = capturesByMessage.get(messageId) || [];
-  const kept = current.filter((c) => !isSelfClosing(c.scriptId));
+  const kept = current.filter((c) => !isStripped(c.scriptId));
   const fresh = [];
   for (const script of compiled) {
-    if (script.kind !== "selfClosingTag")
+    if (script.kind !== "strippedTag" || script.native)
       continue;
     const re = new RegExp(script.findRe.source, script.findRe.flags);
     let last = null;
@@ -2741,7 +2811,7 @@ function syncSelfClosingCaptures(messageId, content, compiled) {
     }
   }
   const key = (c) => c.scriptId + "\x01" + c.fullMatch;
-  const before = current.filter((c) => isSelfClosing(c.scriptId)).map(key);
+  const before = current.filter((c) => isStripped(c.scriptId)).map(key);
   const after = fresh.map(key);
   const changed = before.length !== after.length || before.some((k, i) => k !== after[i]);
   const list = kept.concat(fresh);
@@ -2755,7 +2825,7 @@ function rebuildCapturesFromContent(messageId, content, compiled, _eventName) {
   const newList = [];
   let working = content;
   for (const script of compiled) {
-    if (script.kind !== "pairedTag" && script.kind !== "selfClosingTag")
+    if (script.kind !== "pairedTag" && script.kind !== "strippedTag" || script.native)
       continue;
     script.findRe.lastIndex = 0;
     let lastMatch = null;
@@ -2852,13 +2922,13 @@ async function recoverFullCapture(messageId, chatId, script, payload, recovery) 
     recoveryInFlight.delete(messageId);
   }
 }
-var OPEN_TAG_RE = /<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/g;
+var OPEN_TAG_RE2 = /<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/g;
 function extractAllTagNames(reSource) {
-  OPEN_TAG_RE.lastIndex = 0;
+  OPEN_TAG_RE2.lastIndex = 0;
   const names = [];
   const seen = new Set;
   let m;
-  while ((m = OPEN_TAG_RE.exec(reSource)) !== null) {
+  while ((m = OPEN_TAG_RE2.exec(reSource)) !== null) {
     const lower = m[1].toLowerCase();
     if (seen.has(lower))
       continue;
@@ -3171,7 +3241,7 @@ async function processNode(root, scripts, ctx) {
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
   try {
-    await refreshSelfClosingCaptures(target, scripts, messageId, ctx);
+    await refreshStrippedTagCaptures(target, scripts, messageId, ctx);
     await reconcileNestedTagCaptures(scripts, messageId, ctx);
   } catch (err) {
     console.debug("[vishrun] tag capture refresh failed:", err);
@@ -3181,7 +3251,7 @@ async function processNode(root, scripts, ctx) {
   clearPending(target);
   try {
     for (const script of scripts) {
-      if (!isPlaceholderLikeKind(script.kind))
+      if (!isPlaceholderLikeKind(script.kind) || script.native)
         continue;
       if (script.kind === "delimitedCaptureMultiLine") {
         total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
@@ -3222,7 +3292,7 @@ function collectExpandedTemplates(root, scripts, messageId) {
   const out = new Set;
   const textNodes = collectTextNodes(root);
   for (const script of scripts) {
-    if (!isPlaceholderLikeKind(script.kind))
+    if (!isPlaceholderLikeKind(script.kind) || script.native)
       continue;
     if (script.kind === "delimitedCaptureMultiLine") {
       const bubble = findContentRoot(root);
@@ -3476,7 +3546,9 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
 }
 function isEmptyResidue(node) {
   if (node.nodeType === Node.TEXT_NODE) {
-    return (node.nodeValue ?? "").length === 0;
+    const v = node.nodeValue ?? "";
+    return v.length === 0 || v.includes(`
+`) && v.trim() === "";
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node;
@@ -3487,7 +3559,7 @@ function isEmptyResidue(node) {
     }
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
       return false;
-    return (el.textContent ?? "").length === 0;
+    return (el.textContent ?? "").trim() === "" && !el.querySelector("img,svg,video,audio,iframe,canvas,[data-vishrun-widget]");
   }
   return false;
 }
@@ -3569,9 +3641,9 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
   }
   return count;
 }
-var selfClosingSeen = new Map;
-async function refreshSelfClosingCaptures(target, scripts, messageId, ctx) {
-  if (!scripts.some((s) => s.kind === "selfClosingTag"))
+var strippedTagSeen = new Map;
+async function refreshStrippedTagCaptures(target, scripts, messageId, ctx) {
+  if (!scripts.some((s) => s.kind === "strippedTag" && !s.native))
     return;
   if (isGenerating() && isLatestMessage(messageId))
     return;
@@ -3579,7 +3651,7 @@ async function refreshSelfClosingCaptures(target, scripts, messageId, ctx) {
   if (!chatId)
     return;
   const sig = chatId + "\x01" + hashKey(target.textContent ?? "");
-  if (selfClosingSeen.get(messageId) === sig)
+  if (strippedTagSeen.get(messageId) === sig)
     return;
   let raw = null;
   try {
@@ -3589,11 +3661,11 @@ async function refreshSelfClosingCaptures(target, scripts, messageId, ctx) {
   }
   if (raw == null)
     return;
-  selfClosingSeen.set(messageId, sig);
-  syncSelfClosingCaptures(messageId, raw, scripts);
+  strippedTagSeen.set(messageId, sig);
+  syncStrippedTagCaptures(messageId, raw, scripts);
 }
 async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolvedMap) {
-  const captures = getCapturesForMessage(messageId);
+  const captures = getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native));
   const target = findContentRoot(root);
   let added = 0;
   let removed = 0;
@@ -3686,7 +3758,7 @@ async function reconcileNestedTagCaptures(scripts, messageId, ctx) {
   const caps = getCapturesForMessage(messageId);
   if (caps.length < 2)
     return;
-  const tagScripts = scripts.filter((s) => s.kind === "pairedTag" || s.kind === "selfClosingTag");
+  const tagScripts = scripts.filter((s) => (s.kind === "pairedTag" || s.kind === "strippedTag") && !s.native);
   if (tagScripts.length < 2)
     return;
   const sig = caps.map((c) => c.scriptId + "\x01" + hashKey(c.fullMatch)).join("|");
@@ -3869,6 +3941,48 @@ function hashKey(s) {
   return (h >>> 0).toString(36);
 }
 
+// src/core/takeover-policy.ts
+var SCRIPT_RE = /<script\b/i;
+var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
+var JS_URL_RE = /javascript\s*:/i;
+var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
+var DOLLAR_ZERO_RE = /\$0(?!\d)/;
+function takeoverReasons(replaceString) {
+  const r = [];
+  if (SCRIPT_RE.test(replaceString))
+    r.push("script");
+  if (EVENT_HANDLER_RE.test(replaceString))
+    r.push("event-handler");
+  if (JS_URL_RE.test(replaceString))
+    r.push("js-url");
+  if (BLOCKED_TAG_RE.test(replaceString))
+    r.push("blocked-tag");
+  if (hasMacros(replaceString))
+    r.push("macro");
+  if (DOLLAR_ZERO_RE.test(replaceString))
+    r.push("dollar-zero");
+  return r;
+}
+function selectTakeoverCandidates(scripts) {
+  const renderable = new Set(compileScripts(scripts).filter((c) => c.kind !== "unknown").map((c) => c.sourceIndex));
+  const out = [];
+  scripts.forEach((s, i) => {
+    if (!renderable.has(i))
+      return;
+    if (typeof s.findRegex !== "string" || typeof s.replaceString !== "string")
+      return;
+    const reasons = takeoverReasons(s.replaceString);
+    if (reasons.length === 0)
+      return;
+    out.push({ name: s.scriptName ?? "", findRegex: s.findRegex, replaceString: s.replaceString, reasons });
+  });
+  return out;
+}
+function hostPatternOf(findRegex) {
+  const m = findRegex.match(/^\/(.+)\/([dgimsuvy]*)$/s);
+  return m ? m[1] : findRegex;
+}
+
 // src/core/chat-changed-filter.ts
 var VAR_PATH_RE = /^metadata\.(macro_variables|chat_variables)(\.|$)/;
 function shouldRescanForChangedFields(changedFields) {
@@ -3933,6 +4047,13 @@ function installMessageHooks(ctx) {
     if (!card)
       return null;
     const compiled = compileScripts(card.scripts);
+    if (card.nativeKeys && card.nativeKeys.size > 0) {
+      for (const c of compiled) {
+        const raw = card.scripts[c.sourceIndex];
+        if (raw && card.nativeKeys.has(hostPatternOf(raw.findRegex) + "\x00" + (raw.replaceString ?? "")))
+          c.native = true;
+      }
+    }
     return compiled.length === 0 ? null : compiled;
   }
   function isActiveChat(chatId) {
@@ -4213,75 +4334,42 @@ function defaultIO() {
     }
   };
 }
-function installStatusBarInjectHook(ctx, io = defaultIO()) {
+function cardUsesStatusPlaceholder(scripts) {
+  return scripts.some((s) => !s.disabled && typeof s.findRegex === "string" && /StatusPlaceHolderImpl/.test(s.findRegex));
+}
+function installStatusBarInjectHook(ctx, io = defaultIO(), wanted = () => cardUsesStatusPlaceholder(getActiveCard()?.scripts ?? [])) {
   return ctx.events.on("GENERATION_ENDED", (payload) => {
     const p = payload || {};
     if (p.error)
       return;
     if (!p.messageId || !p.chatId)
       return;
+    if (!wanted())
+      return;
     maybeInjectStatusPlaceholder(p.chatId, p.messageId, io);
   });
 }
 
-// src/core/takeover-policy.ts
-var SCRIPT_RE = /<script\b/i;
-var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
-var JS_URL_RE = /javascript\s*:/i;
-var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
-var DOLLAR_ZERO_RE = /\$0(?!\d)/;
-function takeoverReasons(replaceString) {
-  const r = [];
-  if (SCRIPT_RE.test(replaceString))
-    r.push("script");
-  if (EVENT_HANDLER_RE.test(replaceString))
-    r.push("event-handler");
-  if (JS_URL_RE.test(replaceString))
-    r.push("js-url");
-  if (BLOCKED_TAG_RE.test(replaceString))
-    r.push("blocked-tag");
-  if (hasMacros(replaceString))
-    r.push("macro");
-  if (DOLLAR_ZERO_RE.test(replaceString))
-    r.push("dollar-zero");
-  return r;
-}
-function selectTakeoverCandidates(scripts) {
-  const renderable = new Set(compileScripts(scripts).filter((c) => c.kind !== "unknown").map((c) => c.sourceIndex));
-  const out = [];
-  scripts.forEach((s, i) => {
-    if (!renderable.has(i))
-      return;
-    if (typeof s.findRegex !== "string" || typeof s.replaceString !== "string")
-      return;
-    const reasons = takeoverReasons(s.replaceString);
-    if (reasons.length === 0)
-      return;
-    out.push({ name: s.scriptName ?? "", findRegex: s.findRegex, replaceString: s.replaceString, reasons });
-  });
-  return out;
-}
-
 // src/core/regex-takeover-client.ts
 var TIMEOUT_MS2 = 8000;
-var done = new Set;
 var counter2 = 0;
+var results = new Map;
+var known = new Map;
+function knownNativeKeys(characterId) {
+  return known.get(characterId);
+}
 function requestRegexTakeover(ctx, characterId, scripts) {
-  if (done.has(characterId))
-    return Promise.resolve(0);
+  const hit = results.get(characterId);
+  if (hit)
+    return hit;
   const candidates = selectTakeoverCandidates(scripts);
-  if (candidates.length === 0) {
-    done.add(characterId);
-    return Promise.resolve(0);
-  }
-  done.add(characterId);
   const requestId = `vishrun-rt-${Date.now()}-${++counter2}`;
-  return new Promise((resolve) => {
+  const pending = new Promise((resolve) => {
     let unsub = null;
     const timer = setTimeout(() => {
       unsub?.();
-      done.delete(characterId);
-      resolve(0);
+      results.delete(characterId);
+      resolve({ disabled: 0, native: [] });
     }, TIMEOUT_MS2);
     unsub = ctx.onBackendMessage((payload) => {
       const p = payload;
@@ -4290,8 +4378,11 @@ function requestRegexTakeover(ctx, characterId, scripts) {
       clearTimeout(timer);
       unsub?.();
       if (p.error)
-        done.delete(characterId);
-      resolve(typeof p.disabled === "number" ? p.disabled : 0);
+        results.delete(characterId);
+      const native = Array.isArray(p.native) ? p.native.filter((k) => typeof k === "string") : [];
+      if (!p.error)
+        known.set(characterId, native);
+      resolve({ disabled: typeof p.disabled === "number" ? p.disabled : 0, native });
     });
     ctx.sendToBackend({
       type: "regex_takeover",
@@ -4300,6 +4391,8 @@ function requestRegexTakeover(ctx, characterId, scripts) {
       scripts: candidates.map((c) => ({ findRegex: c.findRegex, replaceString: c.replaceString }))
     });
   });
+  results.set(characterId, pending);
+  return pending;
 }
 
 // src/frontend.ts
@@ -4336,11 +4429,26 @@ function setup(ctx) {
       }
       const firstMes = typeof char.first_mes === "string" ? char.first_mes : null;
       const alternateGreetings = Array.isArray(char.alternate_greetings) ? char.alternate_greetings.filter((g) => typeof g === "string") : [];
-      setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
+      const nativeNow = knownNativeKeys(characterId);
+      setActiveCard({
+        characterId,
+        characterName: name,
+        scripts,
+        firstMes,
+        alternateGreetings,
+        ...nativeNow ? { nativeKeys: new Set(nativeNow) } : {}
+      });
       lastLoadedCharacterId = characterId;
       hooks.rescanAll();
-      requestRegexTakeover(ctx, characterId, scripts).then((disabled) => {
-        if (disabled === 0)
+      requestRegexTakeover(ctx, characterId, scripts).then(({ disabled, native }) => {
+        const card = getActiveCard();
+        if (!card || card.characterId !== characterId)
+          return;
+        const prev = card.nativeKeys ?? new Set;
+        const next = new Set(native);
+        const changed = prev.size !== next.size || [...next].some((k) => !prev.has(k));
+        card.nativeKeys = next;
+        if (disabled === 0 && !changed)
           return;
         ctx.display?.invalidate?.(["*"]);
         hooks.rescanAll();

@@ -272,3 +272,10 @@ test('inferred assistant (no role field, is_user: false): writes paired form', a
   expect(updates).toHaveLength(1);
   expect(updates[0].content.endsWith('\n\n' + STATUS_PLACEHOLDER_PAIRED)).toBe(true);
 });
+
+test('only cards with a StatusPlaceHolderImpl script get the placeholder', async () => {
+  const { cardUsesStatusPlaceholder } = await import('./status-bar-inject');
+  expect(cardUsesStatusPlaceholder([{ findRegex: '<StatusPlaceHolderImpl/>' }])).toBe(true);
+  expect(cardUsesStatusPlaceholder([{ findRegex: '<StatusPlaceHolderImpl/>', disabled: true }])).toBe(false);
+  expect(cardUsesStatusPlaceholder([{ findRegex: '<TXT>(.*?)</TXT>' }])).toBe(false);
+});

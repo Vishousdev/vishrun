@@ -88,6 +88,12 @@ export function buildSizeReporterShell(): string {
           }
         }
         var bottom = rect.bottom + window.scrollY + marginBottom + shadowDown;
+        // Fixed elements sit against the frame viewport and add no height of
+        // their own: reserve their size plus offsets. Viewport-sized ones
+        // (overlays) follow the frame and are skipped.
+        if (cs.position === 'fixed' && rect.height > 0 && Math.abs(rect.height - window.innerHeight) > 1) {
+          bottom = rect.height + Math.max(0, parseFloat(cs.top) || 0) + Math.max(0, parseFloat(cs.bottom) || 0);
+        }
         if (bottom > maxBottom) maxBottom = bottom;
       }
       if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
@@ -119,6 +125,8 @@ export function buildSizeReporterShell(): string {
       } catch (e) {}
     }
     window.addEventListener('load', postSize);
+    // Proxied images arrive after window load; fixed elements do not resize body.
+    document.addEventListener('load', function(e) { if (e.target && e.target.tagName === 'IMG') postSize(); }, true);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

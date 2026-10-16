@@ -17,6 +17,8 @@ export interface TakeoverResponse {
   type: 'regex_takeover_response';
   requestId: string;
   disabled: number;
+  /** pattern + NUL + replacement of the character's rows the host still renders. */
+  native?: string[];
   missingPermissions?: string[];
   error?: string;
 }
@@ -82,6 +84,21 @@ export async function takeoverCharacterRows(
   return disabled;
 }
 
+// Enabled display rows for the character, after any takeover: the host renders
+// these itself, so Vishrun leaves them alone at the top level.
+export async function nativeDisplayKeys(regex: RegexApi, characterId: string, userId: string): Promise<string[]> {
+  const out: string[] = [];
+  for (let offset = 0; ; offset += 200) {
+    const page = await regex.list({ scope: 'character', scopeId: characterId, limit: 200, offset, userId });
+    for (const row of page.data) {
+      if (row.disabled || !targetsOf(row.target).includes('display')) continue;
+      out.push(row.find_regex + '\u0000' + row.replace_string);
+    }
+    if (page.data.length < 200 || offset + 200 >= page.total) break;
+  }
+  return out;
+}
+
 let warnedMissing = false;
 
 export function installRegexTakeoverHandler(): void {
@@ -102,6 +119,7 @@ export function installRegexTakeoverHandler(): void {
         } else {
           const regex = (api as unknown as { regex_scripts: RegexApi }).regex_scripts;
           response.disabled = await takeoverCharacterRows(regex, characterId, scripts, userId);
+          response.native = await nativeDisplayKeys(regex, characterId, userId);
         }
       } catch (err) {
         response.error = err instanceof Error ? err.message : String(err);

@@ -7,8 +7,8 @@
  *    such macro, so we expand it here while the full match is in hand (used by
  *    the Jujutsu Check scripts, `{{setvar::var::$N}}{{match}}`).
  *  - `$1..$N` → 1-indexed capture groups.
- *  - `$$`   → escaped literal `$` (defensive — none of the cards in scope
- *             use it, but the standard String.replace contract includes it).
+ *  - `$$` stays as written: SillyTavern only substitutes `$N`, so card code
+ *    such as `var $$=function(...)` must reach the widget unchanged.
  *  - Missing groups (e.g. `$5` when only 1 group exists) substitute to empty
  *    string, matching JS's RegExp.exec behavior for missing captures.
  *
@@ -32,7 +32,6 @@ export function substitute(template: string, fullMatch: string, groups: string[]
       continue;
     }
     const next = template[i + 1];
-    if (next === '$') { out += '$'; i += 2; continue; }
     if (next >= '0' && next <= '9') {
       // Greedy: $12 reads as group 12 if present, else falls back to $1 + '2'.
       // Cards in scope only use single-digit references, but be sane about it.

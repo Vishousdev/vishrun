@@ -2,6 +2,7 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { compileScripts, type CompiledScript } from '../core/parse-regex-script';
 import { processNode, clearEditingMessageIds } from '../render/inject-into-message';
 import { getActiveCard } from '../state/active-card';
+import { hostPatternOf } from '../core/takeover-policy';
 import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor';
 import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
@@ -78,6 +79,12 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     const card = getActiveCard();
     if (!card) return null;
     const compiled = compileScripts(card.scripts);
+    if (card.nativeKeys && card.nativeKeys.size > 0) {
+      for (const c of compiled) {
+        const raw = card.scripts[c.sourceIndex];
+        if (raw && card.nativeKeys.has(hostPatternOf(raw.findRegex) + '\u0000' + (raw.replaceString ?? ''))) c.native = true;
+      }
+    }
     return compiled.length === 0 ? null : compiled;
   }
 

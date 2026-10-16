@@ -2,6 +2,7 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
 import { parseMessagesResponse } from '../lumiverse/fetch-message';
 import { getChatMessages, updateMessageContent } from '../lumiverse/host-api';
+import { getActiveCard } from '../state/active-card';
 
 // Re-export for callers/tests that imported it from here historically.
 export { parseMessagesResponse };
@@ -121,14 +122,22 @@ interface GenerationEndedPayload {
 
 // GENERATION_ENDED fires once per LLM generation after the message is
 // finalized; streaming events would race the post-stream commit.
+// Only cards with a script on the placeholder tag need the mount point; any
+// other card would get the tag written into its stored replies for nothing.
+export function cardUsesStatusPlaceholder(scripts: ReadonlyArray<{ findRegex?: unknown; disabled?: boolean }>): boolean {
+  return scripts.some((s) => !s.disabled && typeof s.findRegex === 'string' && /StatusPlaceHolderImpl/.test(s.findRegex));
+}
+
 export function installStatusBarInjectHook(
   ctx: SpindleFrontendContext,
   io: InjectIO = defaultIO(),
+  wanted: () => boolean = () => cardUsesStatusPlaceholder(getActiveCard()?.scripts ?? []),
 ): () => void {
   return ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
     const p = (payload || {}) as GenerationEndedPayload;
     if (p.error) return;
     if (!p.messageId || !p.chatId) return;
+    if (!wanted()) return;
     void maybeInjectStatusPlaceholder(p.chatId, p.messageId, io);
   });
 }

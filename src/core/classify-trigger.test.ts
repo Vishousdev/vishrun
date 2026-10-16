@@ -11,8 +11,12 @@ test('CJK brackets with no captures classify as placeholder', () => {
   expect(classifyTrigger(new RegExp('【女王蜂】'))).toBe('placeholder');
 });
 
-test('self-closing tag with no captures classifies as placeholder', () => {
-  expect(classifyTrigger(/<StatusPlaceHolderImpl\/>/)).toBe('placeholder');
+test('lone non-HTML tags classify as strippedTag', () => {
+  expect(classifyTrigger(/<StatusPlaceHolderImpl\/>/)).toBe('strippedTag');
+  expect(classifyTrigger(/<Podcast Opening>/)).toBe('strippedTag');
+  expect(classifyTrigger(/<Return to Home>/)).toBe('strippedTag');
+  expect(classifyTrigger(/<br>/)).toBe('placeholder');
+  expect(classifyTrigger(/【開場白】/)).toBe('placeholder');
 });
 
 test('paired tag with single capture classifies as pairedTag', () => {
@@ -128,9 +132,14 @@ test('word-led or short-prefixed captures stay unknown', () => {
   expect(classifyTrigger(new RegExp('\\d+(x)'))).toBe('unknown');
 });
 
-test('self-closing tag with captures classifies as selfClosingTag', () => {
-  expect(classifyTrigger(/\<bgm src\=\"(.*?)\" artist\=\"(.*?)\" song\=\"(.*?)\" \/\>/)).toBe('selfClosingTag');
-  expect(classifyTrigger(/<sfx\s*name="([^"]+)"\s*\/>/)).toBe('selfClosingTag');
-  expect(classifyTrigger(/<img src="(.*?)">/)).not.toBe('selfClosingTag');
+test('self-closing tag with captures classifies as strippedTag', () => {
+  expect(classifyTrigger(/\<bgm src\=\"(.*?)\" artist\=\"(.*?)\" song\=\"(.*?)\" \/\>/)).toBe('strippedTag');
+  expect(classifyTrigger(/<sfx\s*name="([^"]+)"\s*\/>/)).toBe('strippedTag');
+  expect(classifyTrigger(/<img src="(.*?)">/)).not.toBe('strippedTag');
   expect(classifyTrigger(/<bgm>(.*?)<\/bgm>/)).toBe('pairedTag');
+});
+
+test('non-ASCII tag blocks stay text on screen and classify as multi-line', () => {
+  expect(classifyTrigger(/<简介>\s*([\s\S]*?)\s*<\/简介>\s*<原文>\s*([\s\S]*?)\s*<\/原文>/)).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(/<div>(.*?)/)).toBe('unknown');
 });

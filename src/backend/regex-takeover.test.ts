@@ -30,3 +30,21 @@ test('leaves prompt rows, user-edited rows, re-enabled rows and disabled rows al
   expect(await takeoverCharacterRows(api, 'c1', [SCRIPT], 'u')).toBe(0);
   expect(updates).toEqual([]);
 });
+
+test('nativeDisplayKeys lists enabled display rows only', async () => {
+  const { nativeDisplayKeys } = await import('./regex-takeover');
+  const api = {
+    async list() {
+      return {
+        total: 3,
+        data: [
+          { id: 'a', find_regex: '<TXT>(.*?)</TXT>', replace_string: '<b>$1</b>', target: ['display'], disabled: false },
+          { id: 'b', find_regex: '<X>', replace_string: '<script>1</script>', target: ['display'], disabled: true },
+          { id: 'c', find_regex: 'p', replace_string: 'q', target: ['prompt'], disabled: false },
+        ],
+      };
+    },
+    async update() { return null; },
+  } as unknown as RegexApi;
+  expect(await nativeDisplayKeys(api, 'c1', 'u')).toEqual(['<TXT>(.*?)</TXT>\u0000<b>$1</b>']);
+});
