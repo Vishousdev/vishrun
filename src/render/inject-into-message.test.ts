@@ -189,3 +189,25 @@ test('MVU snapshot determinism: same message content yields the same stat_data a
   expect(snap1).toEqual(snap2);
   expect(snap1.stat_data).toEqual({ rep: 50, location: 'library' });
 });
+
+test('placeByRawOrder follows the stored message order', async () => {
+  const { placeByRawOrder } = await import('./inject-into-message');
+  const { compileScripts } = await import('../core/parse-regex-script');
+  const scripts = compileScripts([
+    { id: 'home', scriptName: 'home', findRegex: '【HOME】', replaceString: '<b>h</b>' },
+    { id: 'bar', scriptName: 'bar', findRegex: '<bar>(.*?)</bar>', replaceString: '<i>$1</i>' },
+  ]);
+  const text = 'Intro text\n<bar>x</bar>\n【HOME】\n';
+  const pos = { text, start: text.indexOf('<bar>'), end: text.indexOf('</bar>') + 6 };
+  const root = document.createElement('div');
+  root.innerHTML = '<p>Intro text</p><p><iframe data-vishrun-widget="home" data-vishrun-script-id="home"></iframe></p>';
+  const bar = document.createElement('iframe');
+  bar.setAttribute('data-vishrun-widget', 'bar');
+  placeByRawOrder(root, bar, pos, scripts, [{ scriptId: 'bar', fullMatch: '<bar>x</bar>' }]);
+  expect(bar.nextElementSibling?.getAttribute('data-vishrun-script-id')).toBe('home');
+
+  const lead = document.createElement('iframe');
+  const t2 = '  <bar>y</bar> rest';
+  placeByRawOrder(root, lead, { text: t2, start: 2, end: 14 }, scripts, []);
+  expect(root.firstChild).toBe(lead);
+});

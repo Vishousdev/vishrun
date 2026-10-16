@@ -101,7 +101,7 @@ test('Mvu + jQuery + lodash + waitGlobalInitialized -> tavern-mvu (Queen Bee Sta
   expect(classifyWidgetEnvironment(html)).toBe('tavern-mvu');
 });
 
-test('triggerSlash -> tavern-slash (Zhou Fang shape)', () => {
+test('triggerSlash -> tavern-slash (button calling triggerSlash)', () => {
   const html = `<script>
     if (typeof triggerSlash === 'function') {
       triggerSlash('/send hi|/trigger');

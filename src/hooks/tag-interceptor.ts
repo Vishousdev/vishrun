@@ -175,6 +175,48 @@ export function teardownTagInterceptors(): void {
  * Returns true if capturesByMessage[messageId] changed, signalling the
  * caller to trigger processMessageById.
  */
+// Replaces the self-closing-tag captures for a message from its stored text,
+// leaving interceptor-delivered paired captures alone. Returns true on change.
+export function syncSelfClosingCaptures(
+  messageId: string,
+  content: string,
+  compiled: CompiledScript[],
+): boolean {
+  const text = content.replace(/\r\n?/g, '\n');
+  const isSelfClosing = (id: string) => compiled.some((s) => s.id === id && s.kind === 'selfClosingTag');
+  const current = capturesByMessage.get(messageId) || [];
+  const kept = current.filter((c) => !isSelfClosing(c.scriptId));
+  const fresh: CapturedTag[] = [];
+  for (const script of compiled) {
+    if (script.kind !== 'selfClosingTag') continue;
+    const re = new RegExp(script.findRe.source, script.findRe.flags);
+    let last: RegExpExecArray | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      last = m;
+      if (m[0].length === 0) re.lastIndex++;
+    }
+    if (last) {
+      fresh.push({
+        scriptId: script.id,
+        scriptName: script.scriptName,
+        replaceString: script.replaceString,
+        findRe: script.findRe,
+        fullMatch: last[0],
+        attrs: {},
+      });
+    }
+  }
+  const key = (c: CapturedTag) => c.scriptId + '\u0001' + c.fullMatch;
+  const before = current.filter((c) => isSelfClosing(c.scriptId)).map(key);
+  const after = fresh.map(key);
+  const changed = before.length !== after.length || before.some((k, i) => k !== after[i]);
+  const list = kept.concat(fresh);
+  if (list.length === 0) capturesByMessage.delete(messageId);
+  else capturesByMessage.set(messageId, list);
+  return changed;
+}
+
 export function rebuildCapturesFromContent(
   messageId: string,
   content: string,
@@ -187,7 +229,7 @@ export function rebuildCapturesFromContent(
   // strips every occurrence.
   let working = content;
   for (const script of compiled) {
-    if (script.kind !== 'pairedTag') continue;
+    if (script.kind !== 'pairedTag' && script.kind !== 'selfClosingTag') continue;
     script.findRe.lastIndex = 0;
     let lastMatch: RegExpExecArray | null = null;
     let m: RegExpExecArray | null;

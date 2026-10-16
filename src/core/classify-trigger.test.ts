@@ -108,9 +108,29 @@ test('tag with attribute capture is not an angle-pipe marker', () => {
 
 test('[X_START]…[X_END] markers with a capture classify as delimited', () => {
   expect(classifyTrigger(new RegExp('\\[ST_START\\]([\\s\\S]*?)\\[ST_END\\]'))).toBe('delimitedCaptureMultiLine');
-  expect(classifyTrigger(new RegExp('\\[HUD\\](.*?)\\[/HUD\\]'))).toBe('unknown');
+  expect(classifyTrigger(new RegExp('\\[HUD\\](.*?)\\[/HUD\\]'))).toBe('delimitedCaptureMultiLine');
 });
 
-test('bracketed pipe status line is not a block marker', () => {
-  expect(classifyTrigger(new RegExp('\\[Status Bar\\|(.*?)\\|(.*?)\\]'))).toBe('unknown');
+test('bracketed pipe status line is anchored by its literal opener', () => {
+  expect(classifyTrigger(new RegExp('\\[Status Bar\\|(.*?)\\|(.*?)\\]'))).toBe('delimitedCaptureMultiLine');
+});
+
+test('literal-anchored capture blocks route through the linearized path', () => {
+  expect(classifyTrigger(new RegExp('\\[Chat with (.*?)\\]([\\s\\S]*)'))).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(new RegExp('\\[Incoming Message\\|(.*?)\\|(.*?)\\|(.*?)\\]', 'gs'))).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(new RegExp('\\[Diary\\]\\s*Date:(.*?)\\s*Weather:(.*?)\\s*Content:([\\s\\S]*)'))).toBe('delimitedCaptureMultiLine');
+  expect(classifyTrigger(new RegExp('╒═════([\\s\\S]*?)╘═════', 'g'))).toBe('delimitedCaptureMultiLine');
+});
+
+test('word-led or short-prefixed captures stay unknown', () => {
+  expect(classifyTrigger(new RegExp('Time: (.*?)\\n'))).toBe('unknown');
+  expect(classifyTrigger(new RegExp('\\[(.*?)\\]'))).toBe('unknown');
+  expect(classifyTrigger(new RegExp('\\d+(x)'))).toBe('unknown');
+});
+
+test('self-closing tag with captures classifies as selfClosingTag', () => {
+  expect(classifyTrigger(/\<bgm src\=\"(.*?)\" artist\=\"(.*?)\" song\=\"(.*?)\" \/\>/)).toBe('selfClosingTag');
+  expect(classifyTrigger(/<sfx\s*name="([^"]+)"\s*\/>/)).toBe('selfClosingTag');
+  expect(classifyTrigger(/<img src="(.*?)">/)).not.toBe('selfClosingTag');
+  expect(classifyTrigger(/<bgm>(.*?)<\/bgm>/)).toBe('pairedTag');
 });

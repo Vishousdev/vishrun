@@ -3,6 +3,7 @@ import react from '../vendor/cdn/react-18.3.1.min.js.txt';
 import reactDom from '../vendor/cdn/react-dom-18.3.1.min.js.txt';
 import babel from '../vendor/cdn/babel-standalone-7.26.10.min.js.txt';
 import vue from '../vendor/cdn/vue-3.5.13.global.prod.js.txt';
+import emojiPicker from '../vendor/cdn/emoji-picker-element-1.26.3.bundle.js.txt';
 
 // Cards load these from public CDNs; the host proxy no longer serves JavaScript,
 // so Vishrun ships pinned builds and answers those URLs locally.
@@ -21,6 +22,7 @@ const LIBS: VendoredLib[] = [
   { id: 'react', hosts: PACKAGE_CDNS, path: /\/react(?:@18(?:\.[\d.]+)?)?\/umd\/react\.(?:production\.min|development)\.js$|\/ajax\/libs\/react\/18[\d.]*\/umd\/react\.(?:production\.min|development)\.js$/, body: react },
   { id: 'react-dom', hosts: PACKAGE_CDNS, path: /\/react-dom(?:@18(?:\.[\d.]+)?)?\/umd\/react-dom\.(?:production\.min|development)\.js$|\/ajax\/libs\/react-dom\/18[\d.]*\/umd\/react-dom\.(?:production\.min|development)\.js$/, body: reactDom },
   { id: 'babel', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?@babel\/standalone(?:@7[\d.]*)?\/babel(?:\.min)?\.js$|\/ajax\/libs\/babel-standalone\/7[\d.]*\/babel(?:\.min)?\.js$/, body: babel },
+  { id: 'emoji-picker-element', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?emoji-picker-element(?:@(?:\^|%5E)?1(?:\.[\d.]+)?)?\/(?:index|picker)\.js$/i, body: emojiPicker },
   { id: 'vue', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?vue(?:@3(?:\.[\d.]+)?)?\/dist\/vue\.global(?:\.prod)?\.js$|\/ajax\/libs\/vue\/3[\d.]*\/vue\.global(?:\.prod)?(?:\.min)?\.js$/, body: vue },
 ];
 

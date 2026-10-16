@@ -35,7 +35,9 @@
  * The two axes are independent. Step 6 split them; Fix B added the fourth bucket.
  */
 
-export type TriggerKind = 'placeholder' | 'pairedTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
+import { literalPrefix } from '../render/pending-hide';
+
+export type TriggerKind = 'placeholder' | 'pairedTag' | 'selfClosingTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
 
 /** Kinds that render through the placeholder pipeline (text-node scan + $N).
  * Multi-line variant uses the linearize-bubble path inside the same pipeline. */
@@ -236,18 +238,39 @@ export function isAnglePipeCapture(re: RegExp): boolean {
   return ANGLE_PIPE_RE.test(src);
 }
 
+// Capture regex that starts with a literal, non-tag marker of 3+ characters
+// (`[Chat with`, `[Diary]`, `╒═════`). The marker anchors the match, so it can
+// run on the linearized bubble like the other block triggers.
+export function isLiteralAnchoredCapture(re: RegExp): boolean {
+  const src = re.source;
+  if (!hasRealCapture(src)) return false;
+  const prefix = literalPrefix(src);
+  if (prefix.length < 3) return false;
+  return !/^[\p{L}\p{N}\s<]/u.test(prefix);
+}
+
 /**
  * Four-bucket classification. Order matters: `pairedTag` wins over `placeholder`
  * (Pacifica satisfies `isPlaceholder` — no captures — but is structurally a
  * paired tag); both win over `delimitedCapture` (a `<TAGNAME (foo)>…</TAGNAME>`
  * with captures is a paired tag, not a delimited-capture marker).
  */
+// `<tag .../>` with no close tag. The host sanitizer drops unknown tags before
+// render, so these are matched against the stored message text instead.
+export function isSelfClosingTag(re: RegExp): boolean {
+  const src = re.source.replace(/\\s[*+?]/g, ' ').replace(/\\([^A-Za-z0-9])/g, '$1');
+  if (src.includes('</')) return false;
+  return /^\s*<\s*[A-Za-z_][\w-]*(?:\s[\s\S]*)?\/\s*>\s*$/.test(src);
+}
+
 export function classifyTrigger(re: RegExp): TriggerKind {
   if (isPairedTag(re)) return 'pairedTag';
   if (isPlaceholder(re)) return 'placeholder';
+  if (isSelfClosingTag(re)) return 'selfClosingTag';
   if (isDelimitedCapture(re)) return isMultiLineRegex(re) ? 'delimitedCaptureMultiLine' : 'delimitedCapture';
   // Linearized path: markdown autolinks URL captures, splitting the match across nodes.
   if (isAnglePipeCapture(re)) return 'delimitedCaptureMultiLine';
+  if (isLiteralAnchoredCapture(re)) return 'delimitedCaptureMultiLine';
   return 'unknown';
 }
 
