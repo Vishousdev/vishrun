@@ -1,4 +1,5 @@
 import { installFetchExternalHandler } from './fetch-external';
+import { installWidgetFetchHandler } from './widget-fetch';
 import { installMacroResolveHandler } from './macro-resolve';
 import { installMessageContentProcessor } from './message-content-processor';
 import { installDispatchSlashHandler } from './dispatch-slash';
@@ -18,6 +19,7 @@ import { installHostReadHandler } from './host-read';
  */
 
 installFetchExternalHandler();
+installWidgetFetchHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
 installDispatchSlashHandler();

@@ -153,7 +153,14 @@ function deepTextContent(root) {
 // src/render/pending-hide.ts
 var PENDING_ATTR = "data-vishrun-pending";
 var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
-function literalPrefix(source) {
+function decodeEscapes(source) {
+  return source.replace(/\\u([0-9A-Fa-f]{4})|\\x([0-9A-Fa-f]{2})/g, (m, u, x) => {
+    const ch = String.fromCharCode(parseInt(u ?? x, 16));
+    return /[\\^$.*+?()[\]{}|\/-]/.test(ch) ? m : ch;
+  });
+}
+function literalPrefix(sourceIn) {
+  const source = decodeEscapes(sourceIn);
   let out = "";
   let i = 0;
   for (;i < source.length; i++) {
@@ -179,7 +186,59 @@ function literalPrefix(source) {
   const after = source.slice(i);
   return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
 }
-function literalSuffix(source) {
+function groupAlternatives(src, from) {
+  let depth = 0;
+  let start = from;
+  const alts = [];
+  for (let i = from;i < src.length; i++) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (ch === "[") {
+      while (i < src.length && src[i] !== "]") {
+        if (src[i] === "\\")
+          i++;
+        i++;
+      }
+      continue;
+    }
+    if (ch === "(")
+      depth++;
+    else if (ch === ")") {
+      if (depth === 0) {
+        alts.push(src.slice(start, i));
+        return { alts, end: i };
+      }
+      depth--;
+    } else if (ch === "|" && depth === 0) {
+      alts.push(src.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return null;
+}
+function leadingLiterals(src) {
+  if (!src.startsWith("(?:"))
+    return [literalPrefix(src)];
+  const g = groupAlternatives(src, 3);
+  return g ? g.alts.map((a) => literalPrefix(a)) : [""];
+}
+function trailingLiterals(src) {
+  if (!src.endsWith(")"))
+    return [literalSuffix(src)];
+  for (let i = src.lastIndexOf("(?:");i >= 0; i = src.lastIndexOf("(?:", i - 1)) {
+    const g = groupAlternatives(src, i + 3);
+    if (g && g.end === src.length - 1)
+      return g.alts.map((a) => literalSuffix(a));
+    if (i === 0)
+      break;
+  }
+  return [literalSuffix(src)];
+}
+function literalSuffix(sourceIn) {
+  const source = decodeEscapes(sourceIn);
   let out = "";
   let i = source.length - 1;
   while (i >= 0) {
@@ -408,7 +467,9 @@ function isLiteralAnchoredCapture(re) {
   const src = re.source;
   if (!hasRealCapture(src))
     return false;
-  const prefix = literalPrefix(src);
+  return leadingLiterals(src).some(isTextAnchor);
+}
+function isTextAnchor(prefix) {
   if (prefix.length < 3)
     return false;
   if (/^<[A-Za-z/!?]/.test(prefix))
@@ -880,6 +941,91 @@ document.addEventListener('DOMContentLoaded',function(){
   new MutationObserver(function(muts){for(var i=0;i<muts.length;i++){var n=muts[i].addedNodes;for(var j=0;j<n.length;j++){var x=n[j];if(x.nodeType!==1)continue;if(x.matches&&x.matches('audio,source'))scan(x.parentNode||x);else scan(x);}}}).observe(document.documentElement,{childList:true,subtree:true});
 });
 })();</script>`;
+}
+
+// src/render/fetch-bridge.ts
+var TIMEOUT_MS2 = 20000;
+var counter2 = 0;
+function fetchBridgeShim() {
+  return `<script>(function(){
+var sb=window.spindleSandbox;
+if(!sb||typeof sb.postMessage!=='function'||typeof sb.onMessage!=='function'||typeof window.fetch!=='function')return;
+var nativeFetch=window.fetch.bind(window);
+var EXT=/^https?:\\/\\//i;
+var pending={};
+var seq=0;
+sb.onMessage(function(m){
+  if(!m||m.kind!=='widget-fetch-response')return;
+  var slot=pending[m.requestId];
+  if(!slot)return;
+  delete pending[m.requestId];
+  if(!m.ok){slot.reject(new TypeError('Failed to fetch: '+(m.error||'error')));return;}
+  var noBody=m.status===204||m.status===205||m.status===304;
+  slot.resolve(new Response(noBody?null:(m.body||''),{status:m.status||200,statusText:m.statusText||'',headers:m.headers||{}}));
+});
+function plainHeaders(h){
+  var out={};
+  if(!h)return out;
+  if(typeof Headers!=='undefined'&&h instanceof Headers){h.forEach(function(v,k){out[k]=v;});return out;}
+  if(Array.isArray(h)){h.forEach(function(p){out[p[0]]=String(p[1]);});return out;}
+  for(var k in h)out[k]=String(h[k]);
+  return out;
+}
+window.fetch=function(input,init){
+  var url=typeof input==='string'?input:(input&&input.url)||String(input);
+  if(!EXT.test(url))return nativeFetch(input,init);
+  init=init||{};
+  var body=init.body;
+  if(body!=null&&typeof body!=='string'){
+    if(typeof URLSearchParams!=='undefined'&&body instanceof URLSearchParams)body=body.toString();
+    else return Promise.reject(new TypeError('Failed to fetch: only string bodies are supported'));
+  }
+  return new Promise(function(resolve,reject){
+    var id='wf-'+Date.now().toString(36)+'-'+(++seq);
+    pending[id]={resolve:resolve,reject:reject};
+    try{
+      sb.postMessage({kind:'widget-fetch',requestId:id,url:url,method:(init.method||(input&&input.method)||'GET'),headers:plainHeaders(init.headers),body:body==null?undefined:body});
+    }catch(e){delete pending[id];reject(new TypeError('Failed to fetch'));}
+  });
+};
+})();</script>`;
+}
+function isWidgetFetch(p) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.kind === "widget-fetch" && typeof r.requestId === "string" && typeof r.url === "string";
+}
+function dispatchWidgetFetch(frame, msg, ctx) {
+  const backendId = `vishrun-wf-${Date.now()}-${++counter2}`;
+  let done = false;
+  let unsub = null;
+  const finish = (reply) => {
+    if (done)
+      return;
+    done = true;
+    clearTimeout(timer);
+    unsub?.();
+    try {
+      frame.postMessage({ kind: "widget-fetch-response", requestId: msg.requestId, ...reply });
+    } catch {}
+  };
+  const timer = setTimeout(() => finish({ ok: false, error: "timeout" }), TIMEOUT_MS2);
+  unsub = ctx.onBackendMessage((payload) => {
+    const p = payload;
+    if (!p || p.type !== "widget_fetch_response" || p.requestId !== backendId)
+      return;
+    const { type: _t, requestId: _r, ...rest } = p;
+    finish(rest);
+  });
+  ctx.sendToBackend({
+    type: "widget_fetch",
+    requestId: backendId,
+    url: msg.url,
+    method: typeof msg.method === "string" ? msg.method : "GET",
+    headers: msg.headers && typeof msg.headers === "object" ? msg.headers : {},
+    body: typeof msg.body === "string" ? msg.body : undefined
+  });
 }
 
 // src/core/diagnostics.ts
@@ -2060,6 +2206,17 @@ function destroyRegisteredWidgetsFor(messageId, scriptId, reason = "destroy-regi
     destroyWidgetIframe(iframe, reason);
   }
 }
+var widgetSources = new WeakMap;
+function setWidgetSource(widget, text) {
+  widgetSources.set(widget, text);
+}
+function restoreWidgetSource(widget) {
+  const text = widgetSources.get(widget);
+  if (text === undefined || !widget.isConnected || !widget.parentNode)
+    return;
+  widget.parentNode.insertBefore(document.createTextNode(text), widget);
+  widgetSources.delete(widget);
+}
 function destroyAllRegisteredWidgetsForMessage(messageId, reason = "destroy-all-for-message") {
   const prefix = messageId + REGISTRY_SEP;
   const matchingKeys = [];
@@ -2073,6 +2230,7 @@ function destroyAllRegisteredWidgetsForMessage(messageId, reason = "destroy-all-
     if (!set)
       continue;
     for (const iframe of [...set]) {
+      restoreWidgetSource(iframe);
       destroyWidgetIframe(iframe, reason);
       destroyed++;
     }
@@ -2230,7 +2388,7 @@ function buildHeadInjection(iframeCtx) {
     greetings: cardGreetings()
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + audioProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function cardGreetings() {
   const card = getActiveCard();
@@ -2641,6 +2799,8 @@ function routeChildMessage(frame, payload, ctx, iframeCtx) {
     handleTriggerSlash(p.payload, ctx);
   } else if (p.kind === "alert") {
     handleHostAlert(p.payload);
+  } else if (isWidgetFetch(payload)) {
+    dispatchWidgetFetch(frame, payload, ctx);
   } else if (isThRequest(payload)) {
     dispatchThRequest(frame, payload, {
       chatId: iframeCtx.chatId,
@@ -3360,10 +3520,12 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
       matches.splice(i, 1);
   }
   if (isGenerating() && isLatestMessage(messageId)) {
-    const open = literalPrefix(script.findRe.source);
-    const close = literalSuffix(script.findRe.source);
-    for (const [s, e] of unterminatedRanges(linear.text, open, close)) {
-      hideRange(bubble, linear.offsetMap, s, e);
+    const src = script.findRe.source;
+    for (const open of leadingLiterals(src)) {
+      for (const close of trailingLiterals(src)) {
+        for (const [s, e] of unterminatedRanges(linear.text, open, close))
+          hideRange(bubble, linear.offsetMap, s, e);
+      }
     }
   }
   if (matches.length === 0)
@@ -3391,6 +3553,7 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
     const fromCache = fromMap ?? resolutionCache.get(expanded);
     const finalHtml = fromCache ?? expanded;
     const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+    setWidgetSource(widget, linear.text.slice(start, end));
     const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
     if (placed) {
       count++;
@@ -3618,6 +3781,7 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
       const fromCache = fromMap ?? resolutionCache.get(expanded);
       const finalHtml = fromCache ?? expanded;
       const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+      setWidgetSource(widget, text.slice(start, end));
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -4351,8 +4515,8 @@ function installStatusBarInjectHook(ctx, io = defaultIO(), wanted = () => cardUs
 }
 
 // src/core/regex-takeover-client.ts
-var TIMEOUT_MS2 = 8000;
-var counter2 = 0;
+var TIMEOUT_MS3 = 8000;
+var counter3 = 0;
 var results = new Map;
 var known = new Map;
 function knownNativeKeys(characterId) {
@@ -4363,14 +4527,14 @@ function requestRegexTakeover(ctx, characterId, scripts) {
   if (hit)
     return hit;
   const candidates = selectTakeoverCandidates(scripts);
-  const requestId = `vishrun-rt-${Date.now()}-${++counter2}`;
+  const requestId = `vishrun-rt-${Date.now()}-${++counter3}`;
   const pending = new Promise((resolve) => {
     let unsub = null;
     const timer = setTimeout(() => {
       unsub?.();
       results.delete(characterId);
       resolve({ disabled: 0, native: [] });
-    }, TIMEOUT_MS2);
+    }, TIMEOUT_MS3);
     unsub = ctx.onBackendMessage((payload) => {
       const p = payload;
       if (!p || p.type !== "regex_takeover_response" || p.requestId !== requestId)

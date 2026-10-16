@@ -10,6 +10,7 @@ import {
   destroyRegisteredWidgetsFor,
   destroyWidgetIframe,
   hasRegisteredWidgetsFor,
+  setWidgetSource,
   widgetNeedsIsolation,
 } from './widget-iframe';
 import { getCapturesForMessage, syncStrippedTagCaptures } from '../hooks/tag-interceptor';
@@ -20,7 +21,7 @@ import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
 import { deepContains, deepQuerySelector, deepQuerySelectorAll, hasShadowHost, isNonTextElement, renderedChildNodes } from './shadow-dom';
 import { computePairedAnchor, placeAtAnchor, type PairedAnchor } from './paired-anchor';
 import { fetchMessageContent } from '../lumiverse/fetch-message';
-import { clearPending, hideRange, literalPrefix, literalSuffix, unterminatedRanges } from './pending-hide';
+import { clearPending, hideRange, leadingLiterals, trailingLiterals, unterminatedRanges } from './pending-hide';
 import { isGenerating, isLatestMessage } from '../state/generation';
 
 // Expanded widget HTML → macro-resolved HTML, for one processNode pass.
@@ -349,10 +350,11 @@ async function replaceMultiLineMatches(
 
   // A block still being streamed has its opener but not its closer yet.
   if (isGenerating() && isLatestMessage(messageId)) {
-    const open = literalPrefix(script.findRe.source);
-    const close = literalSuffix(script.findRe.source);
-    for (const [s, e] of unterminatedRanges(linear.text, open, close)) {
-      hideRange(bubble, linear.offsetMap, s, e);
+    const src = script.findRe.source;
+    for (const open of leadingLiterals(src)) {
+      for (const close of trailingLiterals(src)) {
+        for (const [s, e] of unterminatedRanges(linear.text, open, close)) hideRange(bubble, linear.offsetMap, s, e);
+      }
     }
   }
   if (matches.length === 0) return 0;
@@ -383,6 +385,7 @@ async function replaceMultiLineMatches(
     const finalHtml = fromCache ?? expanded;
 
     const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+    setWidgetSource(widget, linear.text.slice(start, end));
     const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
     if (placed) {
       count++;
@@ -638,6 +641,7 @@ async function replacePlaceholderMatches(
       // await: buildWidget → buildWidgetIframe → injectShimsAndSizeReporter
       // may fetch the Tailwind bundle (cached after the first use).
       const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+      setWidgetSource(widget, text.slice(start, end));
       frag.appendChild(widget);
       cursor = end;
       count++;

@@ -11,7 +11,17 @@ const PENDING_ATTR = 'data-vishrun-pending';
 const META = new Set(['\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}']);
 
 // Literal text a regex source must start with, up to the first metacharacter.
-export function literalPrefix(source: string): string {
+// `\uXXXX` / `\xXX` escapes as the characters they stand for, unless that
+// character is regex syntax.
+function decodeEscapes(source: string): string {
+  return source.replace(/\\u([0-9A-Fa-f]{4})|\\x([0-9A-Fa-f]{2})/g, (m, u, x) => {
+    const ch = String.fromCharCode(parseInt(u ?? x, 16));
+    return /[\\^$.*+?()[\]{}|\/-]/.test(ch) ? m : ch;
+  });
+}
+
+export function literalPrefix(sourceIn: string): string {
+  const source = decodeEscapes(sourceIn);
   let out = '';
   let i = 0;
   for (; i < source.length; i++) {
@@ -37,8 +47,53 @@ export function literalPrefix(source: string): string {
   return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
 }
 
+// Top-level alternatives of the group whose body starts at `from` (just past
+// its opening paren); returns the alternatives and the closing paren index.
+function groupAlternatives(src: string, from: number): { alts: string[]; end: number } | null {
+  let depth = 0;
+  let start = from;
+  const alts: string[] = [];
+  for (let i = from; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\') { i++; continue; }
+    if (ch === '[') {
+      while (i < src.length && src[i] !== ']') { if (src[i] === '\\') i++; i++; }
+      continue;
+    }
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      if (depth === 0) { alts.push(src.slice(start, i)); return { alts, end: i }; }
+      depth--;
+    } else if (ch === '|' && depth === 0) {
+      alts.push(src.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return null;
+}
+
+// Literal prefixes the source can start with: one, or one per alternative of a
+// leading `(?:A|B|…)` group (bilingual tags such as `(?:<Status Bar>|<状态栏>)`).
+export function leadingLiterals(src: string): string[] {
+  if (!src.startsWith('(?:')) return [literalPrefix(src)];
+  const g = groupAlternatives(src, 3);
+  return g ? g.alts.map((a) => literalPrefix(a)) : [''];
+}
+
+// Literal suffixes the source can end with, likewise for a trailing `(?:A|B)`.
+export function trailingLiterals(src: string): string[] {
+  if (!src.endsWith(')')) return [literalSuffix(src)];
+  for (let i = src.lastIndexOf('(?:'); i >= 0; i = src.lastIndexOf('(?:', i - 1)) {
+    const g = groupAlternatives(src, i + 3);
+    if (g && g.end === src.length - 1) return g.alts.map((a) => literalSuffix(a));
+    if (i === 0) break;
+  }
+  return [literalSuffix(src)];
+}
+
 // Literal text a regex source must end with.
-export function literalSuffix(source: string): string {
+export function literalSuffix(sourceIn: string): string {
+  const source = decodeEscapes(sourceIn);
   let out = '';
   let i = source.length - 1;
   while (i >= 0) {
