@@ -76,6 +76,197 @@ function clearActiveCard() {
   current = null;
 }
 
+// src/render/shadow-dom.ts
+function parentAcrossShadow(node) {
+  if (node.parentNode) {
+    const p = node.parentNode;
+    return p.nodeType === 11 && p.host ? p.host : p;
+  }
+  return null;
+}
+function deepContains(root, node) {
+  let cur = node;
+  while (cur) {
+    if (cur === root)
+      return true;
+    cur = parentAcrossShadow(cur);
+  }
+  return false;
+}
+function deepClosest(el, selector) {
+  let cur = el;
+  while (cur) {
+    if (cur.nodeType === 1 && cur.matches(selector))
+      return cur;
+    cur = parentAcrossShadow(cur);
+  }
+  return null;
+}
+function deepQuerySelectorAll(root, selector) {
+  const out = [];
+  const visit = (scope) => {
+    scope.querySelectorAll(selector).forEach((el) => out.push(el));
+    scope.querySelectorAll("*").forEach((el) => {
+      if (el.shadowRoot)
+        visit(el.shadowRoot);
+    });
+  };
+  visit(root);
+  return out;
+}
+function deepQuerySelector(root, selector) {
+  return deepQuerySelectorAll(root, selector)[0] ?? null;
+}
+function hasShadowHost(root) {
+  for (const el of Array.from(root.querySelectorAll("*"))) {
+    if (el.shadowRoot)
+      return true;
+  }
+  return false;
+}
+function renderedChildNodes(node) {
+  const sr = node.nodeType === 1 ? node.shadowRoot : null;
+  return Array.from((sr ?? node).childNodes);
+}
+var NON_TEXT_TAGS = new Set(["STYLE", "SCRIPT", "TEMPLATE", "NOSCRIPT"]);
+function isNonTextElement(el) {
+  return NON_TEXT_TAGS.has(el.tagName);
+}
+function deepTextContent(root) {
+  let s = "";
+  const walk = (n) => {
+    if (n.nodeType === 3) {
+      s += n.nodeValue ?? "";
+      return;
+    }
+    if (n.nodeType !== 1 && n.nodeType !== 11)
+      return;
+    if (n.nodeType === 1 && isNonTextElement(n))
+      return;
+    for (const c of renderedChildNodes(n))
+      walk(c);
+  };
+  walk(root);
+  return s;
+}
+
+// src/render/pending-hide.ts
+var PENDING_ATTR = "data-vishrun-pending";
+var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
+function literalPrefix(source) {
+  let out = "";
+  for (let i = 0;i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      const next = source[i + 1];
+      if (next === undefined || /[A-Za-z0-9]/.test(next))
+        break;
+      out += next;
+      i++;
+      continue;
+    }
+    if (META.has(ch))
+      break;
+    out += ch;
+  }
+  const after = source.slice(out.length);
+  return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
+}
+function literalSuffix(source) {
+  let out = "";
+  let i = source.length - 1;
+  while (i >= 0) {
+    const ch = source[i];
+    const escaped = i > 0 && source[i - 1] === "\\" && !(i > 1 && source[i - 2] === "\\");
+    if (escaped) {
+      if (/[A-Za-z0-9]/.test(ch))
+        break;
+      out = ch + out;
+      i -= 2;
+      continue;
+    }
+    if (META.has(ch))
+      break;
+    out = ch + out;
+    i--;
+  }
+  return out;
+}
+function unterminatedRanges(text, open, close) {
+  const out = [];
+  if (open.length < 3 || close.length === 0)
+    return out;
+  let from = 0;
+  for (;; ) {
+    const o = text.indexOf(open, from);
+    if (o < 0)
+      break;
+    const c = text.indexOf(close, o + open.length);
+    if (c < 0) {
+      out.push([o, text.length]);
+      break;
+    }
+    from = c + close.length;
+  }
+  return out;
+}
+function hide(el) {
+  if (el.hasAttribute(PENDING_ATTR))
+    return;
+  el.setAttribute(PENDING_ATTR, el.style.getPropertyValue("display") || "");
+  el.style.setProperty("display", "none", "important");
+}
+function unhide(el) {
+  const prev = el.getAttribute(PENDING_ATTR);
+  el.removeAttribute(PENDING_ATTR);
+  if (prev)
+    el.style.setProperty("display", prev);
+  else
+    el.style.removeProperty("display");
+}
+function clearPending(root) {
+  deepQuerySelectorAll(root, `[${PENDING_ATTR}]`).forEach(unhide);
+}
+function hideRange(bubble, offsetMap, start, end) {
+  const byNode = new Map;
+  for (const e of offsetMap)
+    byNode.set(e.node, e);
+  const span = (el) => {
+    let lo = Infinity;
+    let hi = -Infinity;
+    const walk = (n) => {
+      const e = byNode.get(n);
+      if (e) {
+        lo = Math.min(lo, e.sourceStart);
+        hi = Math.max(hi, e.sourceEnd);
+      }
+      for (const c of renderedChildNodes(n))
+        walk(c);
+    };
+    walk(el);
+    return lo === Infinity ? null : [lo, hi];
+  };
+  const hidden = new Set;
+  for (const e of offsetMap) {
+    if (e.sourceEnd <= start || e.sourceStart >= end)
+      continue;
+    let el = e.node.parentElement;
+    let best = null;
+    while (el && el !== bubble) {
+      const s = span(el);
+      if (!s || s[0] < start || s[1] > end)
+        break;
+      best = el;
+      const p = el.parentNode;
+      el = p && p.nodeType === 11 ? null : p;
+    }
+    if (best && ![...hidden].some((h) => h.contains(best)))
+      hidden.add(best);
+  }
+  hidden.forEach((el) => hide(el));
+  return hidden.size;
+}
+
 // src/core/classify-trigger.ts
 function isPlaceholderLikeKind(kind) {
   return kind === "placeholder" || kind === "delimitedCapture" || kind === "delimitedCaptureMultiLine";
@@ -206,14 +397,33 @@ function isAnglePipeCapture(re) {
     return false;
   return ANGLE_PIPE_RE.test(src);
 }
+function isLiteralAnchoredCapture(re) {
+  const src = re.source;
+  if (!hasRealCapture(src))
+    return false;
+  const prefix = literalPrefix(src);
+  if (prefix.length < 3)
+    return false;
+  return !/^[\p{L}\p{N}\s<]/u.test(prefix);
+}
+function isSelfClosingTag(re) {
+  const src = re.source.replace(/\\s[*+?]/g, " ").replace(/\\([^A-Za-z0-9])/g, "$1");
+  if (src.includes("</"))
+    return false;
+  return /^\s*<\s*[A-Za-z_][\w-]*(?:\s[\s\S]*)?\/\s*>\s*$/.test(src);
+}
 function classifyTrigger(re) {
   if (isPairedTag(re))
     return "pairedTag";
   if (isPlaceholder(re))
     return "placeholder";
+  if (isSelfClosingTag(re))
+    return "selfClosingTag";
   if (isDelimitedCapture(re))
     return isMultiLineRegex(re) ? "delimitedCaptureMultiLine" : "delimitedCapture";
   if (isAnglePipeCapture(re))
+    return "delimitedCaptureMultiLine";
+  if (isLiteralAnchoredCapture(re))
     return "delimitedCaptureMultiLine";
   return "unknown";
 }
@@ -388,80 +598,6 @@ function expand(html, script, allScripts, processing, depth) {
   return out;
 }
 
-// src/render/shadow-dom.ts
-function parentAcrossShadow(node) {
-  if (node.parentNode) {
-    const p = node.parentNode;
-    return p.nodeType === 11 && p.host ? p.host : p;
-  }
-  return null;
-}
-function deepContains(root, node) {
-  let cur = node;
-  while (cur) {
-    if (cur === root)
-      return true;
-    cur = parentAcrossShadow(cur);
-  }
-  return false;
-}
-function deepClosest(el, selector) {
-  let cur = el;
-  while (cur) {
-    if (cur.nodeType === 1 && cur.matches(selector))
-      return cur;
-    cur = parentAcrossShadow(cur);
-  }
-  return null;
-}
-function deepQuerySelectorAll(root, selector) {
-  const out = [];
-  const visit = (scope) => {
-    scope.querySelectorAll(selector).forEach((el) => out.push(el));
-    scope.querySelectorAll("*").forEach((el) => {
-      if (el.shadowRoot)
-        visit(el.shadowRoot);
-    });
-  };
-  visit(root);
-  return out;
-}
-function deepQuerySelector(root, selector) {
-  return deepQuerySelectorAll(root, selector)[0] ?? null;
-}
-function hasShadowHost(root) {
-  for (const el of Array.from(root.querySelectorAll("*"))) {
-    if (el.shadowRoot)
-      return true;
-  }
-  return false;
-}
-function renderedChildNodes(node) {
-  const sr = node.nodeType === 1 ? node.shadowRoot : null;
-  return Array.from((sr ?? node).childNodes);
-}
-var NON_TEXT_TAGS = new Set(["STYLE", "SCRIPT", "TEMPLATE", "NOSCRIPT"]);
-function isNonTextElement(el) {
-  return NON_TEXT_TAGS.has(el.tagName);
-}
-function deepTextContent(root) {
-  let s = "";
-  const walk = (n) => {
-    if (n.nodeType === 3) {
-      s += n.nodeValue ?? "";
-      return;
-    }
-    if (n.nodeType !== 1 && n.nodeType !== 11)
-      return;
-    if (n.nodeType === 1 && isNonTextElement(n))
-      return;
-    for (const c of renderedChildNodes(n))
-      walk(c);
-  };
-  walk(root);
-  return s;
-}
-
 // src/core/dispatch-slash.ts
 function isDispatchSlashResponse(p, requestId) {
   if (!p || typeof p !== "object")
@@ -605,6 +741,21 @@ function setComposerText(text, doc = document) {
   ta.focus();
   return true;
 }
+var SEND_BUTTON_SELECTOR = '[data-component="InputArea"] button[class*="sendBtn"]:not([class*="sendBtnStop"])';
+function clickSend(doc = document, delayMs = 60) {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      const btn = doc.querySelector(SEND_BUTTON_SELECTOR);
+      if (!btn || btn.disabled)
+        return resolve(false);
+      btn.click();
+      resolve(true);
+    }, delayMs);
+  });
+}
+function splitPipeline(command) {
+  return command.split(/\|(?=\s*\/[A-Za-z])/).map((c) => c.trim()).filter(Boolean);
+}
 function parseSlash(command) {
   const m = /^\s*\/([A-Za-z][\w-]*)\b\s?([\s\S]*)$/.exec(command);
   return m ? { name: m[1].toLowerCase(), rest: m[2] } : null;
@@ -613,8 +764,19 @@ async function handleTriggerSlash(payload, ctx, deps = {}) {
   const command = payload && typeof payload === "object" ? payload.command : undefined;
   if (typeof command !== "string")
     return;
-  const parsed = parseSlash(command);
   const setComposer = deps.setComposer ?? setComposerText;
+  const steps = splitPipeline(command).map(parseSlash);
+  const [first, second] = steps;
+  if (first?.name === "send" && steps.length <= 2 && (!second || second.name === "trigger")) {
+    if (!setComposer(first.rest)) {
+      console.warn("[vishrun] triggerSlash: composer not found");
+      return;
+    }
+    if (second && !await (deps.send ?? clickSend)())
+      console.warn("[vishrun] triggerSlash: send button unavailable");
+    return;
+  }
+  const parsed = parseSlash(command);
   if (parsed && (parsed.name === "setinput" || parsed.name === "input")) {
     if (!setComposer(parsed.rest))
       console.warn("[vishrun] triggerSlash: composer not found");
@@ -628,6 +790,89 @@ async function handleTriggerSlash(payload, ctx, deps = {}) {
 }
 function triggerSlashShim() {
   return `<script>(function(){` + `if(typeof window.triggerSlash==='function')return;` + `window.triggerSlash=function(cmd){` + `try{window.spindleSandbox.postMessage({kind:'trigger-slash',payload:{command:String(cmd)}});}catch(e){}` + `return Promise.resolve('');` + `};` + `})();</script>`;
+}
+
+// src/render/audio-proxy.ts
+var ATTR = "data-vishrun-extaudio";
+function stripExternalAudioSrc(html) {
+  if (!/<(?:audio|source)\b/i.test(html))
+    return html;
+  return html.replace(/<(?:audio|source)\b[^>]*>/gi, (tag) => tag.replace(/(\s)src\s*=\s*(['"])(https?:\/\/[^'"]+)\2/i, `$1${ATTR}=$2$3$2`));
+}
+function audioProxyHelper() {
+  return `<script>(function(){
+var ATTR='${ATTR}';
+var sb=window.spindleSandbox;
+if(!sb||typeof sb.fetchAudio!=='function')return;
+var EXT=/^https?:\\/\\//i;
+var cache=Object.create(null);
+var pending=new WeakMap();
+var media=HTMLMediaElement.prototype;
+var srcDesc=Object.getOwnPropertyDescriptor(media,'src');
+var setAttr=Element.prototype.setAttribute;
+var origPlay=media.play;
+var origLoad=media.load;
+function resolveUrl(url){
+  if(!cache[url])cache[url]=sb.fetchAudio(url).then(function(r){return r.url;});
+  return cache[url];
+}
+function isAudioTarget(el){
+  return el instanceof HTMLAudioElement||(el instanceof HTMLSourceElement&&el.parentElement instanceof HTMLAudioElement);
+}
+function owner(el){return el instanceof HTMLSourceElement?el.parentElement:el;}
+function divert(el,url){
+  setAttr.call(el,ATTR,url);
+  var media=owner(el);
+  var p=resolveUrl(url).then(function(blob){
+    if(el.getAttribute(ATTR)!==url)return;
+    el.removeAttribute(ATTR);
+    if(el instanceof HTMLSourceElement){setAttr.call(el,'src',blob);if(media)origLoad.call(media);}
+    else srcDesc.set.call(el,blob);
+  },function(e){console.warn('[vishrun] audio proxy failed',url,e&&e.message||e);});
+  if(media)pending.set(media,p);
+  return p;
+}
+Object.defineProperty(media,'src',{configurable:true,enumerable:srcDesc.enumerable,get:srcDesc.get,set:function(v){
+  if(typeof v==='string'&&EXT.test(v)&&this instanceof HTMLAudioElement){divert(this,v);return;}
+  srcDesc.set.call(this,v);
+}});
+Element.prototype.setAttribute=function(name,value){
+  if(String(name).toLowerCase()==='src'&&typeof value==='string'&&EXT.test(value)&&isAudioTarget(this)){divert(this,value);return;}
+  return setAttr.call(this,name,value);
+};
+media.play=function(){
+  var self=this,p=pending.get(this);
+  if(!p)return origPlay.call(this);
+  return p.then(function(){pending.delete(self);return origPlay.call(self);});
+};
+media.load=function(){
+  var self=this,p=pending.get(this);
+  if(!p)return origLoad.call(this);
+  p.then(function(){origLoad.call(self);});
+};
+var OrigAudio=window.Audio;
+if(OrigAudio){
+  var Wrapped=function Audio(url){var a=new OrigAudio();if(url!==undefined)a.src=url;return a;};
+  Wrapped.prototype=OrigAudio.prototype;
+  window.Audio=Wrapped;
+}
+function scan(root){
+  if(!root||!root.querySelectorAll)return;
+  var list=root.querySelectorAll('audio['+ATTR+'],source['+ATTR+'],audio[src^="http"],audio source[src^="http"]');
+  for(var i=0;i<list.length;i++){
+    var el=list[i];
+    if(!isAudioTarget(el))continue;
+    var url=el.getAttribute(ATTR)||el.getAttribute('src');
+    if(!EXT.test(url||''))continue;
+    if(el.hasAttribute('src'))el.removeAttribute('src');
+    divert(el,url);
+  }
+}
+document.addEventListener('DOMContentLoaded',function(){
+  scan(document);
+  new MutationObserver(function(muts){for(var i=0;i<muts.length;i++){var n=muts[i].addedNodes;for(var j=0;j<n.length;j++){var x=n[j];if(x.nodeType!==1)continue;if(x.matches&&x.matches('audio,source'))scan(x.parentNode||x);else scan(x);}}}).observe(document.documentElement,{childList:true,subtree:true});
+});
+})();</script>`;
 }
 
 // src/core/diagnostics.ts
@@ -1889,7 +2134,7 @@ async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
   const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
   const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
-  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withoutCdnJQuery));
+  const stripped = rewriteCssExternalUrls(stripExternalAudioSrc(stripExternalImageSrc(withoutCdnJQuery)));
   const head = buildHeadInjection(iframeCtx);
   const withHead = injectIntoHead(stripped, head);
   const shell = buildSizeReporterShell();
@@ -1921,7 +2166,7 @@ function buildHeadInjection(iframeCtx) {
     messagesSnapshot: iframeCtx.messagesSnapshot
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + audioProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -2466,11 +2711,51 @@ function teardownTagInterceptors() {
   activeUnsubs = [];
   activeTagNames = new Set;
 }
+function syncSelfClosingCaptures(messageId, content, compiled) {
+  const text = content.replace(/\r\n?/g, `
+`);
+  const isSelfClosing = (id) => compiled.some((s) => s.id === id && s.kind === "selfClosingTag");
+  const current = capturesByMessage.get(messageId) || [];
+  const kept = current.filter((c) => !isSelfClosing(c.scriptId));
+  const fresh = [];
+  for (const script of compiled) {
+    if (script.kind !== "selfClosingTag")
+      continue;
+    const re = new RegExp(script.findRe.source, script.findRe.flags);
+    let last = null;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      last = m;
+      if (m[0].length === 0)
+        re.lastIndex++;
+    }
+    if (last) {
+      fresh.push({
+        scriptId: script.id,
+        scriptName: script.scriptName,
+        replaceString: script.replaceString,
+        findRe: script.findRe,
+        fullMatch: last[0],
+        attrs: {}
+      });
+    }
+  }
+  const key = (c) => c.scriptId + "\x01" + c.fullMatch;
+  const before = current.filter((c) => isSelfClosing(c.scriptId)).map(key);
+  const after = fresh.map(key);
+  const changed = before.length !== after.length || before.some((k, i) => k !== after[i]);
+  const list = kept.concat(fresh);
+  if (list.length === 0)
+    capturesByMessage.delete(messageId);
+  else
+    capturesByMessage.set(messageId, list);
+  return changed;
+}
 function rebuildCapturesFromContent(messageId, content, compiled, _eventName) {
   const newList = [];
   let working = content;
   for (const script of compiled) {
-    if (script.kind !== "pairedTag")
+    if (script.kind !== "pairedTag" && script.kind !== "selfClosingTag")
       continue;
     script.findRe.lastIndex = 0;
     let lastMatch = null;
@@ -2823,123 +3108,6 @@ async function fetchMessageContentById(chatId, messageId) {
 }
 var fetchMessageContent = fetchMessageContentById;
 
-// src/render/pending-hide.ts
-var PENDING_ATTR = "data-vishrun-pending";
-var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
-function literalPrefix(source) {
-  let out = "";
-  for (let i = 0;i < source.length; i++) {
-    const ch = source[i];
-    if (ch === "\\") {
-      const next = source[i + 1];
-      if (next === undefined || /[A-Za-z0-9]/.test(next))
-        break;
-      out += next;
-      i++;
-      continue;
-    }
-    if (META.has(ch))
-      break;
-    out += ch;
-  }
-  const after = source.slice(out.length);
-  return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
-}
-function literalSuffix(source) {
-  let out = "";
-  let i = source.length - 1;
-  while (i >= 0) {
-    const ch = source[i];
-    const escaped = i > 0 && source[i - 1] === "\\" && !(i > 1 && source[i - 2] === "\\");
-    if (escaped) {
-      if (/[A-Za-z0-9]/.test(ch))
-        break;
-      out = ch + out;
-      i -= 2;
-      continue;
-    }
-    if (META.has(ch))
-      break;
-    out = ch + out;
-    i--;
-  }
-  return out;
-}
-function unterminatedRanges(text, open, close) {
-  const out = [];
-  if (open.length < 3 || close.length === 0)
-    return out;
-  let from = 0;
-  for (;; ) {
-    const o = text.indexOf(open, from);
-    if (o < 0)
-      break;
-    const c = text.indexOf(close, o + open.length);
-    if (c < 0) {
-      out.push([o, text.length]);
-      break;
-    }
-    from = c + close.length;
-  }
-  return out;
-}
-function hide(el) {
-  if (el.hasAttribute(PENDING_ATTR))
-    return;
-  el.setAttribute(PENDING_ATTR, el.style.getPropertyValue("display") || "");
-  el.style.setProperty("display", "none", "important");
-}
-function unhide(el) {
-  const prev = el.getAttribute(PENDING_ATTR);
-  el.removeAttribute(PENDING_ATTR);
-  if (prev)
-    el.style.setProperty("display", prev);
-  else
-    el.style.removeProperty("display");
-}
-function clearPending(root) {
-  deepQuerySelectorAll(root, `[${PENDING_ATTR}]`).forEach(unhide);
-}
-function hideRange(bubble, offsetMap, start, end) {
-  const byNode = new Map;
-  for (const e of offsetMap)
-    byNode.set(e.node, e);
-  const span = (el) => {
-    let lo = Infinity;
-    let hi = -Infinity;
-    const walk = (n) => {
-      const e = byNode.get(n);
-      if (e) {
-        lo = Math.min(lo, e.sourceStart);
-        hi = Math.max(hi, e.sourceEnd);
-      }
-      for (const c of renderedChildNodes(n))
-        walk(c);
-    };
-    walk(el);
-    return lo === Infinity ? null : [lo, hi];
-  };
-  const hidden = new Set;
-  for (const e of offsetMap) {
-    if (e.sourceEnd <= start || e.sourceStart >= end)
-      continue;
-    let el = e.node.parentElement;
-    let best = null;
-    while (el && el !== bubble) {
-      const s = span(el);
-      if (!s || s[0] < start || s[1] > end)
-        break;
-      best = el;
-      const p = el.parentNode;
-      el = p && p.nodeType === 11 ? null : p;
-    }
-    if (best && ![...hidden].some((h) => h.contains(best)))
-      hidden.add(best);
-  }
-  hidden.forEach((el) => hide(el));
-  return hidden.size;
-}
-
 // src/state/generation.ts
 var generating = false;
 function setGenerating(v) {
@@ -3002,6 +3170,12 @@ async function processNode(root, scripts, ctx) {
     return 0;
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
+  try {
+    await refreshSelfClosingCaptures(target, scripts, messageId, ctx);
+    await reconcileNestedTagCaptures(scripts, messageId, ctx);
+  } catch (err) {
+    console.debug("[vishrun] tag capture refresh failed:", err);
+  }
   const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
   let total = 0;
   clearPending(target);
@@ -3105,9 +3279,15 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
   const matches = [];
   let m;
   while ((m = script.findRe.exec(linear.text)) !== null) {
-    matches.push({ start: m.index, end: m.index + m[0].length, match: m });
+    matches.push({ start: m.index, end: m.index + m[0].length, match: m, occurrence: matches.length });
     if (m[0].length === 0)
       script.findRe.lastIndex++;
+  }
+  const outer = outerRangesFromLaterScripts(linear.text, script, allScripts);
+  for (let i = matches.length - 1;i >= 0; i--) {
+    const { start, end } = matches[i];
+    if (outer.some(([s, e]) => s < start && end <= e))
+      matches.splice(i, 1);
   }
   if (isGenerating() && isLatestMessage(messageId)) {
     const open = literalPrefix(script.findRe.source);
@@ -3123,9 +3303,17 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
   if (hasRegisteredWidgetsFor(messageId, script.id)) {
     destroyRegisteredWidgetsFor(messageId, script.id);
   }
+  const rawMatches = await rawMatchesWithStrippedTags(script, messageId, ctx);
   let count = 0;
   for (let i = matches.length - 1;i >= 0; i--) {
-    const { start, end, match } = matches[i];
+    const { start, end, occurrence } = matches[i];
+    let match = matches[i].match;
+    const raw = rawMatches?.matches[occurrence];
+    if (raw) {
+      match = raw;
+      for (const fm of rawMatches.pairedInside(raw[0]))
+        consumedPairedMatches.add(messageId + "\x01" + fm);
+    }
     const groups = match.slice(1).map((g) => g ?? "");
     const html = substitute(script.replaceString, match[0], groups);
     const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
@@ -3152,6 +3340,58 @@ async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx,
   }
   invalidateLinearizedBubble(bubble);
   return count;
+}
+var consumedPairedMatches = new Set;
+function isConsumedPaired(messageId, fullMatch) {
+  return consumedPairedMatches.has(messageId + "\x01" + fullMatch.replace(/\r\n?/g, `
+`));
+}
+async function rawMatchesWithStrippedTags(script, messageId, ctx) {
+  const caps = getCapturesForMessage(messageId);
+  if (caps.length === 0)
+    return null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId)
+    return null;
+  let raw = null;
+  try {
+    raw = await fetchMessageContent(chatId, messageId);
+  } catch {
+    return null;
+  }
+  if (!raw)
+    return null;
+  const text = raw.replace(/\r\n?/g, `
+`);
+  const re = new RegExp(script.findRe.source, script.findRe.flags);
+  const matches = [];
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    matches.push(m);
+    if (m[0].length === 0)
+      re.lastIndex++;
+  }
+  const fulls = caps.map((c) => c.fullMatch.replace(/\r\n?/g, `
+`));
+  const pairedInside = (block) => fulls.filter((f) => block.includes(f));
+  if (!matches.some((mm) => pairedInside(mm[0]).length > 0))
+    return null;
+  return { matches: matches.map((mm) => pairedInside(mm[0]).length > 0 ? mm : null), pairedInside };
+}
+function outerRangesFromLaterScripts(text, script, allScripts) {
+  const out = [];
+  for (const other of allScripts) {
+    if (other.kind !== "delimitedCaptureMultiLine" || other.sourceIndex <= script.sourceIndex)
+      continue;
+    const re = new RegExp(other.findRe.source, other.findRe.flags);
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      out.push([m.index, m.index + m[0].length]);
+      if (m[0].length === 0)
+        re.lastIndex++;
+    }
+  }
+  return out;
 }
 function replaceLinearRange(bubble, offsetMap, start, end, widget) {
   let startEntry = null;
@@ -3329,6 +3569,29 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
   }
   return count;
 }
+var selfClosingSeen = new Map;
+async function refreshSelfClosingCaptures(target, scripts, messageId, ctx) {
+  if (!scripts.some((s) => s.kind === "selfClosingTag"))
+    return;
+  if (isGenerating() && isLatestMessage(messageId))
+    return;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId)
+    return;
+  const sig = chatId + "\x01" + hashKey(target.textContent ?? "");
+  if (selfClosingSeen.get(messageId) === sig)
+    return;
+  let raw = null;
+  try {
+    raw = await fetchMessageContent(chatId, messageId);
+  } catch {
+    return;
+  }
+  if (raw == null)
+    return;
+  selfClosingSeen.set(messageId, sig);
+  syncSelfClosingCaptures(messageId, raw, scripts);
+}
 async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolvedMap) {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
@@ -3338,7 +3601,7 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
   existingPaired.forEach((el) => {
     const sid = el.getAttribute("data-vishrun-script-id");
     const fmHash = el.getAttribute("data-vishrun-paired-fullmatch");
-    const stillValid = captures.some((c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash);
+    const stillValid = captures.some((c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash && !isConsumedPaired(messageId, c.fullMatch));
     if (!stillValid) {
       if (el.tagName === "IFRAME") {
         destroyWidgetIframe(el);
@@ -3349,6 +3612,8 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
     }
   });
   for (const cap of captures) {
+    if (isConsumedPaired(messageId, cap.fullMatch))
+      continue;
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
     if (deepQuerySelector(target, sel))
       continue;
@@ -3396,6 +3661,7 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
       continue;
     }
     const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
+    const rawPos = anchor ? null : await rawPositionOf(messageId, cap.fullMatch, ctx);
     const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     if (!target.isConnected || deepQuerySelector(target, sel)) {
@@ -3410,10 +3676,132 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
       continue;
     }
     if (!anchor || !placeAtAnchor(target, anchor, iframe))
-      target.appendChild(iframe);
+      placeByRawOrder(target, iframe, rawPos, allScripts, captures);
     added++;
   }
   return added;
+}
+var nestedReconciled = new Map;
+async function reconcileNestedTagCaptures(scripts, messageId, ctx) {
+  const caps = getCapturesForMessage(messageId);
+  if (caps.length < 2)
+    return;
+  const tagScripts = scripts.filter((s) => s.kind === "pairedTag" || s.kind === "selfClosingTag");
+  if (tagScripts.length < 2)
+    return;
+  const sig = caps.map((c) => c.scriptId + "\x01" + hashKey(c.fullMatch)).join("|");
+  if (nestedReconciled.get(messageId) === sig)
+    return;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId)
+    return;
+  const raw = await fetchMessageContent(chatId, messageId);
+  if (!raw)
+    return;
+  const text = raw.replace(/\r\n?/g, `
+`);
+  for (const cap of caps) {
+    const own = tagScripts.find((s) => s.id === cap.scriptId);
+    if (!own)
+      continue;
+    const re = new RegExp(own.findRe.source, own.findRe.flags);
+    let last = null;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      last = m;
+      if (m[0].length === 0)
+        re.lastIndex++;
+    }
+    if (!last || last[0] === cap.fullMatch.replace(/\r\n?/g, `
+`))
+      continue;
+    const block = last[0];
+    const inner = caps.filter((o) => o !== cap && block.includes(o.fullMatch.replace(/\r\n?/g, `
+`)));
+    if (inner.length === 0)
+      continue;
+    cap.fullMatch = block;
+    for (const o of inner)
+      consumedPairedMatches.add(messageId + "\x01" + o.fullMatch.replace(/\r\n?/g, `
+`));
+  }
+  nestedReconciled.set(messageId, caps.map((c) => c.scriptId + "\x01" + hashKey(c.fullMatch)).join("|"));
+}
+var rawPosCache = new Map;
+async function rawPositionOf(messageId, fullMatch, ctx) {
+  const key = messageId + "\x01" + hashKey(fullMatch);
+  if (rawPosCache.has(key))
+    return rawPosCache.get(key) ?? null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId)
+    return null;
+  let pos = null;
+  try {
+    const raw = await fetchMessageContent(chatId, messageId);
+    if (raw) {
+      const text = raw.replace(/\r\n?/g, `
+`);
+      const start = text.indexOf(fullMatch.replace(/\r\n?/g, `
+`));
+      if (start >= 0)
+        pos = { text, start, end: start + fullMatch.replace(/\r\n?/g, `
+`).length };
+    }
+  } catch {
+    pos = null;
+  }
+  if (rawPosCache.size > 256)
+    rawPosCache.clear();
+  rawPosCache.set(key, pos);
+  return pos;
+}
+function placeByRawOrder(target, widget, pos, scripts, captures) {
+  if (!pos) {
+    target.appendChild(widget);
+    return;
+  }
+  if (pos.text.slice(0, pos.start).trim() === "") {
+    target.insertBefore(widget, target.firstChild);
+    return;
+  }
+  let best = null;
+  for (const el of Array.from(target.querySelectorAll("[data-vishrun-widget]"))) {
+    if (el === widget || !el.parentNode || el.parentElement?.closest("[data-vishrun-widget]"))
+      continue;
+    const at = rawIndexOfWidget(el, pos.text, scripts, captures);
+    if (at === null || at < pos.end)
+      continue;
+    if (!best || at < best.at)
+      best = { el, at };
+  }
+  if (best)
+    best.el.parentNode.insertBefore(widget, best.el);
+  else
+    target.appendChild(widget);
+}
+function rawIndexOfWidget(el, text, scripts, captures) {
+  const sid = el.getAttribute("data-vishrun-script-id");
+  if (!sid)
+    return null;
+  const fm = el.getAttribute("data-vishrun-paired-fullmatch");
+  if (fm) {
+    const cap = captures.find((c) => c.scriptId === sid && hashKey(c.fullMatch) === fm);
+    if (!cap)
+      return null;
+    const i = text.indexOf(cap.fullMatch.replace(/\r\n?/g, `
+`));
+    return i >= 0 ? i : null;
+  }
+  const script = scripts.find((s) => s.id === sid);
+  if (!script)
+    return null;
+  const re = new RegExp(script.findRe.source, script.findRe.flags.includes("g") ? script.findRe.flags : script.findRe.flags + "g");
+  const first = re.exec(text);
+  if (!first)
+    return null;
+  if (re.exec(text))
+    return null;
+  return first.index;
 }
 var anchorCache = new Map;
 async function resolvePairedAnchor(target, messageId, fullMatch, ctx) {

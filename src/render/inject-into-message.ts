@@ -12,7 +12,7 @@ import {
   hasRegisteredWidgetsFor,
   widgetNeedsIsolation,
 } from './widget-iframe';
-import { getCapturesForMessage } from '../hooks/tag-interceptor';
+import { getCapturesForMessage, syncSelfClosingCaptures } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
 import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
@@ -166,6 +166,13 @@ export async function processNode(
   // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
   // widget HTML before any widget is built. Always returns a map; missing
   // entries → widget renders the raw template (no worse than pre-MVU-lite).
+  // Tag captures first: macro collection below reads their final fullMatch.
+  try {
+    await refreshSelfClosingCaptures(target, scripts, messageId, ctx);
+    await reconcileNestedTagCaptures(scripts, messageId, ctx);
+  } catch (err) {
+    console.debug('[vishrun] tag capture refresh failed:', err);
+  }
   const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
 
   let total = 0;
@@ -324,11 +331,20 @@ async function replaceMultiLineMatches(
   if (linear.text.length === 0) return 0;
 
   script.findRe.lastIndex = 0;
-  const matches: Array<{ start: number; end: number; match: RegExpExecArray }> = [];
+  const matches: Array<{ start: number; end: number; match: RegExpExecArray; occurrence: number }> = [];
   let m: RegExpExecArray | null;
   while ((m = script.findRe.exec(linear.text)) !== null) {
-    matches.push({ start: m.index, end: m.index + m[0].length, match: m });
+    matches.push({ start: m.index, end: m.index + m[0].length, match: m, occurrence: matches.length });
     if (m[0].length === 0) script.findRe.lastIndex++;
+  }
+
+  // ST applies scripts in order on the text, so a lower-index script whose match
+  // sits inside a later script's block is rendered by that block's nested
+  // pipeline, not here (rendering it first would remove it from the block).
+  const outer = outerRangesFromLaterScripts(linear.text, script, allScripts);
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end } = matches[i];
+    if (outer.some(([s, e]) => s < start && end <= e)) matches.splice(i, 1);
   }
 
   // A block still being streamed has its opener but not its closer yet.
@@ -346,9 +362,19 @@ async function replaceMultiLineMatches(
     destroyRegisteredWidgetsFor(messageId, script.id);
   }
 
+  const rawMatches = await rawMatchesWithStrippedTags(script, messageId, ctx);
+
   let count = 0;
   for (let i = matches.length - 1; i >= 0; i--) {
-    const { start, end, match } = matches[i];
+    const { start, end, occurrence } = matches[i];
+    let match = matches[i].match;
+    // Paired tags inside the block were removed before render; the stored text
+    // still has them, so use its captures and let the nested pipeline expand them.
+    const raw = rawMatches?.matches[occurrence];
+    if (raw) {
+      match = raw;
+      for (const fm of rawMatches!.pairedInside(raw[0])) consumedPairedMatches.add(messageId + '\u0001' + fm);
+    }
     const groups = match.slice(1).map((g) => g ?? '');
     const html = substitute(script.replaceString, match[0], groups);
     const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
@@ -376,6 +402,61 @@ async function replaceMultiLineMatches(
 
   invalidateLinearizedBubble(bubble);
   return count;
+}
+
+// Paired-tag fullMatches already rendered inside another script's block.
+const consumedPairedMatches = new Set<string>();
+
+function isConsumedPaired(messageId: string, fullMatch: string): boolean {
+  return consumedPairedMatches.has(messageId + '\u0001' + fullMatch.replace(/\r\n?/g, '\n'));
+}
+
+async function rawMatchesWithStrippedTags(
+  script: CompiledScript,
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<{ matches: Array<RegExpExecArray | null>; pairedInside: (block: string) => string[] } | null> {
+  const caps = getCapturesForMessage(messageId);
+  if (caps.length === 0) return null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId) return null;
+  let raw: string | null = null;
+  try {
+    raw = await fetchMessageContent(chatId, messageId);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  const text = raw.replace(/\r\n?/g, '\n');
+  const re = new RegExp(script.findRe.source, script.findRe.flags);
+  const matches: RegExpExecArray[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    matches.push(m);
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  const fulls = caps.map((c) => c.fullMatch.replace(/\r\n?/g, '\n'));
+  const pairedInside = (block: string) => fulls.filter((f) => block.includes(f));
+  if (!matches.some((mm) => pairedInside(mm[0]).length > 0)) return null;
+  return { matches: matches.map((mm) => (pairedInside(mm[0]).length > 0 ? mm : null)), pairedInside };
+}
+
+function outerRangesFromLaterScripts(
+  text: string,
+  script: CompiledScript,
+  allScripts: CompiledScript[],
+): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const other of allScripts) {
+    if (other.kind !== 'delimitedCaptureMultiLine' || other.sourceIndex <= script.sourceIndex) continue;
+    const re = new RegExp(other.findRe.source, other.findRe.flags);
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      out.push([m.index, m.index + m[0].length]);
+      if (m[0].length === 0) re.lastIndex++;
+    }
+  }
+  return out;
 }
 
 export function replaceLinearRange(
@@ -586,6 +667,34 @@ async function replacePlaceholderMatches(
 
 // ─── Paired-tag pipeline ───────────────────────────────────────────────
 
+// Self-closing tags never reach the DOM, so their captures come from the
+// stored message. Re-read only when the rendered text changes, and not while
+// the message is still streaming.
+const selfClosingSeen = new Map<string, string>();
+
+async function refreshSelfClosingCaptures(
+  target: HTMLElement,
+  scripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<void> {
+  if (!scripts.some((s) => s.kind === 'selfClosingTag')) return;
+  if (isGenerating() && isLatestMessage(messageId)) return;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId) return;
+  const sig = chatId + '\u0001' + hashKey(target.textContent ?? '');
+  if (selfClosingSeen.get(messageId) === sig) return;
+  let raw: string | null = null;
+  try {
+    raw = await fetchMessageContent(chatId, messageId);
+  } catch {
+    return;
+  }
+  if (raw == null) return;
+  selfClosingSeen.set(messageId, sig);
+  syncSelfClosingCaptures(messageId, raw, scripts);
+}
+
 async function renderPairedTagCaptures(
   root: HTMLElement,
   allScripts: CompiledScript[],
@@ -614,7 +723,7 @@ async function renderPairedTagCaptures(
     const sid = el.getAttribute('data-vishrun-script-id');
     const fmHash = el.getAttribute('data-vishrun-paired-fullmatch');
     const stillValid = captures.some(
-      (c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash,
+      (c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash && !isConsumedPaired(messageId, c.fullMatch),
     );
     if (!stillValid) {
       // destroyWidgetIframe releases the host's sandboxFrames record AND
@@ -634,6 +743,7 @@ async function renderPairedTagCaptures(
   // the within-scan idempotency check (a capture iterated twice in one
   // scan doesn't double-insert).
   for (const cap of captures) {
+    if (isConsumedPaired(messageId, cap.fullMatch)) continue;
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
     if (deepQuerySelector(target, sel)) continue;
 
@@ -699,6 +809,7 @@ async function renderPairedTagCaptures(
       continue;
     }
     const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
+    const rawPos = anchor ? null : await rawPositionOf(messageId, cap.fullMatch, ctx);
     const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
@@ -715,11 +826,133 @@ async function renderPairedTagCaptures(
       destroyWidgetIframe(iframe);
       continue;
     }
-    if (!anchor || !placeAtAnchor(target, anchor, iframe)) target.appendChild(iframe);
+    if (!anchor || !placeAtAnchor(target, anchor, iframe)) placeByRawOrder(target, iframe, rawPos, allScripts, captures);
     added++;
   }
 
   return added;
+}
+
+// The host strips every registered tag independently, so an outer tag's
+// capture loses the inner tags. Scripts apply in index order on raw text in
+// SillyTavern, so the outer block keeps them and the nested pipeline renders
+// them in place. Swap such captures for the stored text's match and mark the
+// inner captures as consumed.
+const nestedReconciled = new Map<string, string>();
+
+async function reconcileNestedTagCaptures(
+  scripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<void> {
+  const caps = getCapturesForMessage(messageId);
+  if (caps.length < 2) return;
+  const tagScripts = scripts.filter((s) => s.kind === 'pairedTag' || s.kind === 'selfClosingTag');
+  if (tagScripts.length < 2) return;
+  const sig = caps.map((c) => c.scriptId + '\u0001' + hashKey(c.fullMatch)).join('|');
+  if (nestedReconciled.get(messageId) === sig) return;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId) return;
+  const raw = await fetchMessageContent(chatId, messageId);
+  if (!raw) return;
+  const text = raw.replace(/\r\n?/g, '\n');
+  for (const cap of caps) {
+    const own = tagScripts.find((s) => s.id === cap.scriptId);
+    if (!own) continue;
+    const re = new RegExp(own.findRe.source, own.findRe.flags);
+    let last: RegExpExecArray | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      last = m;
+      if (m[0].length === 0) re.lastIndex++;
+    }
+    if (!last || last[0] === cap.fullMatch.replace(/\r\n?/g, '\n')) continue;
+    const block = last[0];
+    const inner = caps.filter((o) => o !== cap && block.includes(o.fullMatch.replace(/\r\n?/g, '\n')));
+    if (inner.length === 0) continue;
+    cap.fullMatch = block;
+    for (const o of inner) consumedPairedMatches.add(messageId + '\u0001' + o.fullMatch.replace(/\r\n?/g, '\n'));
+  }
+  nestedReconciled.set(messageId, caps.map((c) => c.scriptId + '\u0001' + hashKey(c.fullMatch)).join('|'));
+}
+
+// Where a stripped tag sat in the stored message, for ordering it among the
+// other widgets when no authored-HTML anchor exists.
+interface RawPosition { text: string; start: number; end: number }
+const rawPosCache = new Map<string, RawPosition | null>();
+
+async function rawPositionOf(messageId: string, fullMatch: string, ctx: SpindleFrontendContext): Promise<RawPosition | null> {
+  const key = messageId + '\u0001' + hashKey(fullMatch);
+  if (rawPosCache.has(key)) return rawPosCache.get(key) ?? null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId) return null;
+  let pos: RawPosition | null = null;
+  try {
+    const raw = await fetchMessageContent(chatId, messageId);
+    if (raw) {
+      const text = raw.replace(/\r\n?/g, '\n');
+      const start = text.indexOf(fullMatch.replace(/\r\n?/g, '\n'));
+      if (start >= 0) pos = { text, start, end: start + fullMatch.replace(/\r\n?/g, '\n').length };
+    }
+  } catch {
+    pos = null;
+  }
+  if (rawPosCache.size > 256) rawPosCache.clear();
+  rawPosCache.set(key, pos);
+  return pos;
+}
+
+// At the top when only whitespace precedes the tag in the stored text; else
+// before the first rendered widget whose source follows it; else at the end.
+export function placeByRawOrder(
+  target: HTMLElement,
+  widget: Element,
+  pos: RawPosition | null,
+  scripts: CompiledScript[],
+  captures: Array<{ scriptId: string; fullMatch: string }>,
+): void {
+  if (!pos) {
+    target.appendChild(widget);
+    return;
+  }
+  if (pos.text.slice(0, pos.start).trim() === '') {
+    target.insertBefore(widget, target.firstChild);
+    return;
+  }
+  let best: { el: Element; at: number } | null = null;
+  for (const el of Array.from(target.querySelectorAll('[data-vishrun-widget]'))) {
+    if (el === widget || !el.parentNode || el.parentElement?.closest('[data-vishrun-widget]')) continue;
+    const at = rawIndexOfWidget(el, pos.text, scripts, captures);
+    if (at === null || at < pos.end) continue;
+    if (!best || at < best.at) best = { el, at };
+  }
+  if (best) best.el.parentNode!.insertBefore(widget, best.el);
+  else target.appendChild(widget);
+}
+
+// Source offset of a rendered widget, or null when it cannot be told apart.
+function rawIndexOfWidget(
+  el: Element,
+  text: string,
+  scripts: CompiledScript[],
+  captures: Array<{ scriptId: string; fullMatch: string }>,
+): number | null {
+  const sid = el.getAttribute('data-vishrun-script-id');
+  if (!sid) return null;
+  const fm = el.getAttribute('data-vishrun-paired-fullmatch');
+  if (fm) {
+    const cap = captures.find((c) => c.scriptId === sid && hashKey(c.fullMatch) === fm);
+    if (!cap) return null;
+    const i = text.indexOf(cap.fullMatch.replace(/\r\n?/g, '\n'));
+    return i >= 0 ? i : null;
+  }
+  const script = scripts.find((s) => s.id === sid);
+  if (!script) return null;
+  const re = new RegExp(script.findRe.source, script.findRe.flags.includes('g') ? script.findRe.flags : script.findRe.flags + 'g');
+  const first = re.exec(text);
+  if (!first) return null;
+  if (re.exec(text)) return null;
+  return first.index;
 }
 
 // Anchors are only needed when the message renders authored HTML islands;
