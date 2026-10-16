@@ -7,7 +7,7 @@ import { registerMvuDisplayStrip } from './hooks/mvu-display-strip';
 import { installStatusBarInjectHook } from './hooks/status-bar-inject';
 import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
-import { requestRegexTakeover } from './core/regex-takeover-client';
+import { knownNativeKeys, requestRegexTakeover } from './core/regex-takeover-client';
 import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
 
 interface ChatChangedPayload {
@@ -71,11 +71,21 @@ export function setup(ctx: SpindleFrontendContext) {
       const alternateGreetings = Array.isArray(char.alternate_greetings)
         ? char.alternate_greetings.filter((g): g is string => typeof g === 'string')
         : [];
-      setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
+      const nativeNow = knownNativeKeys(characterId);
+      setActiveCard({
+        characterId, characterName: name, scripts, firstMes, alternateGreetings,
+        ...(nativeNow ? { nativeKeys: new Set(nativeNow) } : {}),
+      });
       lastLoadedCharacterId = characterId;
       hooks.rescanAll();
-      void requestRegexTakeover(ctx, characterId, scripts).then((disabled) => {
-        if (disabled === 0) return;
+      void requestRegexTakeover(ctx, characterId, scripts).then(({ disabled, native }) => {
+        const card = getActiveCard();
+        if (!card || card.characterId !== characterId) return;
+        const prev = card.nativeKeys ?? new Set<string>();
+        const next = new Set(native);
+        const changed = prev.size !== next.size || [...next].some((k) => !prev.has(k));
+        card.nativeKeys = next;
+        if (disabled === 0 && !changed) return;
         (ctx as { display?: { invalidate?: (vars: string[]) => void } }).display?.invalidate?.(['*']);
         hooks.rescanAll();
       });

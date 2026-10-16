@@ -14,6 +14,8 @@ export interface CompiledScript {
    */
   kind: TriggerKind;
   sourceIndex: number;
+  /** Rendered by the host's own regex row: skipped at the top level, kept for nested expansion. */
+  native?: boolean;
 }
 
 /**

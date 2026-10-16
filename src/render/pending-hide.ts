@@ -13,10 +13,17 @@ const META = new Set(['\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']
 // Literal text a regex source must start with, up to the first metacharacter.
 export function literalPrefix(source: string): string {
   let out = '';
-  for (let i = 0; i < source.length; i++) {
+  let i = 0;
+  for (; i < source.length; i++) {
     const ch = source[i];
     if (ch === '\\') {
       const next = source[i + 1];
+      const hex = next === 'u' ? /^[0-9A-Fa-f]{4}/.exec(source.slice(i + 2)) : next === 'x' ? /^[0-9A-Fa-f]{2}/.exec(source.slice(i + 2)) : null;
+      if (hex) {
+        out += String.fromCharCode(parseInt(hex[0], 16));
+        i += 1 + hex[0].length;
+        continue;
+      }
       if (next === undefined || /[A-Za-z0-9]/.test(next)) break;
       out += next;
       i++;
@@ -26,7 +33,7 @@ export function literalPrefix(source: string): string {
     out += ch;
   }
   // A trailing quantifier would make the last char optional.
-  const after = source.slice(out.length);
+  const after = source.slice(i);
   return /^[?*{]/.test(after) ? out.slice(0, -1) : out;
 }
 

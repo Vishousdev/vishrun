@@ -239,3 +239,57 @@ test('thHelpersShim produces a script with baked constants and sync getChatMessa
   expect(out.includes("postRequest('th-get-chat-messages'")).toBe(false);
   expect(out.includes('th-set-chat-message')).toBe(true);
 });
+
+test('SillyTavern global: a greeting swipe change routes to setChatMessages, an edit to setChatMessage', async () => {
+  const out = thHelpersShim({
+    currentMessageIndex: 0,
+    currentMessageId: 'm0',
+    chatId: 'chatZ',
+    messagesSnapshot: makeSnapshot([{ message: 'g0', swipes: ['g0', 'g1', 'g2'] }, { message: 'reply' }]),
+    greetings: ['g0', 'g1', 'g2'],
+  });
+  const w = window as any;
+  const posted: unknown[] = [];
+  const swiped: unknown[] = [];
+  delete w.SillyTavern;
+  w.spindleSandbox = { onMessage() {}, postMessage(p: any) { posted.push(p); } };
+  w.setChatMessages = (p: unknown) => { swiped.push(p); };
+  new Function(out.replace(/^<script>/, '').replace(/<\/script>$/, ''))();
+  const ST = w.SillyTavern;
+  expect(ST.chat[0].swipes).toEqual(['g0', 'g1', 'g2']);
+  ST.chat[0].swipe_id = 2;
+  ST.chat[0].mes = ST.chat[0].swipes[2];
+  ST.chat[1].mes = 'edited';
+  void ST.saveChat();
+  await ST.reloadCurrentChat();
+  expect(swiped).toEqual([[{ message_id: 0, swipe_id: 2 }]]);
+  expect(posted.map((p: any) => [p.op, p.body.messageId, p.body.fieldValues.message])).toEqual([['th-set-chat-message', 1, 'edited']]);
+  expect(ST.getContext().chat).toBe(ST.chat);
+  delete w.SillyTavern;
+  delete w.setChatMessages;
+});
+
+test('SillyTavern.chat[0] reports the greeting shown even when slot 0 holds its text', () => {
+  const out = thHelpersShim({
+    currentMessageIndex: 0,
+    currentMessageId: 'm0',
+    chatId: 'c',
+    messagesSnapshot: makeSnapshot([{ message: 'episode 2\r\n', swipe_id: 0, swipes: ['episode 2\r\n', 'e1', 'episode 2'] }]),
+    greetings: ['intro', 'episode 1', 'episode 2'],
+  });
+  const w = window as any;
+  const swiped: unknown[] = [];
+  delete w.SillyTavern;
+  w.spindleSandbox = { onMessage() {}, postMessage() {} };
+  w.setChatMessages = (p: unknown) => { swiped.push(p); };
+  new Function(out.replace(/^<script>/, '').replace(/<\/script>$/, ''))();
+  const ST = w.SillyTavern;
+  expect(ST.chat[0].swipe_id).toBe(2);
+  expect(ST.chat[0].swipes[0]).toBe('intro');
+  ST.chat[0].swipe_id = 0;
+  ST.chat[0].mes = ST.chat[0].swipes[0];
+  void ST.saveChat();
+  expect(swiped).toEqual([[{ message_id: 0, swipe_id: 0 }]]);
+  delete w.SillyTavern;
+  delete w.setChatMessages;
+});

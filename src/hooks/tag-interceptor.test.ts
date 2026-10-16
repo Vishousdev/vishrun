@@ -5,7 +5,7 @@ import {
   teardownTagInterceptors,
   getCapturesForMessage,
   extractAllTagNames,
-  syncSelfClosingCaptures,
+  syncStrippedTagCaptures,
 } from './tag-interceptor';
 import { compileScripts } from '../core/parse-regex-script';
 import type { RawRegexScript } from '../lumiverse/fetch-character';
@@ -181,15 +181,15 @@ test('single-tag script stores synchronously with no content fetch', () => {
   expect(caps[0].fullMatch).toBe('<ToDo>do it</ToDo>');
 });
 
-test('syncSelfClosingCaptures reads self-closing tags from stored text and keeps paired captures', () => {
+test('syncStrippedTagCaptures reads self-closing tags from stored text and keeps paired captures', () => {
   const compiled = compileScripts([
     script('\\<bgm src\\=\\"(.*?)\\" song\\=\\"(.*?)\\" \\/\\>', 'music'),
   ]);
-  expect(compiled[0].kind).toBe('selfClosingTag');
+  expect(compiled[0].kind).toBe('strippedTag');
   const content = '<bgm src="https://a.test/x.mp3" song="X" />\r\nHello';
-  expect(syncSelfClosingCaptures('m-sc', content, compiled)).toBe(true);
+  expect(syncStrippedTagCaptures('m-sc', content, compiled)).toBe(true);
   expect(getCapturesForMessage('m-sc').map((c) => c.fullMatch)).toEqual(['<bgm src="https://a.test/x.mp3" song="X" />']);
-  expect(syncSelfClosingCaptures('m-sc', content, compiled)).toBe(false);
-  expect(syncSelfClosingCaptures('m-sc', 'no tag here', compiled)).toBe(true);
+  expect(syncStrippedTagCaptures('m-sc', content, compiled)).toBe(false);
+  expect(syncStrippedTagCaptures('m-sc', 'no tag here', compiled)).toBe(true);
   expect(getCapturesForMessage('m-sc')).toEqual([]);
 });

@@ -209,3 +209,7 @@ test('window._ assignment does NOT escalate (not a member call)', () => {
   const html = `<script>window._helpful = function(){};</script>`;
   expect(classifyWidgetEnvironment(html)).toBe('static');
 });
+
+test('SillyTavern.chat usage gets the helpers shim', () => {
+  expect(classifyWidgetEnvironment('<script>var ST=window.SillyTavern; ST.saveChat();</script>')).toBe('tavern-helpers-light');
+});

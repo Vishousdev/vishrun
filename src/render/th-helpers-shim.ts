@@ -14,6 +14,8 @@ export interface ThHelpersConstants {
   currentMessageId: string;
   chatId: string;
   messagesSnapshot: SnapshotMessage[];
+  /** Card greetings (first_mes, then alternates) for SillyTavern.chat[0].swipes. */
+  greetings?: string[];
 }
 
 export interface ChatMessageNonSwiped {
@@ -148,6 +150,7 @@ export function thHelpersShim(consts: ThHelpersConstants): string {
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
     messagesSnapshot: consts.messagesSnapshot,
+    greetings: consts.greetings ?? [],
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -226,5 +229,50 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
+// SillyTavern global (ST.chat + saveChat). Cards mutate chat[] in place and
+// save; saveChat diffs against the snapshot and routes the changes: a new
+// swipe_id on the greeting goes to setChatMessages, an edited mes to
+// setChatMessage. reloadCurrentChat is a no-op: the host re-renders on save.
+if (!window.SillyTavern) {
+  var stChat = THC.messagesSnapshot.map(function(m){
+    return {
+      name: m.name, is_user: m.role === 'user', is_system: false,
+      mes: m.message, swipe_id: m.swipe_id, swipes: (m.swipes || []).slice(), extra: m.extra || {}
+    };
+  });
+  // The greeting lives in slot 0 with its text swapped, so the snapshot cannot
+  // tell which greeting is shown. Use the card greetings and match the text.
+  var greetings = THC.greetings || [];
+  if (stChat[0] && !stChat[0].is_user && greetings.length > 1) {
+    var norm = function(s){ return String(s == null ? '' : s).replace(/\\r\\n?/g, '\\n').trim(); };
+    var shown = norm(stChat[0].mes);
+    stChat[0].swipes = greetings.slice();
+    stChat[0].swipe_id = -1;
+    for (var g = 0; g < greetings.length; g++) {
+      if (norm(greetings[g]) === shown) { stChat[0].swipe_id = g; break; }
+    }
+  }
+  var stBase = stChat.map(function(m){ return { swipe_id: m.swipe_id, mes: m.mes }; });
+  var saveChat = function(){
+    var jobs = [];
+    for (var i = 0; i < stChat.length; i++) {
+      var m = stChat[i], b = stBase[i];
+      if (!m || !b) continue;
+      if (i === 0 && m.swipe_id !== b.swipe_id && typeof window.setChatMessages === 'function') {
+        window.setChatMessages([{ message_id: 0, swipe_id: m.swipe_id }]);
+      } else if (m.mes !== b.mes) {
+        jobs.push(window.setChatMessage({ message: m.mes }, i));
+      }
+      stBase[i] = { swipe_id: m.swipe_id, mes: m.mes };
+    }
+    return Promise.all(jobs).then(function(){});
+  };
+  var reloadCurrentChat = function(){ return Promise.resolve(); };
+  var stContext = function(){
+    return { chat: stChat, chatId: THC.chatId, getCurrentChatId: function(){ return THC.chatId; },
+      saveChat: saveChat, reloadCurrentChat: reloadCurrentChat };
+  };
+  window.SillyTavern = { chat: stChat, saveChat: saveChat, reloadCurrentChat: reloadCurrentChat, getContext: stContext };
+}
 })();</script>`;
 }

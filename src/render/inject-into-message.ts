@@ -12,7 +12,7 @@ import {
   hasRegisteredWidgetsFor,
   widgetNeedsIsolation,
 } from './widget-iframe';
-import { getCapturesForMessage, syncSelfClosingCaptures } from '../hooks/tag-interceptor';
+import { getCapturesForMessage, syncStrippedTagCaptures } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
 import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
@@ -168,7 +168,7 @@ export async function processNode(
   // entries → widget renders the raw template (no worse than pre-MVU-lite).
   // Tag captures first: macro collection below reads their final fullMatch.
   try {
-    await refreshSelfClosingCaptures(target, scripts, messageId, ctx);
+    await refreshStrippedTagCaptures(target, scripts, messageId, ctx);
     await reconcileNestedTagCaptures(scripts, messageId, ctx);
   } catch (err) {
     console.debug('[vishrun] tag capture refresh failed:', err);
@@ -188,7 +188,7 @@ export async function processNode(
       // (single regex across all text nodes in the bubble). pairedTag scripts
       // go through registerTagInterceptor (pre-sanitizer) and surface here as
       // captures via getCapturesForMessage. unknown is skipped.
-      if (!isPlaceholderLikeKind(script.kind)) continue;
+      if (!isPlaceholderLikeKind(script.kind) || script.native) continue;
       if (script.kind === 'delimitedCaptureMultiLine') {
         total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
       } else {
@@ -261,7 +261,7 @@ function collectExpandedTemplates(
   // [data-vishrun-widget], so re-scans collect nothing here and skip the round-trip.
   const textNodes = collectTextNodes(root);
   for (const script of scripts) {
-    if (!isPlaceholderLikeKind(script.kind)) continue;
+    if (!isPlaceholderLikeKind(script.kind) || script.native) continue;
     if (script.kind === 'delimitedCaptureMultiLine') {
       const bubble = findContentRoot(root);
       const linear = getLinearizedBubble(bubble);
@@ -531,7 +531,9 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
 
 function isEmptyResidue(node: Node): boolean {
   if (node.nodeType === Node.TEXT_NODE) {
-    return (node.nodeValue ?? '').length === 0;
+    // Markdown's newlines between blocks carry no content.
+    const v = node.nodeValue ?? '';
+    return v.length === 0 || (v.includes('\n') && v.trim() === '');
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement;
@@ -542,7 +544,8 @@ function isEmptyResidue(node: Node): boolean {
       return (el.textContent ?? '').length === 0 && !el.querySelector('img,svg,video,audio,iframe');
     }
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
-    return (el.textContent ?? '').length === 0;
+    // Lists keep their structure after the text is cut: an empty <ul><li> still draws a bullet.
+    return (el.textContent ?? '').trim() === '' && !el.querySelector('img,svg,video,audio,iframe,canvas,[data-vishrun-widget]');
   }
   return false;
 }
@@ -670,20 +673,20 @@ async function replacePlaceholderMatches(
 // Self-closing tags never reach the DOM, so their captures come from the
 // stored message. Re-read only when the rendered text changes, and not while
 // the message is still streaming.
-const selfClosingSeen = new Map<string, string>();
+const strippedTagSeen = new Map<string, string>();
 
-async function refreshSelfClosingCaptures(
+async function refreshStrippedTagCaptures(
   target: HTMLElement,
   scripts: CompiledScript[],
   messageId: string,
   ctx: SpindleFrontendContext,
 ): Promise<void> {
-  if (!scripts.some((s) => s.kind === 'selfClosingTag')) return;
+  if (!scripts.some((s) => s.kind === 'strippedTag' && !s.native)) return;
   if (isGenerating() && isLatestMessage(messageId)) return;
   const chatId = ctx.getActiveChat().chatId;
   if (!chatId) return;
   const sig = chatId + '\u0001' + hashKey(target.textContent ?? '');
-  if (selfClosingSeen.get(messageId) === sig) return;
+  if (strippedTagSeen.get(messageId) === sig) return;
   let raw: string | null = null;
   try {
     raw = await fetchMessageContent(chatId, messageId);
@@ -691,8 +694,8 @@ async function refreshSelfClosingCaptures(
     return;
   }
   if (raw == null) return;
-  selfClosingSeen.set(messageId, sig);
-  syncSelfClosingCaptures(messageId, raw, scripts);
+  strippedTagSeen.set(messageId, sig);
+  syncStrippedTagCaptures(messageId, raw, scripts);
 }
 
 async function renderPairedTagCaptures(
@@ -702,7 +705,8 @@ async function renderPairedTagCaptures(
   ctx: SpindleFrontendContext,
   resolvedMap: ResolvedMap,
 ): Promise<number> {
-  const captures = getCapturesForMessage(messageId);
+  // Widgets of host-rendered scripts count as stale and are removed in phase 1.
+  const captures = getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native));
   const target = findContentRoot(root);
   let added = 0;
   let removed = 0;
@@ -847,7 +851,7 @@ async function reconcileNestedTagCaptures(
 ): Promise<void> {
   const caps = getCapturesForMessage(messageId);
   if (caps.length < 2) return;
-  const tagScripts = scripts.filter((s) => s.kind === 'pairedTag' || s.kind === 'selfClosingTag');
+  const tagScripts = scripts.filter((s) => (s.kind === 'pairedTag' || s.kind === 'strippedTag') && !s.native);
   if (tagScripts.length < 2) return;
   const sig = caps.map((c) => c.scriptId + '\u0001' + hashKey(c.fullMatch)).join('|');
   if (nestedReconciled.get(messageId) === sig) return;

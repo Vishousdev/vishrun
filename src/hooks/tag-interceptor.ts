@@ -92,7 +92,7 @@ export function syncTagInterceptors(
   const desired = new Map<string, Registration>();
 
   for (const s of compiled) {
-    if (s.kind !== 'pairedTag') continue;
+    if (s.kind !== 'pairedTag' || s.native) continue;
     const tags = extractAllTagNames(s.findRe.source);
     if (tags.length === 0) {
       // Should be unreachable if classify-trigger and the tag-name extractors
@@ -107,7 +107,7 @@ export function syncTagInterceptors(
     desired.set(tags[0].toLowerCase(), { script: s, role: 'capture' });
   }
   for (const s of compiled) {
-    if (s.kind !== 'pairedTag') continue;
+    if (s.kind !== 'pairedTag' || s.native) continue;
     const tags = extractAllTagNames(s.findRe.source);
     for (let i = 1; i < tags.length; i++) {
       const key = tags[i].toLowerCase();
@@ -177,18 +177,18 @@ export function teardownTagInterceptors(): void {
  */
 // Replaces the self-closing-tag captures for a message from its stored text,
 // leaving interceptor-delivered paired captures alone. Returns true on change.
-export function syncSelfClosingCaptures(
+export function syncStrippedTagCaptures(
   messageId: string,
   content: string,
   compiled: CompiledScript[],
 ): boolean {
   const text = content.replace(/\r\n?/g, '\n');
-  const isSelfClosing = (id: string) => compiled.some((s) => s.id === id && s.kind === 'selfClosingTag');
+  const isStripped = (id: string) => compiled.some((s) => s.id === id && s.kind === 'strippedTag');
   const current = capturesByMessage.get(messageId) || [];
-  const kept = current.filter((c) => !isSelfClosing(c.scriptId));
+  const kept = current.filter((c) => !isStripped(c.scriptId));
   const fresh: CapturedTag[] = [];
   for (const script of compiled) {
-    if (script.kind !== 'selfClosingTag') continue;
+    if (script.kind !== 'strippedTag' || script.native) continue;
     const re = new RegExp(script.findRe.source, script.findRe.flags);
     let last: RegExpExecArray | null = null;
     let m: RegExpExecArray | null;
@@ -208,7 +208,7 @@ export function syncSelfClosingCaptures(
     }
   }
   const key = (c: CapturedTag) => c.scriptId + '\u0001' + c.fullMatch;
-  const before = current.filter((c) => isSelfClosing(c.scriptId)).map(key);
+  const before = current.filter((c) => isStripped(c.scriptId)).map(key);
   const after = fresh.map(key);
   const changed = before.length !== after.length || before.some((k, i) => k !== after[i]);
   const list = kept.concat(fresh);
@@ -229,7 +229,7 @@ export function rebuildCapturesFromContent(
   // strips every occurrence.
   let working = content;
   for (const script of compiled) {
-    if (script.kind !== 'pairedTag' && script.kind !== 'selfClosingTag') continue;
+    if ((script.kind !== 'pairedTag' && script.kind !== 'strippedTag') || script.native) continue;
     script.findRe.lastIndex = 0;
     let lastMatch: RegExpExecArray | null = null;
     let m: RegExpExecArray | null;

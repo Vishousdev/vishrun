@@ -37,7 +37,7 @@
 
 import { literalPrefix } from '../render/pending-hide';
 
-export type TriggerKind = 'placeholder' | 'pairedTag' | 'selfClosingTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
+export type TriggerKind = 'placeholder' | 'pairedTag' | 'strippedTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
 
 /** Kinds that render through the placeholder pipeline (text-node scan + $N).
  * Multi-line variant uses the linearize-bubble path inside the same pipeline. */
@@ -246,7 +246,10 @@ export function isLiteralAnchoredCapture(re: RegExp): boolean {
   if (!hasRealCapture(src)) return false;
   const prefix = literalPrefix(src);
   if (prefix.length < 3) return false;
-  return !/^[\p{L}\p{N}\s<]/u.test(prefix);
+  // `<` is fine unless markdown would read it as an HTML tag (ASCII name,
+  // closing tag, comment or declaration); `<简介>` stays text on screen.
+  if (/^<[A-Za-z/!?]/.test(prefix)) return false;
+  return !/^[\p{L}\p{N}\s]/u.test(prefix);
 }
 
 /**
@@ -255,18 +258,32 @@ export function isLiteralAnchoredCapture(re: RegExp): boolean {
  * paired tag); both win over `delimitedCapture` (a `<TAGNAME (foo)>…</TAGNAME>`
  * with captures is a paired tag, not a delimited-capture marker).
  */
-// `<tag .../>` with no close tag. The host sanitizer drops unknown tags before
-// render, so these are matched against the stored message text instead.
-export function isSelfClosingTag(re: RegExp): boolean {
+const HTML_TAGS = new Set((
+  'a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col ' +
+  'colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 ' +
+  'h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark menu meta ' +
+  'meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s samp script ' +
+  'search section select slot small source span strong style sub summary sup table tbody td template textarea ' +
+  'tfoot th thead time title tr track u ul var video wbr font center svg math'
+).split(' '));
+
+// A lone `<name attr...>` or `<name .../>` that markdown parses as raw HTML
+// (CommonMark open-tag grammar) and that is not an HTML element. The host
+// sanitizer drops those before render, so they are matched against the stored
+// message text instead of the DOM.
+const OPEN_TAG_RE = /^\s*<([A-Za-z][A-Za-z0-9-]*)((?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:"[\s\S]*?"|'[\s\S]*?'|[^\s"'=<>`]+))?)*)\s*\/?>\s*$/;
+
+export function isStrippedTag(re: RegExp): boolean {
   const src = re.source.replace(/\\s[*+?]/g, ' ').replace(/\\([^A-Za-z0-9])/g, '$1');
   if (src.includes('</')) return false;
-  return /^\s*<\s*[A-Za-z_][\w-]*(?:\s[\s\S]*)?\/\s*>\s*$/.test(src);
+  const m = OPEN_TAG_RE.exec(src);
+  return !!m && !HTML_TAGS.has(m[1].toLowerCase());
 }
 
 export function classifyTrigger(re: RegExp): TriggerKind {
   if (isPairedTag(re)) return 'pairedTag';
+  if (isStrippedTag(re)) return 'strippedTag';
   if (isPlaceholder(re)) return 'placeholder';
-  if (isSelfClosingTag(re)) return 'selfClosingTag';
   if (isDelimitedCapture(re)) return isMultiLineRegex(re) ? 'delimitedCaptureMultiLine' : 'delimitedCapture';
   // Linearized path: markdown autolinks URL captures, splitting the match across nodes.
   if (isAnglePipeCapture(re)) return 'delimitedCaptureMultiLine';
