@@ -8,6 +8,7 @@ import { installStatusBarInjectHook } from './hooks/status-bar-inject';
 import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { requestRegexTakeover } from './core/regex-takeover-client';
+import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -24,6 +25,7 @@ interface MessageEventPayload {
 }
 
 export function setup(ctx: SpindleFrontendContext) {
+  setHostContext(ctx);
   const hooks = installMessageHooks(ctx);
   // System-wide: hide <UpdateVariable> blocks from the chat UI without
   // mutating the stored content. The backend MVU replay needs the blocks
@@ -91,12 +93,10 @@ export function setup(ctx: SpindleFrontendContext) {
     const active = ctx.getActiveChat();
     if (active.characterId || !active.chatId) return active.characterId ?? null;
     try {
-      const r = await fetch(`/api/v1/chats/${encodeURIComponent(active.chatId)}?messages=false`, { credentials: 'same-origin' });
-      if (!r.ok) return null;
-      const chat = (await r.json()) as { character_id?: string | null };
+      const characterId = await getChatCharacterId(active.chatId);
       const now = ctx.getActiveChat();
       if (now.chatId !== active.chatId) return now.characterId ?? null;
-      return now.characterId ?? chat.character_id ?? null;
+      return now.characterId ?? characterId ?? null;
     } catch {
       return null;
     }
@@ -187,5 +187,6 @@ export function setup(ctx: SpindleFrontendContext) {
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
+    setHostContext(null);
   };
 }

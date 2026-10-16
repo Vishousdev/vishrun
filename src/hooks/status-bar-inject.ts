@@ -1,6 +1,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
 import { parseMessagesResponse } from '../lumiverse/fetch-message';
+import { getChatMessages, updateMessageContent } from '../lumiverse/host-api';
 
 // Re-export for callers/tests that imported it from here historically.
 export { parseMessagesResponse };
@@ -95,33 +96,17 @@ export async function maybeInjectStatusPlaceholder(
   }
 }
 
-// Default IO: same-origin REST against Lumiverse. PUT {content} updates
-// both `content` and `swipes[swipe_id]` on the server side.
+// Default IO: host APIs (backend read, ctx write). A content-only update
+// writes both `content` and `swipes[swipe_id]` on the server side.
 export function defaultIO(): InjectIO {
   return {
     fetchContent: async (chatId, messageId) => {
-      const r = await fetch(
-        `/api/v1/chats/${encodeURIComponent(chatId)}/messages`,
-        { credentials: 'same-origin' },
-      );
-      if (!r.ok) throw new Error(`messages fetch failed: HTTP ${r.status}`);
-      const json = await r.json() as unknown;
-      const list = parseMessagesResponse(json);
-      const m = list.find((mm) => mm.id === messageId);
+      const m = (await getChatMessages(chatId)).find((mm) => mm.id === messageId);
       if (!m) return null;
       return { id: m.id, content: m.content, isUser: m.is_user, role: m.role };
     },
     updateContent: async (chatId, messageId, newContent) => {
-      const r = await fetch(
-        `/api/v1/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`,
-        {
-          method: 'PUT',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: newContent }),
-        },
-      );
-      if (!r.ok) throw new Error(`update failed: HTTP ${r.status}`);
+      await updateMessageContent(chatId, messageId, newContent);
     },
   };
 }

@@ -85,3 +85,14 @@ test('widget-iframe.ts: sandbox is widened to the four-token set in the detached
   expect(sandboxIdx).toBeGreaterThan(msgIdIdx);
   expect(sandboxIdx).toBeLessThan(marginIdx);
 });
+
+test('syncFrameColorScheme mirrors the frame document color-scheme onto the element', async () => {
+  const { syncFrameColorScheme } = await import('./widget-iframe');
+  const f = document.createElement('iframe');
+  document.body.appendChild(f);
+  const doc = f.contentDocument!;
+  doc.documentElement.style.colorScheme = 'dark light';
+  syncFrameColorScheme(f);
+  expect(f.style.colorScheme).toBe('dark light');
+  f.remove();
+});

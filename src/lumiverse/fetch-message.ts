@@ -1,5 +1,7 @@
+import { getChatMessages } from './host-api';
+
 /**
- * Lumiverse REST helper for message content.
+ * Lumiverse helper for message content (reads go through the backend worker).
  *
  * GET /api/v1/chats/:chatId/messages returns PaginatedResult<Message>
  * (`{ data, total, limit, offset }`). parseMessagesResponse unwraps that
@@ -27,23 +29,8 @@ export async function fetchMessageContentById(
   chatId: string,
   messageId: string,
 ): Promise<string | null> {
-  const r = await fetch(
-    `/api/v1/chats/${encodeURIComponent(chatId)}/messages`,
-    { credentials: 'same-origin' },
-  );
-  if (!r.ok) throw new Error(`messages fetch failed: HTTP ${r.status}`);
-  const json = await r.json() as unknown;
-  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
+  const m = (await getChatMessages(chatId)).find((mm) => mm.id === messageId);
   return m ? m.content : null;
 }
 
-// The host has no single-message GET; read the tail page and pick the row.
-export async function fetchMessageContent(chatId: string, messageId: string): Promise<string | null> {
-  const r = await fetch(
-    `/api/v1/chats/${encodeURIComponent(chatId)}/messages?tail=true&limit=1000`,
-    { credentials: 'same-origin' },
-  );
-  if (!r.ok) return null;
-  const m = parseMessagesResponse((await r.json()) as unknown).find((mm) => mm.id === messageId);
-  return m ? m.content : null;
-}
+export const fetchMessageContent = fetchMessageContentById;

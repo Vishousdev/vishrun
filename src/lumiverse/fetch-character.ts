@@ -7,6 +7,8 @@
  * 2026-04-28: `character.extensions.regex_scripts` is the correct path.
  */
 
+import { getCharacter } from './host-api';
+
 export interface RawRegexScript {
   id?: string;
   scriptName?: string;
@@ -36,12 +38,9 @@ export interface LumiverseCharacter {
 }
 
 export async function fetchCharacter(characterId: string): Promise<LumiverseCharacter> {
-  const url = `/api/v1/characters/${encodeURIComponent(characterId)}`;
-  const r = await fetch(url, { credentials: 'same-origin' });
-  if (!r.ok) {
-    throw new Error(`fetchCharacter ${characterId}: HTTP ${r.status} ${r.statusText}`);
-  }
-  return (await r.json()) as LumiverseCharacter;
+  const char = await getCharacter(characterId);
+  if (!char || typeof char !== 'object') throw new Error(`fetchCharacter ${characterId}: empty response`);
+  return char as LumiverseCharacter;
 }
 
 export function extractRegexScripts(char: LumiverseCharacter): RawRegexScript[] {
