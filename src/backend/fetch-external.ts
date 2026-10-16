@@ -1,5 +1,6 @@
 import type { RequestInitDTO } from 'lumiverse-spindle-types';
 import { api } from './common';
+import { vendoredBodyFor } from './vendored-cdn';
 
 // `fetch_external` protocol: the frontend ctx has no CORS proxy, so to inline
 // cross-origin assets into widget sandboxes (Tailwind / React / Babel CDNs) it
@@ -37,6 +38,11 @@ export function installFetchExternalHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isFetchExternalRequest(payload)) return;
     const { requestId, url } = payload;
+    const vendored = vendoredBodyFor(url);
+    if (vendored !== null) {
+      api.sendToFrontend({ type: 'fetch_external_response', requestId, ok: true, body: vendored }, userId);
+      return;
+    }
     const options: RequestInitDTO = { responseType: 'text' };
     api.cors(url, options).then(
       (result) => {

@@ -1,11 +1,63 @@
+// src/lumiverse/host-api.ts
+var ctxRef = null;
+function setHostContext(ctx) {
+  ctxRef = ctx;
+}
+function ctx() {
+  if (!ctxRef)
+    throw new Error("[vishrun] host context not initialised");
+  return ctxRef;
+}
+async function getCharacter(characterId) {
+  const c = ctx();
+  if (!c.characters)
+    throw new Error("[vishrun] ctx.characters unavailable on this host");
+  return c.characters.get(characterId);
+}
+async function updateMessageContent(chatId, messageId, content) {
+  const c = ctx();
+  if (!c.chats)
+    throw new Error("[vishrun] ctx.chats unavailable on this host");
+  await c.chats.updateMessage(chatId, messageId, { content });
+}
+var TIMEOUT_MS = 8000;
+var counter = 0;
+function hostRead(op, chatId) {
+  const c = ctx();
+  const requestId = `vishrun-hr-${Date.now()}-${++counter}`;
+  return new Promise((resolve, reject) => {
+    let unsub = null;
+    const timer = setTimeout(() => {
+      unsub?.();
+      reject(new Error(`[vishrun] host_read ${op} timed out`));
+    }, TIMEOUT_MS);
+    unsub = c.onBackendMessage((payload) => {
+      const p = payload;
+      if (!p || p.type !== "host_read_response" || p.requestId !== requestId)
+        return;
+      clearTimeout(timer);
+      unsub?.();
+      if (p.error)
+        reject(new Error(p.error));
+      else
+        resolve(p.result);
+    });
+    c.sendToBackend({ type: "host_read", requestId, op, chatId });
+  });
+}
+function getChatCharacterId(chatId) {
+  return hostRead("chat_character", chatId);
+}
+function getChatMessages(chatId) {
+  return hostRead("messages", chatId);
+}
+
 // src/lumiverse/fetch-character.ts
 async function fetchCharacter(characterId) {
-  const url = `/api/v1/characters/${encodeURIComponent(characterId)}`;
-  const r = await fetch(url, { credentials: "same-origin" });
-  if (!r.ok) {
-    throw new Error(`fetchCharacter ${characterId}: HTTP ${r.status} ${r.statusText}`);
-  }
-  return await r.json();
+  const char = await getCharacter(characterId);
+  if (!char || typeof char !== "object")
+    throw new Error(`fetchCharacter ${characterId}: empty response`);
+  return char;
 }
 function extractRegexScripts(char) {
   const scripts = char?.extensions?.regex_scripts;
@@ -1779,6 +1831,7 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   iframe.style.margin = "12px 0";
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "none";
+  iframe.addEventListener("load", () => syncFrameColorScheme(iframe));
   widgetFrameDestroyers.set(iframe, () => frame.destroy());
   registerWidget(messageId, scriptId, iframe);
   if (VSH_VISHRUN_DIAG) {
@@ -1789,6 +1842,16 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     }));
   }
   return iframe;
+}
+function syncFrameColorScheme(iframe) {
+  try {
+    const doc = iframe.contentDocument;
+    if (!doc)
+      return;
+    const scheme = doc.defaultView?.getComputedStyle(doc.documentElement).colorScheme;
+    if (scheme)
+      iframe.style.colorScheme = scheme;
+  } catch {}
 }
 function destroyWidgetIframe(iframe, reason = "unspecified") {
   if (VSH_VISHRUN_DIAG) {
@@ -2329,25 +2392,13 @@ async function handleSetChatMessages(iframe, payload, ctx) {
         targetContentHead: targetContent.slice(0, 200)
       }));
     }
-    const url = `/api/v1/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`;
     try {
-      const r = await fetch(url, {
-        method: "PUT",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: targetContent })
-      });
+      await updateMessageContent(chatId, messageId, targetContent);
       if (VSH_VISHRUN_DIAG) {
-        console.log("[vishrun:bridge] set-chat-messages PUT", JSON.stringify({
-          url,
-          contentLen: targetContent.length,
-          status: r.status,
-          ok: r.ok
+        console.log("[vishrun:bridge] set-chat-messages update", JSON.stringify({
+          messageId,
+          contentLen: targetContent.length
         }));
-      }
-      if (!r.ok) {
-        console.warn(`[vishrun] setChatMessages: PUT failed (HTTP ${r.status}) for swipe_id=${swipeId}`);
-        continue;
       }
     } catch (err) {
       if (VSH_VISHRUN_DIAG) {
@@ -2355,7 +2406,7 @@ async function handleSetChatMessages(iframe, payload, ctx) {
           error: err instanceof Error ? err.message : String(err)
         }));
       }
-      console.warn("[vishrun] setChatMessages: PUT threw", err);
+      console.warn("[vishrun] setChatMessages: update failed", err);
       continue;
     }
   }
@@ -2766,29 +2817,11 @@ function placeAtAnchor(root, anchor, widget) {
 }
 
 // src/lumiverse/fetch-message.ts
-function parseMessagesResponse(json) {
-  if (Array.isArray(json))
-    return json;
-  if (json && typeof json === "object" && Array.isArray(json.data)) {
-    return json.data;
-  }
-  return [];
-}
 async function fetchMessageContentById(chatId, messageId) {
-  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
-  if (!r.ok)
-    throw new Error(`messages fetch failed: HTTP ${r.status}`);
-  const json = await r.json();
-  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
+  const m = (await getChatMessages(chatId)).find((mm) => mm.id === messageId);
   return m ? m.content : null;
 }
-async function fetchMessageContent(chatId, messageId) {
-  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages?tail=true&limit=1000`, { credentials: "same-origin" });
-  if (!r.ok)
-    return null;
-  const m = parseMessagesResponse(await r.json()).find((mm) => mm.id === messageId);
-  return m ? m.content : null;
-}
+var fetchMessageContent = fetchMessageContentById;
 
 // src/render/pending-hide.ts
 var PENDING_ATTR = "data-vishrun-pending";
@@ -3782,25 +3815,13 @@ async function maybeInjectStatusPlaceholder(chatId, messageId, io) {
 function defaultIO() {
   return {
     fetchContent: async (chatId, messageId) => {
-      const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
-      if (!r.ok)
-        throw new Error(`messages fetch failed: HTTP ${r.status}`);
-      const json = await r.json();
-      const list = parseMessagesResponse(json);
-      const m = list.find((mm) => mm.id === messageId);
+      const m = (await getChatMessages(chatId)).find((mm) => mm.id === messageId);
       if (!m)
         return null;
       return { id: m.id, content: m.content, isUser: m.is_user, role: m.role };
     },
     updateContent: async (chatId, messageId, newContent) => {
-      const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`, {
-        method: "PUT",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: newContent })
-      });
-      if (!r.ok)
-        throw new Error(`update failed: HTTP ${r.status}`);
+      await updateMessageContent(chatId, messageId, newContent);
     }
   };
 }
@@ -3854,9 +3875,9 @@ function selectTakeoverCandidates(scripts) {
 }
 
 // src/core/regex-takeover-client.ts
-var TIMEOUT_MS = 8000;
+var TIMEOUT_MS2 = 8000;
 var done = new Set;
-var counter = 0;
+var counter2 = 0;
 function requestRegexTakeover(ctx, characterId, scripts) {
   if (done.has(characterId))
     return Promise.resolve(0);
@@ -3866,14 +3887,14 @@ function requestRegexTakeover(ctx, characterId, scripts) {
     return Promise.resolve(0);
   }
   done.add(characterId);
-  const requestId = `vishrun-rt-${Date.now()}-${++counter}`;
+  const requestId = `vishrun-rt-${Date.now()}-${++counter2}`;
   return new Promise((resolve) => {
     let unsub = null;
     const timer = setTimeout(() => {
       unsub?.();
       done.delete(characterId);
       resolve(0);
-    }, TIMEOUT_MS);
+    }, TIMEOUT_MS2);
     unsub = ctx.onBackendMessage((payload) => {
       const p = payload;
       if (!p || p.type !== "regex_takeover_response" || p.requestId !== requestId)
@@ -3895,6 +3916,7 @@ function requestRegexTakeover(ctx, characterId, scripts) {
 
 // src/frontend.ts
 function setup(ctx) {
+  setHostContext(ctx);
   const hooks = installMessageHooks(ctx);
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
@@ -3947,14 +3969,11 @@ function setup(ctx) {
     if (active.characterId || !active.chatId)
       return active.characterId ?? null;
     try {
-      const r = await fetch(`/api/v1/chats/${encodeURIComponent(active.chatId)}?messages=false`, { credentials: "same-origin" });
-      if (!r.ok)
-        return null;
-      const chat = await r.json();
+      const characterId = await getChatCharacterId(active.chatId);
       const now = ctx.getActiveChat();
       if (now.chatId !== active.chatId)
         return now.characterId ?? null;
-      return now.characterId ?? chat.character_id ?? null;
+      return now.characterId ?? characterId ?? null;
     } catch {
       return null;
     }
@@ -4006,6 +4025,7 @@ function setup(ctx) {
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
+    setHostContext(null);
   };
 }
 export {

@@ -36,5 +36,9 @@ Verified end-to-end on Lumiverse staging (`d157784` and forward) with cards usin
 
 ## Install
 
-- Open Lumiverse, go to Extensions, click Add extensions, choose Install from source, paste this repo's GitHub URL, and click Install from source. Once installed, enable the extension, grant the `cors_proxy` permission from the Extensions panel, and refresh the browser tab.
+- Open Lumiverse, go to Extensions, click Add extensions, choose Install from source, paste this repo's GitHub URL, and click Install from source. Once installed, enable the extension, grant the privileged permissions from the Extensions panel, and refresh the browser tab:
+  - `cors_proxy`: external images, fonts and audio in widgets.
+  - `unsafe_eval`: widgets that compile templates at runtime (Vue, Babel).
+  - `regex_scripts` + `regex_scripts_unrestricted`: Lumiverse imports a card's regex scripts as its own rules and renders them with JavaScript stripped. With these grants Vishrun turns off those copies for the scripts it renders itself. Without them, cards imported after mid-2026 show inert widgets.
+- CDN libraries that cards load (Tailwind, React, ReactDOM, Babel, Vue) ship with Vishrun, since Lumiverse's proxy does not serve JavaScript. See `src/vendor/cdn/THIRD_PARTY.md`.
 - For local development, clone the repo to `Lumiverse/data/extensions/vishrun/repo` and follow the standard Spindle build flow (`bun build` produces both `dist/frontend.js` and `dist/backend.js`).
