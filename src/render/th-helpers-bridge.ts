@@ -1,6 +1,6 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import type { SnapshotMessage } from '../backend/th-helpers';
-import { emptyMvuData, type MvuData } from '../backend/mvu-parser';
+import { emptyMvuData, type MvuData } from '../core/mvu-data';
 
 const TH_TIMEOUT_MS = 5000;
 

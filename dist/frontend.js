@@ -1613,7 +1613,7 @@ if (!window.SillyTavern) {
 })();</script>`;
 }
 
-// src/backend/mvu-parser.ts
+// src/core/mvu-data.ts
 function emptyMvuData() {
   return { stat_data: {} };
 }
