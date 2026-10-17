@@ -6,7 +6,7 @@ import { hasMacros } from './macro-detection';
 // regex rows and renders them first, with scripts stripped. Vishrun takes a row
 // back only when the replacement needs something the native renderer drops.
 
-export type TakeoverReason = 'script' | 'event-handler' | 'js-url' | 'blocked-tag' | 'macro' | 'dollar-zero';
+export type TakeoverReason = 'script' | 'event-handler' | 'js-url' | 'blocked-tag' | 'macro' | 'dollar-zero' | 'html-fence';
 
 const SCRIPT_RE = /<script\b/i;
 const EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
@@ -15,6 +15,8 @@ const JS_URL_RE = /javascript\s*:/i;
 const BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
 // Native replacement only knows $1..$99, $& and named groups.
 const DOLLAR_ZERO_RE = /\$0(?!\d)/;
+// Fenced HTML renders as a code block natively, as a frame in SillyTavern.
+const HTML_FENCE_RE = /```(?:html)?[ \t]*\r?\n\s*</i;
 
 export function takeoverReasons(replaceString: string): TakeoverReason[] {
   const r: TakeoverReason[] = [];
@@ -25,6 +27,7 @@ export function takeoverReasons(replaceString: string): TakeoverReason[] {
   // Imported rows get no replacement-macro substitution, unlike SillyTavern.
   if (hasMacros(replaceString)) r.push('macro');
   if (DOLLAR_ZERO_RE.test(replaceString)) r.push('dollar-zero');
+  if (HTML_FENCE_RE.test(replaceString)) r.push('html-fence');
   return r;
 }
 
