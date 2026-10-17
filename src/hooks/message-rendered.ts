@@ -12,6 +12,18 @@ import { setGenerating } from '../state/generation';
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
 
+// One element per message: virtualized rows carry the id on the row and on
+// the message inside it.
+export function outermostMessageNodes(root: ParentNode): HTMLElement[] {
+  const out: HTMLElement[] = [];
+  root.querySelectorAll<HTMLElement>('[data-message-id]').forEach((n) => {
+    const id = n.getAttribute('data-message-id');
+    const outer = n.parentElement?.closest(`[data-message-id="${CSS.escape(id ?? '')}"]`);
+    if (!outer) out.push(n);
+  });
+  return out;
+}
+
 interface GenerationEndedPayload {
   generationId?: string;
   chatId?: string;
@@ -129,9 +141,8 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       : null;
     pausedWatcher?.observe(watchTarget!, OBSERVE_OPTS);
     try {
-      const nodes = document.querySelectorAll('[data-message-id]');
       const tasks: Promise<unknown>[] = [];
-      nodes.forEach((n) => { tasks.push(processNode(n as HTMLElement, compiled, ctx).catch(() => {})); });
+      for (const n of outermostMessageNodes(document)) tasks.push(processNode(n, compiled, ctx).catch(() => {}));
       await Promise.all(tasks);
     } finally {
       if (pausedWatcher) {
@@ -276,6 +287,21 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     }));
   }
 
+  // The host can swap the MessageList element after mount (chat reveal,
+  // virtualized list rebuilds), leaving the observer on a detached node.
+  // Re-attach to the live list and rescan when that happens.
+  const listWatch = setInterval(() => {
+    const compiled = compiledForActiveCard();
+    if (!compiled) return;
+    const live = document.querySelector(MESSAGE_LIST_SELECTOR);
+    if (!live || live === observedTarget) return;
+    if (observer) observer.disconnect();
+    observer = null;
+    observedTarget = null;
+    attachObserver();
+    void scanAllNow(compiled);
+  }, 1000);
+
   const unsubGenStarted = ctx.events.on('GENERATION_STARTED', () => { setGenerating(true); });
   const unsubGenStopped = ctx.events.on('GENERATION_STOPPED', () => {
     setGenerating(false);
@@ -305,6 +331,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     processMessageById,
     compiledForActiveCard,
     dispose: () => {
+      clearInterval(listWatch);
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
