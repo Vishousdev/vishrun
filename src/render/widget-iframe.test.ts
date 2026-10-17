@@ -96,3 +96,11 @@ test('syncFrameColorScheme mirrors the frame document color-scheme onto the elem
   expect(f.style.colorScheme).toBe('dark light');
   f.remove();
 });
+
+test('headIntoBody moves card head content to the start of body, like JS-Slash-Runner', async () => {
+  const { headIntoBody } = await import('./widget-iframe');
+  expect(headIntoBody('<html><head><style>a{}</style></head><body><p>x</p></body></html>'))
+    .toBe('<html><head></head><body><style>a{}</style><p>x</p></body></html>');
+  expect(headIntoBody('<div>no document</div>')).toBe('<div>no document</div>');
+  expect(headIntoBody('<html><head></head><body>y</body></html>')).toBe('<html><head></head><body>y</body></html>');
+});

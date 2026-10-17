@@ -729,7 +729,10 @@ async function renderPairedTagCaptures(
   resolvedMap: ResolvedMap,
 ): Promise<number> {
   // Widgets of host-rendered scripts count as stale and are removed in phase 1.
-  const captures = getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native));
+  const captures = firstScriptPerBlock(
+    getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native)),
+    allScripts,
+  );
   const target = findContentRoot(root);
   let added = 0;
   let removed = 0;
@@ -858,6 +861,22 @@ async function renderPairedTagCaptures(
   }
 
   return added;
+}
+
+// Two scripts matching the same block: SillyTavern applies them in card order,
+// so the first replaces it and the later one finds nothing left to match.
+export function firstScriptPerBlock<T extends { scriptId: string; fullMatch: string }>(
+  captures: T[],
+  scripts: CompiledScript[],
+): T[] {
+  const order = (id: string) => scripts.find((s) => s.id === id)?.sourceIndex ?? Number.MAX_SAFE_INTEGER;
+  const best = new Map<string, T>();
+  for (const c of captures) {
+    const key = c.fullMatch.replace(/\r\n?/g, '\n');
+    const prev = best.get(key);
+    if (!prev || order(c.scriptId) < order(prev.scriptId)) best.set(key, c);
+  }
+  return captures.filter((c) => best.get(c.fullMatch.replace(/\r\n?/g, '\n')) === c);
 }
 
 // The host strips every registered tag independently, so an outer tag's

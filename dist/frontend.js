@@ -1028,6 +1028,40 @@ function dispatchWidgetFetch(frame, msg, ctx) {
   });
 }
 
+// src/render/css-url-proxy.ts
+function cssUrlProxyShim() {
+  return `<script>(function(){
+var resolve=window.__vishrunProxiedImageUrl;
+if(typeof resolve!=='function'||typeof MutationObserver==='undefined')return;
+var URL_RE=/url\\(\\s*(['"]?)(https?:\\/\\/[^'")\\s]+)\\1\\s*\\)/gi;
+function fix(el){
+  var css=el.getAttribute&&el.getAttribute('style');
+  if(!css||css.indexOf('http')===-1)return;
+  URL_RE.lastIndex=0;
+  if(!URL_RE.test(css))return;
+  var urls=[];URL_RE.lastIndex=0;var m;
+  while((m=URL_RE.exec(css))!==null)urls.push(m[2]);
+  Promise.all(urls.map(function(u){return resolve(u).catch(function(){return null;});})).then(function(blobs){
+    if(el.getAttribute('style')!==css)return;
+    var i=0;URL_RE.lastIndex=0;
+    el.setAttribute('style',css.replace(URL_RE,function(){var b=blobs[i++];return b?'url("'+b+'")':'none';}));
+  });
+}
+function scan(root){
+  if(root.nodeType===1&&root.hasAttribute('style'))fix(root);
+  if(root.querySelectorAll){var l=root.querySelectorAll('[style*="url("]');for(var i=0;i<l.length;i++)fix(l[i]);}
+}
+new MutationObserver(function(recs){
+  for(var i=0;i<recs.length;i++){
+    var r=recs[i];
+    if(r.type==='attributes')fix(r.target);
+    else for(var j=0;j<r.addedNodes.length;j++){var n=r.addedNodes[j];if(n.nodeType===1)scan(n);}
+  }
+}).observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['style']});
+if(document.body)scan(document.body);else document.addEventListener('DOMContentLoaded',function(){scan(document.body);});
+})();</script>`;
+}
+
 // src/core/diagnostics.ts
 var VSH_VISHRUN_DIAG = false;
 
@@ -2369,7 +2403,7 @@ async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
   const stripped = rewriteCssExternalUrls(stripExternalAudioSrc(stripExternalImageSrc(withoutCdnJQuery)));
   const head = buildHeadInjection(iframeCtx);
-  const withHead = injectIntoHead(stripped, head);
+  const withHead = injectIntoHead(headIntoBody(stripped), head);
   const shell = buildSizeReporterShell();
   const closeBody = withHead.lastIndexOf("</body>");
   if (closeBody >= 0) {
@@ -2400,7 +2434,7 @@ function buildHeadInjection(iframeCtx) {
     greetings: cardGreetings()
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function cardGreetings() {
   const card = getActiveCard();
@@ -2448,6 +2482,8 @@ function externalImageProxyHelper() {
         set: function(val) {
           if (typeof val === 'string' && /^https?:\\/\\//i.test(val)) {
             this.setAttribute(KEY, val);
+            // Detached loaders (new Image()) never reach the DOM scan.
+            processImg(this);
             return;
           }
           return desc.set.call(this, val);
@@ -2518,7 +2554,9 @@ function externalImageProxyHelper() {
           typeof value === 'string' &&
           /^https?:\\/\\//i.test(value)
         ) {
-          return origSetAttr.call(this, KEY, value);
+          origSetAttr.call(this, KEY, value);
+          processImg(this);
+          return;
         }
         return origSetAttr.call(this, name, value);
       };
@@ -2543,29 +2581,12 @@ function externalImageProxyHelper() {
     // Mark in-flight so a MutationObserver re-fire doesn't double-fetch.
     img.removeAttribute(KEY);
     img.setAttribute('data-vishrun-extimg-loading', '1');
-    window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(
-      function(res) {
-        try {
-          // loader.ts:196-202 already converted base64 → Uint8Array on
-          // the host side. Treat the body as bytes; constructing a
-          // Blob from a Uint8Array preserves binary fidelity.
-          if (!res || !res.body) {
-            console.warn('[vishrun] corsProxy returned no body for', url);
-            return;
-          }
-          var ct = '';
-          if (res.headers) {
-            ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
-          }
-          ct = String(ct).split(';')[0].trim() || 'application/octet-stream';
-          var blob = new Blob([res.body], { type: ct });
-          var blobUrl = URL.createObjectURL(blob);
-          setBlobSrc(img, blobUrl);
-        } catch (e) {
-          console.warn('[vishrun] corsProxy decode failed for', url, e);
-        } finally {
-          img.removeAttribute('data-vishrun-extimg-loading');
-        }
+    img.__vishrunWant = url;
+    proxiedImageUrl(url).then(
+      function(blobUrl) {
+        img.removeAttribute('data-vishrun-extimg-loading');
+        if (img.__vishrunWant !== url) return;
+        setBlobSrc(img, blobUrl);
       },
       function(err) {
         img.removeAttribute('data-vishrun-extimg-loading');
@@ -2573,6 +2594,23 @@ function externalImageProxyHelper() {
       }
     );
   }
+
+  // One fetch per URL: preloaders and the visible <img> share the blob.
+  var imageCache = {};
+  function proxiedImageUrl(url) {
+    if (imageCache[url]) return imageCache[url];
+    var p = window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(function(res) {
+      if (!res || !res.body) throw new Error('no body');
+      var ct = '';
+      if (res.headers) ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
+      ct = String(ct).split(';')[0].trim() || 'application/octet-stream';
+      return URL.createObjectURL(new Blob([res.body], { type: ct }));
+    });
+    imageCache[url] = p;
+    p.catch(function() { delete imageCache[url]; });
+    return p;
+  }
+  window.__vishrunProxiedImageUrl = proxiedImageUrl;
 
   function scan(root) {
     if (!root || typeof root.querySelectorAll !== 'function') return;
@@ -2791,6 +2829,26 @@ function fontFaceHelper() {
 })();
 </script>`;
 }
+function headIntoBody(html) {
+  const open = /<head\b[^>]*>/i.exec(html);
+  if (!open)
+    return html;
+  const bodyAt = html.search(/<body\b/i);
+  if (bodyAt >= 0 && bodyAt < open.index)
+    return html;
+  const closeAt = html.toLowerCase().indexOf("</head>", open.index + open[0].length);
+  if (closeAt < 0)
+    return html;
+  const inner = html.slice(open.index + open[0].length, closeAt);
+  if (inner.trim() === "")
+    return html;
+  const without = html.slice(0, open.index + open[0].length) + html.slice(closeAt);
+  const body = /<body\b[^>]*>/i.exec(without);
+  if (!body)
+    return without.slice(0, open.index + open[0].length) + "</head>" + inner + without.slice(open.index + open[0].length + "</head>".length);
+  const at = body.index + body[0].length;
+  return without.slice(0, at) + inner + without.slice(at);
+}
 function injectIntoHead(html, blob) {
   const openHead = html.match(/<head\b[^>]*>/i);
   if (openHead && openHead.index !== undefined) {
@@ -2916,7 +2974,9 @@ function syncTagInterceptors(ctx, compiled, recovery) {
       console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `no tag name extractable — skipping. findRegex source: ${s.findRe.source}`);
       continue;
     }
-    desired.set(tags[0].toLowerCase(), { script: s, role: "capture" });
+    const anchor = tags[0].toLowerCase();
+    if (!desired.has(anchor))
+      desired.set(anchor, { script: s, role: "capture" });
   }
   for (const s of compiled) {
     if (s.kind !== "pairedTag" || s.native)
@@ -3855,7 +3915,7 @@ async function refreshStrippedTagCaptures(target, scripts, messageId, ctx) {
   syncStrippedTagCaptures(messageId, raw, scripts);
 }
 async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolvedMap) {
-  const captures = getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native));
+  const captures = firstScriptPerBlock(getCapturesForMessage(messageId).filter((c) => !allScripts.some((s) => s.id === c.scriptId && s.native)), allScripts);
   const target = findContentRoot(root);
   let added = 0;
   let removed = 0;
@@ -3942,6 +4002,19 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
     added++;
   }
   return added;
+}
+function firstScriptPerBlock(captures, scripts) {
+  const order = (id) => scripts.find((s) => s.id === id)?.sourceIndex ?? Number.MAX_SAFE_INTEGER;
+  const best = new Map;
+  for (const c of captures) {
+    const key = c.fullMatch.replace(/\r\n?/g, `
+`);
+    const prev = best.get(key);
+    if (!prev || order(c.scriptId) < order(prev.scriptId))
+      best.set(key, c);
+  }
+  return captures.filter((c) => best.get(c.fullMatch.replace(/\r\n?/g, `
+`)) === c);
 }
 var nestedReconciled = new Map;
 async function reconcileNestedTagCaptures(scripts, messageId, ctx) {

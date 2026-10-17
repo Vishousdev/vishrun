@@ -211,3 +211,14 @@ test('placeByRawOrder follows the stored message order', async () => {
   placeByRawOrder(root, lead, { text: t2, start: 2, end: 14 }, scripts, []);
   expect(root.firstChild).toBe(lead);
 });
+
+test('firstScriptPerBlock keeps the earlier script when two match the same block', async () => {
+  const { firstScriptPerBlock } = await import('./inject-into-message');
+  const scripts = [{ id: 'night', sourceIndex: 1 }, { id: 'day', sourceIndex: 2 }] as never;
+  const caps = [
+    { scriptId: 'day', fullMatch: '<status>x</status>' },
+    { scriptId: 'night', fullMatch: '<status>x</status>' },
+    { scriptId: 'day', fullMatch: '<other>y</other>' },
+  ];
+  expect(firstScriptPerBlock(caps, scripts).map((c) => c.scriptId + ':' + c.fullMatch)).toEqual(['night:<status>x</status>', 'day:<other>y</other>']);
+});
