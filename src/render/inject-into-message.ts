@@ -114,7 +114,26 @@ export function getEditingMessageIdsForTest(): ReadonlySet<string> {
  * Idempotency: both pipelines skip work where a [data-vishrun-widget] is
  * already in place. Re-running on the same DOM is a no-op.
  */
-export async function processNode(
+// One render per message at a time. Virtualized lists nest two elements with
+// the same data-message-id around one MessageContent; overlapping passes on
+// them tear down each other's widgets.
+const messageQueue = new Map<string, Promise<number>>();
+
+export function processNode(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  ctx: SpindleFrontendContext,
+): Promise<number> {
+  const id = root.getAttribute('data-message-id');
+  if (!id) return Promise.resolve(0);
+  const prev = messageQueue.get(id) ?? Promise.resolve(0);
+  const next = prev.catch(() => 0).then(() => processNodeNow(root, scripts, ctx));
+  messageQueue.set(id, next);
+  void next.finally(() => { if (messageQueue.get(id) === next) messageQueue.delete(id); });
+  return next;
+}
+
+async function processNodeNow(
   root: HTMLElement,
   scripts: CompiledScript[],
   ctx: SpindleFrontendContext,

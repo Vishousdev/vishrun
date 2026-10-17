@@ -99,9 +99,13 @@ export function buildSizeReporterShell(): string {
       if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
       var h = Math.ceil(maxBottom) + 4;
 
+      // CSS transitions grow in equal steps too; only a frame-driven loop
+      // (content sized off the frame height) should pin.
+      var animating = typeof document.getAnimations === 'function' && document.getAnimations().length > 0;
+      if (animating) history = [];
       history.push(h);
       if (history.length > 4) history.shift();
-      if (history.length === 4) {
+      if (!animating && history.length === 4) {
         var dd1 = history[1] - history[0];
         var dd2 = history[2] - history[1];
         var dd3 = history[3] - history[2];
@@ -127,6 +131,14 @@ export function buildSizeReporterShell(): string {
     window.addEventListener('load', postSize);
     // Proxied images arrive after window load; fixed elements do not resize body.
     document.addEventListener('load', function(e) { if (e.target && e.target.tagName === 'IMG') postSize(); }, true);
+    document.addEventListener('transitionend', postSize, true);
+    document.addEventListener('animationend', postSize, true);
+    // A click can expand or collapse content: lift a pin and measure again.
+    document.addEventListener('click', function() {
+      pinned = false;
+      history = [];
+      setTimeout(postSize, 0);
+    }, true);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);

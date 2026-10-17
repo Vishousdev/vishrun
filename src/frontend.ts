@@ -24,6 +24,12 @@ interface MessageEventPayload {
   previousSwipeId?: number;
 }
 
+export function touchesActiveChat(payload: unknown): boolean {
+  const p = (payload || {}) as { key?: unknown; keys?: unknown };
+  const keys = Array.isArray(p.keys) ? p.keys : [p.key];
+  return keys.some((k) => k === 'activeChatId' || k === 'activeCharacterId');
+}
+
 export function setup(ctx: SpindleFrontendContext) {
   setHostContext(ctx);
   const hooks = installMessageHooks(ctx);
@@ -171,11 +177,24 @@ export function setup(ctx: SpindleFrontendContext) {
   // wakeup. Watch-item: depends on those literal key strings; if Lumiverse
   // renames either, the cold-load path silently breaks until something
   // else (CHAT_CHANGED) wakes the extension.
+  // Single updates carry `key`, batched ones `keys`.
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
-    const p = (payload || {}) as { key?: string };
-    if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
+    if (!touchesActiveChat(payload)) return;
     void resolveActiveCharacterId().then(loadFor);
   });
+
+  // Safety net for a hydration that no event reports: check the active chat
+  // once a second until a card is loaded, for the first 20 seconds.
+  let coldTries = 0;
+  const coldTimer = setInterval(() => {
+    if (++coldTries > 20 || lastLoadedCharacterId !== null) {
+      clearInterval(coldTimer);
+      return;
+    }
+    const now = ctx.getActiveChat();
+    if (!now.characterId && !now.chatId) return;
+    void resolveActiveCharacterId().then((id) => { if (id && lastLoadedCharacterId === null) void loadFor(id); });
+  }, 1000);
 
   // If Lumiverse already hydrated by the time setup() runs, kick the load
   // synchronously. Otherwise wait for SETTINGS_UPDATED. We deliberately do
@@ -188,6 +207,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   return () => {
+    clearInterval(coldTimer);
     unsubChatChanged();
     unsubSettingsUpdated();
     unsubMessageSwiped();

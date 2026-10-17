@@ -2036,9 +2036,13 @@ function buildSizeReporterShell() {
       if (document.body.scrollHeight > maxBottom) maxBottom = document.body.scrollHeight;
       var h = Math.ceil(maxBottom) + 4;
 
+      // CSS transitions grow in equal steps too; only a frame-driven loop
+      // (content sized off the frame height) should pin.
+      var animating = typeof document.getAnimations === 'function' && document.getAnimations().length > 0;
+      if (animating) history = [];
       history.push(h);
       if (history.length > 4) history.shift();
-      if (history.length === 4) {
+      if (!animating && history.length === 4) {
         var dd1 = history[1] - history[0];
         var dd2 = history[2] - history[1];
         var dd3 = history[3] - history[2];
@@ -2064,6 +2068,14 @@ function buildSizeReporterShell() {
     window.addEventListener('load', postSize);
     // Proxied images arrive after window load; fixed elements do not resize body.
     document.addEventListener('load', function(e) { if (e.target && e.target.tagName === 'IMG') postSize(); }, true);
+    document.addEventListener('transitionend', postSize, true);
+    document.addEventListener('animationend', postSize, true);
+    // A click can expand or collapse content: lift a pin and measure again.
+    document.addEventListener('click', function() {
+      pinned = false;
+      history = [];
+      setTimeout(postSize, 0);
+    }, true);
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
@@ -3375,7 +3387,21 @@ function computeEditModeTransition(root, messageId, editingSet) {
 function clearEditingMessageIds() {
   editingMessageIds.clear();
 }
-async function processNode(root, scripts, ctx) {
+var messageQueue = new Map;
+function processNode(root, scripts, ctx) {
+  const id = root.getAttribute("data-message-id");
+  if (!id)
+    return Promise.resolve(0);
+  const prev = messageQueue.get(id) ?? Promise.resolve(0);
+  const next = prev.catch(() => 0).then(() => processNodeNow(root, scripts, ctx));
+  messageQueue.set(id, next);
+  next.finally(() => {
+    if (messageQueue.get(id) === next)
+      messageQueue.delete(id);
+  });
+  return next;
+}
+async function processNodeNow(root, scripts, ctx) {
   const messageId = root.getAttribute("data-message-id") || undefined;
   if (!messageId) {
     return 0;
@@ -4199,6 +4225,16 @@ function allSelf(records) {
 // src/hooks/message-rendered.ts
 var MAX_RAF_RETRIES = 3;
 var MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
+function outermostMessageNodes(root) {
+  const out = [];
+  root.querySelectorAll("[data-message-id]").forEach((n) => {
+    const id = n.getAttribute("data-message-id");
+    const outer = n.parentElement?.closest(`[data-message-id="${CSS.escape(id ?? "")}"]`);
+    if (!outer)
+      out.push(n);
+  });
+  return out;
+}
 function installMessageHooks(ctx) {
   let observer = null;
   let observedTarget = null;
@@ -4253,11 +4289,9 @@ function installMessageHooks(ctx) {
     }) : null;
     pausedWatcher?.observe(watchTarget, OBSERVE_OPTS);
     try {
-      const nodes = document.querySelectorAll("[data-message-id]");
       const tasks = [];
-      nodes.forEach((n) => {
+      for (const n of outermostMessageNodes(document))
         tasks.push(processNode(n, compiled, ctx).catch(() => {}));
-      });
       await Promise.all(tasks);
     } finally {
       if (pausedWatcher) {
@@ -4383,6 +4417,20 @@ function installMessageHooks(ctx) {
       scanAllNow(compiled);
     }));
   }
+  const listWatch = setInterval(() => {
+    const compiled = compiledForActiveCard();
+    if (!compiled)
+      return;
+    const live = document.querySelector(MESSAGE_LIST_SELECTOR);
+    if (!live || live === observedTarget)
+      return;
+    if (observer)
+      observer.disconnect();
+    observer = null;
+    observedTarget = null;
+    attachObserver();
+    scanAllNow(compiled);
+  }, 1000);
   const unsubGenStarted = ctx.events.on("GENERATION_STARTED", () => {
     setGenerating(true);
   });
@@ -4412,6 +4460,7 @@ function installMessageHooks(ctx) {
     processMessageById,
     compiledForActiveCard,
     dispose: () => {
+      clearInterval(listWatch);
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
@@ -4560,6 +4609,11 @@ function requestRegexTakeover(ctx, characterId, scripts) {
 }
 
 // src/frontend.ts
+function touchesActiveChat(payload) {
+  const p = payload || {};
+  const keys = Array.isArray(p.keys) ? p.keys : [p.key];
+  return keys.some((k) => k === "activeChatId" || k === "activeCharacterId");
+}
 function setup(ctx) {
   setHostContext(ctx);
   const hooks = installMessageHooks(ctx);
@@ -4663,11 +4717,24 @@ function setup(ctx) {
   const unsubMessageSwiped = ctx.events.on("MESSAGE_SWIPED", (p) => handleMessageMutation("MESSAGE_SWIPED", p));
   const unsubMessageEdited = ctx.events.on("MESSAGE_EDITED", (p) => handleMessageMutation("MESSAGE_EDITED", p));
   const unsubSettingsUpdated = ctx.events.on("SETTINGS_UPDATED", (payload) => {
-    const p = payload || {};
-    if (p.key !== "activeChatId" && p.key !== "activeCharacterId")
+    if (!touchesActiveChat(payload))
       return;
     resolveActiveCharacterId().then(loadFor);
   });
+  let coldTries = 0;
+  const coldTimer = setInterval(() => {
+    if (++coldTries > 20 || lastLoadedCharacterId !== null) {
+      clearInterval(coldTimer);
+      return;
+    }
+    const now = ctx.getActiveChat();
+    if (!now.characterId && !now.chatId)
+      return;
+    resolveActiveCharacterId().then((id) => {
+      if (id && lastLoadedCharacterId === null)
+        loadFor(id);
+    });
+  }, 1000);
   const active = ctx.getActiveChat();
   if (active.characterId || active.chatId) {
     resolveActiveCharacterId().then((id) => {
@@ -4676,6 +4743,7 @@ function setup(ctx) {
     });
   }
   return () => {
+    clearInterval(coldTimer);
     unsubChatChanged();
     unsubSettingsUpdated();
     unsubMessageSwiped();
@@ -4689,5 +4757,6 @@ function setup(ctx) {
   };
 }
 export {
-  setup
+  setup,
+  touchesActiveChat
 };
