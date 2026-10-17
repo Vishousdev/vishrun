@@ -8,11 +8,13 @@ test('reasons cover what the host renderer drops', () => {
   expect(takeoverReasons('<link rel="stylesheet" href="https://fonts.googleapis.com/x">')).toEqual(['blocked-tag']);
   expect(takeoverReasons('<b>{{getvar::grade}}</b>')).toEqual(['macro']);
   expect(takeoverReasons('<b>$0</b>')).toEqual(['dollar-zero']);
+  expect(takeoverReasons('```html\n<head><style>.a{}</style></head>\n<body>x</body>\n```')).toEqual(['html-fence']);
 });
 
 test('static HTML stays with the native renderer', () => {
   expect(takeoverReasons('<div class="card"><style>.a{}</style><audio src="$2"></audio>$1</div>')).toEqual([]);
   expect(takeoverReasons('<b>$10</b>')).toEqual([]);
+  expect(takeoverReasons('```js\nconst a = 1;\n```')).toEqual([]);
 });
 
 test('only renderable, non-prompt scripts that need Vishrun are selected', () => {

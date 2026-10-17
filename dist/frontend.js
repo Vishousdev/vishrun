@@ -4210,6 +4210,7 @@ var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
 var JS_URL_RE = /javascript\s*:/i;
 var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
 var DOLLAR_ZERO_RE = /\$0(?!\d)/;
+var HTML_FENCE_RE = /```(?:html)?[ \t]*\r?\n\s*</i;
 function takeoverReasons(replaceString) {
   const r = [];
   if (SCRIPT_RE.test(replaceString))
@@ -4224,6 +4225,8 @@ function takeoverReasons(replaceString) {
     r.push("macro");
   if (DOLLAR_ZERO_RE.test(replaceString))
     r.push("dollar-zero");
+  if (HTML_FENCE_RE.test(replaceString))
+    r.push("html-fence");
   return r;
 }
 function selectTakeoverCandidates(scripts) {
