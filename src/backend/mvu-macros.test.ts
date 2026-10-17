@@ -16,6 +16,6 @@ test('get_message_variable output: JSON, strings raw, $ keys dropped', () => {
 });
 
 test('format_message_variable output is YAML', () => {
-  expect(formatVariable(data, 'stat_data', 'yaml')).toBe('yan_favor: 5\n世界:\n  时间: "08:00"\nlist:\n  - a\n  - b');
-  expect(toYaml({ a: [{ b: 1, c: 'x y' }], d: '', e: true, f: 'line1\nline2' })).toBe('a:\n  - b: 1\n    c: x y\nd: ""\ne: true\nf: |-\n  line1\n  line2');
+  expect(formatVariable(data, 'stat_data', 'yaml')).toBe("yan_favor: 5\n世界:\n  时间: '08:00'\nlist:\n  - a\n  - b");
+  expect(toYaml({ a: [{ b: 1, c: 'x y' }], d: '', e: true, f: 'line1\nline2' })).toBe("a:\n  - b: 1\n    c: x y\nd: ''\ne: true\nf: |-\n  line1\n  line2");
 });

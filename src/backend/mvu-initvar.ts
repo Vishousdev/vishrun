@@ -1,4 +1,5 @@
-import { parseYaml } from './mvu-yaml';
+import { yamlLoad } from './mvu-yaml-schema';
+import JSON5 from 'json5';
 
 // MVU seeds stat_data from lorebook entries whose comment contains
 // "[initvar]", enabled or not. Content is JSON or YAML, optionally wrapped in
@@ -29,20 +30,23 @@ export function parseInitvarContent(raw: string): Obj | null {
   if (xml) text = xml[1];
   const fence = text.trim().match(/```.*\n([\s\S]*)\n```/m);
   if (fence) text = fence[1];
-  text = text.trim();
-  if (!text) return null;
+  if (!text.trim()) return null;
   try {
-    const parsed = JSON.parse(text);
-    return isPlainObject(parsed) ? parsed : null;
-  } catch {
-    // not JSON, fall through to YAML
-  }
-  try {
-    const parsed = parseYaml(text) as unknown;
+    const parsed = parseString(text);
     return isPlainObject(parsed) ? parsed : null;
   } catch {
     return null;
   }
+}
+
+// MVU's parseString: YAML (with merge keys) unless the text opens with [ or {,
+// then JSON5, then the other one.
+export function parseString(content: string): unknown {
+  const yaml = () => yamlLoad(content);
+  if (/^[[{]/.test(content.trimStart())) {
+    try { return JSON5.parse(content); } catch { return yaml(); }
+  }
+  try { return yaml(); } catch { return JSON5.parse(content); }
 }
 
 export function initvarFromEntries(entries: InitvarEntry[]): Obj {

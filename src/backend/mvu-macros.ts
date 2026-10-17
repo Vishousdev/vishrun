@@ -1,3 +1,4 @@
+import { yamlDump } from './mvu-yaml-schema';
 import { api } from './common';
 import { handleGetVariablesSnapshot } from './th-helpers';
 
@@ -33,56 +34,8 @@ export function omitDollarKeys(v: unknown): unknown {
   return v;
 }
 
-const PLAIN_RE = /^[^\s\-?:,[\]{}#&*!|>'"%@`][^:#\n]*$/;
-const RESERVED_RE = /^(?:true|false|null|~|yes|no|on|off|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?|0x[0-9a-f]+|\.inf|\.nan)$/i;
-
-function yamlString(s: string, indent: string): string {
-  if (s.includes('\n')) {
-    const body = s.replace(/\n+$/, '').split('\n').map((l) => (l ? indent + '  ' + l : '')).join('\n');
-    return (s.endsWith('\n') ? '|' : '|-') + '\n' + body;
-  }
-  if (s === '' || !PLAIN_RE.test(s) || /\s$/.test(s) || RESERVED_RE.test(s)) return JSON.stringify(s);
-  return s;
-}
-
-function yamlKey(k: string): string {
-  return k !== '' && PLAIN_RE.test(k) && !/\s$/.test(k) && !RESERVED_RE.test(k) ? k : JSON.stringify(k);
-}
-
-function yamlScalar(v: unknown, indent: string): string {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'string') return yamlString(v, indent);
-  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
-  return JSON.stringify(v);
-}
-
-function isNode(v: unknown): v is Record<string, unknown> | unknown[] {
-  return v !== null && typeof v === 'object' && (Array.isArray(v) ? v.length > 0 : Object.keys(v).length > 0);
-}
-
-function yamlLines(v: unknown, indent: string): string {
-  if (Array.isArray(v)) {
-    if (v.length === 0) return indent + '[]';
-    return v.map((item) => {
-      if (!isNode(item)) return `${indent}- ${Array.isArray(item) ? '[]' : item !== null && typeof item === 'object' ? '{}' : yamlScalar(item, indent)}`;
-      const inner = yamlLines(item, indent + '  ');
-      return `${indent}- ${inner.slice(indent.length + 2)}`;
-    }).join('\n');
-  }
-  if (v !== null && typeof v === 'object') {
-    const entries = Object.entries(v);
-    if (entries.length === 0) return indent + '{}';
-    return entries.map(([k, x]) => {
-      if (isNode(x)) return `${indent}${yamlKey(k)}:\n${yamlLines(x, indent + '  ')}`;
-      const empty = Array.isArray(x) ? '[]' : x !== null && typeof x === 'object' ? '{}' : yamlScalar(x, indent);
-      return `${indent}${yamlKey(k)}: ${empty}`;
-    }).join('\n');
-  }
-  return indent + yamlScalar(v, indent);
-}
-
 export function toYaml(v: unknown): string {
-  return yamlLines(v, '').trimEnd();
+  return yamlDump(v).trimEnd();
 }
 
 export function formatVariable(data: unknown, path: string, mode: 'json' | 'yaml'): string {
