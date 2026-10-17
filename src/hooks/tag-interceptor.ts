@@ -104,7 +104,9 @@ export function syncTagInterceptors(
       );
       continue;
     }
-    desired.set(tags[0].toLowerCase(), { script: s, role: 'capture' });
+    // Scripts run in card order: an earlier script on the same tag consumes it.
+    const anchor = tags[0].toLowerCase();
+    if (!desired.has(anchor)) desired.set(anchor, { script: s, role: 'capture' });
   }
   for (const s of compiled) {
     if (s.kind !== 'pairedTag' || s.native) continue;
