@@ -250,8 +250,10 @@ function hashStripped(s: string): number {
 export async function computeVariablesSnapshot(
   messages: ChatMessageContent[],
   recoveryFetcher?: CardGreetingFetcher,
+  seed?: Record<string, unknown>,
 ): Promise<MvuData> {
-  let state = emptyMvuData();
+  // Lorebook [initvar] seed; a greeting <initvar> replaces it, as in MVU.
+  let state: MvuData = { stat_data: { ...(seed ?? {}) } };
   let cachedCandidates: string[] | null = null;
   let candidatesTried = false;
 

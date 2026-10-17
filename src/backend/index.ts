@@ -6,6 +6,7 @@ import { installDispatchSlashHandler } from './dispatch-slash';
 import { installThHelpersHandler } from './th-helpers';
 import { installRegexTakeoverHandler } from './regex-takeover';
 import { installHostReadHandler } from './host-read';
+import { installMvuMacros } from './mvu-macros';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -26,6 +27,7 @@ installDispatchSlashHandler();
 installThHelpersHandler();
 installRegexTakeoverHandler();
 installHostReadHandler();
+installMvuMacros();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).

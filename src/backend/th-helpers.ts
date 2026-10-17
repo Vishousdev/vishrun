@@ -1,6 +1,7 @@
-import type { ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
+import type { CharacterDTO, ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
 import { api } from './common';
 import { computeVariablesSnapshot, emptyMvuData, type MvuData } from './mvu-parser';
+import { initvarFromEntries, type InitvarEntry } from './mvu-initvar';
 
 const LOG_PREFIX = '[vishrun:th-helpers]';
 const log = {
@@ -118,16 +119,16 @@ type CharactersApi = SpindleAPI['characters'];
 // msg.extra; single-character chats fall back to the chat row. Empty array
 // when unresolved. Shared by the initial-message swipes population and the
 // variables-snapshot recovery below.
-async function fetchCharacterGreetings(
+async function fetchChatCharacter(
   messages: ChatMessageDTO[],
   chatId: string,
   userId: string,
   chats: ChatsApi,
   characters: CharactersApi,
-): Promise<string[]> {
+): Promise<CharacterDTO | null> {
   const msg0 = messages[0] as (ChatMessageDTO & { extra?: Record<string, unknown> }) | undefined;
   let charId: string | null = null;
-  const fromExtra = msg0?.extra?.character_id;
+  const fromExtra = msg0?.extra?.character_id ?? msg0?.extra?.greeting_character_id;
   if (typeof fromExtra === 'string' && fromExtra.length > 0) {
     charId = fromExtra;
   } else {
@@ -136,12 +137,56 @@ async function fetchCharacterGreetings(
     const chatDto = await chats.get(chatId, userId);
     if (chatDto && typeof chatDto.character_id === 'string') charId = chatDto.character_id;
   }
-  if (!charId) return [];
-  const card = await characters.get(charId, userId);
+  if (!charId) return null;
+  return (await characters.get(charId, userId)) ?? null;
+}
+
+function greetingsOf(card: CharacterDTO | null): string[] {
   if (!card) return [];
   const first = typeof card.first_mes === 'string' ? card.first_mes : '';
   const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
   return [first, ...alt];
+}
+
+async function fetchCharacterGreetings(
+  messages: ChatMessageDTO[],
+  chatId: string,
+  userId: string,
+  chats: ChatsApi,
+  characters: CharactersApi,
+): Promise<string[]> {
+  return greetingsOf(await fetchChatCharacter(messages, chatId, userId, chats, characters));
+}
+
+type WorldBooksApi = { entries: { list(id: string, o?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: InitvarEntry[]; total: number }> } };
+
+// [initvar] seed from the character's attached world books when readable
+// (world_books permission), else from the lorebook embedded in the card.
+export async function initvarSeedFor(
+  card: CharacterDTO | null,
+  userId: string,
+  worldBooks: WorldBooksApi | undefined = (api as unknown as { world_books?: WorldBooksApi }).world_books,
+): Promise<Record<string, unknown>> {
+  if (!card) return {};
+  const ids = Array.isArray(card.world_book_ids) ? card.world_book_ids : [];
+  if (worldBooks && ids.length > 0) {
+    try {
+      const entries: InitvarEntry[] = [];
+      for (const id of ids) {
+        for (let offset = 0; ; offset += 200) {
+          const page = await worldBooks.entries.list(id, { limit: 200, offset, userId });
+          entries.push(...page.data);
+          if (page.data.length < 200 || entries.length >= page.total) break;
+        }
+      }
+      if (entries.length > 0) return initvarFromEntries(entries);
+    } catch {
+      // no permission or missing book: use the embedded copy
+    }
+  }
+  const book = card.extensions?.character_book as { entries?: Array<InitvarEntry & { name?: unknown }> } | undefined;
+  const embedded = Array.isArray(book?.entries) ? book.entries : [];
+  return initvarFromEntries(embedded.map((e) => ({ comment: e.comment ?? e.name, content: e.content })));
 }
 
 export async function handleGetMessagesSnapshot(
@@ -202,12 +247,21 @@ export async function handleGetVariablesSnapshot(
   chat: ChatApi = api.chat,
   chats: ChatsApi = api.chats,
   characters: CharactersApi = api.characters,
+  messageCount?: number,
 ): Promise<MvuData> {
   try {
-    const messages = await chat.getMessages(chatId);
-    return await computeVariablesSnapshot(messages, () =>
-      fetchCharacterGreetings(messages as ChatMessageDTO[], chatId, userId, chats, characters),
-    );
+    const all = await chat.getMessages(chatId);
+    // Prompt macros pass the context's message count, so a regenerated
+    // reply does not see its own previous update.
+    const messages = typeof messageCount === 'number' && messageCount >= 0 ? all.slice(0, messageCount) : all;
+    let card: CharacterDTO | null = null;
+    try {
+      card = await fetchChatCharacter(messages as ChatMessageDTO[], chatId, userId, chats, characters);
+    } catch (err) {
+      log.warn('character lookup failed:', err instanceof Error ? err.message : String(err));
+    }
+    const seed = await initvarSeedFor(card, userId);
+    return await computeVariablesSnapshot(messages, async () => greetingsOf(card), seed);
   } catch (err) {
     log.warn('getVariablesSnapshot failed:', err instanceof Error ? err.message : String(err));
     return emptyMvuData();

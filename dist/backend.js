@@ -1130,8 +1130,8 @@ function stripUpdateVariableBlocks(s) {
 function hashStripped(s) {
   return fnv1a(stripUpdateVariableBlocks(s));
 }
-async function computeVariablesSnapshot(messages, recoveryFetcher) {
-  let state = emptyMvuData();
+async function computeVariablesSnapshot(messages, recoveryFetcher, seed) {
+  let state = { stat_data: { ...seed ?? {} } };
   let cachedCandidates = null;
   let candidatesTried = false;
   for (const msg of messages) {
@@ -1192,6 +1192,53 @@ async function computeVariablesSnapshot(messages, recoveryFetcher) {
   return state;
 }
 
+// src/backend/mvu-initvar.ts
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+function mergeInitvar(target, source) {
+  for (const [k, v] of Object.entries(source)) {
+    const cur = target[k];
+    target[k] = isPlainObject(cur) && isPlainObject(v) ? mergeInitvar({ ...cur }, v) : v;
+  }
+  return target;
+}
+function parseInitvarContent(raw) {
+  let text = raw.trim();
+  const xml = text.match(/.*<initvar>.*\n([\s\S]*)\n.*<\/initvar>.*/m);
+  if (xml)
+    text = xml[1];
+  const fence = text.trim().match(/```.*\n([\s\S]*)\n```/m);
+  if (fence)
+    text = fence[1];
+  text = text.trim();
+  if (!text)
+    return null;
+  try {
+    const parsed = JSON.parse(text);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {}
+  try {
+    const parsed = parseYaml(text);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function initvarFromEntries(entries) {
+  const out = {};
+  for (const e of entries) {
+    if (typeof e.comment !== "string" || !e.comment.toLowerCase().includes("[initvar]"))
+      continue;
+    if (typeof e.content !== "string")
+      continue;
+    const data = parseInitvarContent(e.content);
+    if (data)
+      mergeInitvar(out, data);
+  }
+  return out;
+}
+
 // src/backend/th-helpers.ts
 var LOG_PREFIX = "[vishrun:th-helpers]";
 var log = {
@@ -1239,10 +1286,10 @@ function shapeSnapshotMessage(msg) {
     extra: msg.extra ?? {}
   };
 }
-async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
+async function fetchChatCharacter(messages, chatId, userId, chats, characters) {
   const msg0 = messages[0];
   let charId = null;
-  const fromExtra = msg0?.extra?.character_id;
+  const fromExtra = msg0?.extra?.character_id ?? msg0?.extra?.greeting_character_id;
   if (typeof fromExtra === "string" && fromExtra.length > 0) {
     charId = fromExtra;
   } else {
@@ -1251,13 +1298,41 @@ async function fetchCharacterGreetings(messages, chatId, userId, chats, characte
       charId = chatDto.character_id;
   }
   if (!charId)
-    return [];
-  const card = await characters.get(charId, userId);
+    return null;
+  return await characters.get(charId, userId) ?? null;
+}
+function greetingsOf(card) {
   if (!card)
     return [];
   const first = typeof card.first_mes === "string" ? card.first_mes : "";
   const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
   return [first, ...alt];
+}
+async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
+  return greetingsOf(await fetchChatCharacter(messages, chatId, userId, chats, characters));
+}
+async function initvarSeedFor(card, userId, worldBooks = api.world_books) {
+  if (!card)
+    return {};
+  const ids = Array.isArray(card.world_book_ids) ? card.world_book_ids : [];
+  if (worldBooks && ids.length > 0) {
+    try {
+      const entries = [];
+      for (const id of ids) {
+        for (let offset = 0;; offset += 200) {
+          const page = await worldBooks.entries.list(id, { limit: 200, offset, userId });
+          entries.push(...page.data);
+          if (page.data.length < 200 || entries.length >= page.total)
+            break;
+        }
+      }
+      if (entries.length > 0)
+        return initvarFromEntries(entries);
+    } catch {}
+  }
+  const book = card.extensions?.character_book;
+  const embedded = Array.isArray(book?.entries) ? book.entries : [];
+  return initvarFromEntries(embedded.map((e) => ({ comment: e.comment ?? e.name, content: e.content })));
 }
 async function handleGetMessagesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters) {
   const messages = await chat.getMessages(chatId);
@@ -1282,10 +1357,18 @@ async function handleGetMessagesSnapshot(chatId, userId, chat = api.chat, chats 
   }
   return snapshot;
 }
-async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters) {
+async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters, messageCount) {
   try {
-    const messages = await chat.getMessages(chatId);
-    return await computeVariablesSnapshot(messages, () => fetchCharacterGreetings(messages, chatId, userId, chats, characters));
+    const all = await chat.getMessages(chatId);
+    const messages = typeof messageCount === "number" && messageCount >= 0 ? all.slice(0, messageCount) : all;
+    let card = null;
+    try {
+      card = await fetchChatCharacter(messages, chatId, userId, chats, characters);
+    } catch (err) {
+      log.warn("character lookup failed:", err instanceof Error ? err.message : String(err));
+    }
+    const seed = await initvarSeedFor(card, userId);
+    return await computeVariablesSnapshot(messages, async () => greetingsOf(card), seed);
   } catch (err) {
     log.warn("getVariablesSnapshot failed:", err instanceof Error ? err.message : String(err));
     return emptyMvuData();
@@ -1483,6 +1566,147 @@ function installHostReadHandler() {
   });
 }
 
+// src/backend/mvu-macros.ts
+function toPath(path) {
+  const out = [];
+  const re = /\[(?:'([^']*)'|"([^"]*)"|([^\]]*))\]|([^.[\]]+)/g;
+  for (const m of path.matchAll(re))
+    out.push(m[1] ?? m[2] ?? m[3] ?? m[4]);
+  return out;
+}
+function getAtPath(root, path) {
+  let cur = root;
+  for (const seg of toPath(path.trim())) {
+    if (cur === null || typeof cur !== "object")
+      return null;
+    cur = cur[seg];
+    if (cur === undefined)
+      return null;
+  }
+  return cur === undefined ? null : cur;
+}
+function omitDollarKeys(v) {
+  if (Array.isArray(v))
+    return v.map(omitDollarKeys);
+  if (v !== null && typeof v === "object") {
+    const out = {};
+    for (const [k, x] of Object.entries(v))
+      if (!k.startsWith("$"))
+        out[k] = omitDollarKeys(x);
+    return out;
+  }
+  return v;
+}
+var PLAIN_RE = /^[^\s\-?:,[\]{}#&*!|>'"%@`][^:#\n]*$/;
+var RESERVED_RE = /^(?:true|false|null|~|yes|no|on|off|-?\d+(?:\.\d+)?(?:e[+-]?\d+)?|0x[0-9a-f]+|\.inf|\.nan)$/i;
+function yamlString(s, indent) {
+  if (s.includes(`
+`)) {
+    const body = s.replace(/\n+$/, "").split(`
+`).map((l) => l ? indent + "  " + l : "").join(`
+`);
+    return (s.endsWith(`
+`) ? "|" : "|-") + `
+` + body;
+  }
+  if (s === "" || !PLAIN_RE.test(s) || /\s$/.test(s) || RESERVED_RE.test(s))
+    return JSON.stringify(s);
+  return s;
+}
+function yamlKey(k) {
+  return k !== "" && PLAIN_RE.test(k) && !/\s$/.test(k) && !RESERVED_RE.test(k) ? k : JSON.stringify(k);
+}
+function yamlScalar(v, indent) {
+  if (v === null || v === undefined)
+    return "null";
+  if (typeof v === "string")
+    return yamlString(v, indent);
+  if (typeof v === "number" || typeof v === "boolean")
+    return String(v);
+  return JSON.stringify(v);
+}
+function isNode(v) {
+  return v !== null && typeof v === "object" && (Array.isArray(v) ? v.length > 0 : Object.keys(v).length > 0);
+}
+function yamlLines(v, indent) {
+  if (Array.isArray(v)) {
+    if (v.length === 0)
+      return indent + "[]";
+    return v.map((item) => {
+      if (!isNode(item))
+        return `${indent}- ${Array.isArray(item) ? "[]" : item !== null && typeof item === "object" ? "{}" : yamlScalar(item, indent)}`;
+      const inner = yamlLines(item, indent + "  ");
+      return `${indent}- ${inner.slice(indent.length + 2)}`;
+    }).join(`
+`);
+  }
+  if (v !== null && typeof v === "object") {
+    const entries = Object.entries(v);
+    if (entries.length === 0)
+      return indent + "{}";
+    return entries.map(([k, x]) => {
+      if (isNode(x))
+        return `${indent}${yamlKey(k)}:
+${yamlLines(x, indent + "  ")}`;
+      const empty = Array.isArray(x) ? "[]" : x !== null && typeof x === "object" ? "{}" : yamlScalar(x, indent);
+      return `${indent}${yamlKey(k)}: ${empty}`;
+    }).join(`
+`);
+  }
+  return indent + yamlScalar(v, indent);
+}
+function toYaml(v) {
+  return yamlLines(v, "").trimEnd();
+}
+function formatVariable(data, path, mode) {
+  const value = omitDollarKeys(getAtPath(data, path));
+  if (typeof value === "string")
+    return value;
+  return mode === "json" ? JSON.stringify(value) : toYaml(value);
+}
+var chatOwners = new Map;
+var lastUserId;
+function rememberOwner(payload, userId) {
+  if (typeof userId !== "string" || !userId)
+    return;
+  lastUserId = userId;
+  const chatId = payload?.chatId;
+  if (typeof chatId === "string" && chatId)
+    chatOwners.set(chatId, userId);
+}
+function macroHandler(mode) {
+  return async (ctx) => {
+    const c = ctx ?? {};
+    const path = typeof c.args?.[0] === "string" ? c.args[0] : "";
+    if (!c.chatId)
+      return "";
+    const userId = c.userId ?? chatOwners.get(c.chatId) ?? lastUserId;
+    const count = c.env?.chat?.messageCount;
+    const data = await handleGetVariablesSnapshot(c.chatId, userId, undefined, undefined, undefined, typeof count === "number" ? count : undefined);
+    return formatVariable(data, path, mode);
+  };
+}
+function installMvuMacros() {
+  api.onFrontendMessage((payload, userId) => rememberOwner(payload, userId));
+  const reg = api.registerMacro;
+  reg({
+    name: "get_message_variable",
+    category: "Vishrun",
+    description: "MVU message variable at a path, as JSON.",
+    args: [{ name: "path", required: true }],
+    volatile: true,
+    handler: macroHandler("json")
+  });
+  reg({
+    name: "format_message_variable",
+    category: "Vishrun",
+    description: "MVU message variable at a path, as YAML.",
+    args: [{ name: "path", required: true }],
+    volatile: true,
+    handler: macroHandler("yaml")
+  });
+}
+
 // src/backend/index.ts
 installFetchExternalHandler();
 installWidgetFetchHandler();
@@ -1492,6 +1716,7 @@ installDispatchSlashHandler();
 installThHelpersHandler();
 installRegexTakeoverHandler();
 installHostReadHandler();
+installMvuMacros();
 function setup() {}
 export {
   setup
