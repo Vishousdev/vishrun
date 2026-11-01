@@ -24,8 +24,8 @@ export async function hostRead(op: HostReadRequest['op'], chatId: string, userId
   }
   const messages = await api.chat.getMessages(chatId);
   return messages.map((m) => {
-    const mm = m as { id: string; content: string; is_user: boolean; role?: string };
-    return { id: mm.id, content: mm.content, is_user: mm.is_user, role: mm.role };
+    const mm = m as { id: string; content: string; is_user: boolean; role?: string; name?: string; extra?: { hidden?: unknown } };
+    return { id: mm.id, content: mm.content, is_user: mm.is_user, role: mm.role, name: mm.name, hidden: mm.extra?.hidden === true };
   });
 }
 

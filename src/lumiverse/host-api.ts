@@ -9,6 +9,8 @@ export interface HostMessage {
   content: string;
   is_user: boolean;
   role?: 'system' | 'user' | 'assistant';
+  name?: string;
+  hidden?: boolean;
 }
 
 interface HostCtx {
