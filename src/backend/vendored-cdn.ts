@@ -1,6 +1,9 @@
 import tailwind from '../vendor/cdn/tailwind-browser-4.1.18.js.txt';
 import react from '../vendor/cdn/react-18.3.1.min.js.txt';
 import reactDom from '../vendor/cdn/react-dom-18.3.1.min.js.txt';
+import react17 from '../vendor/cdn/react-17.0.2.min.js.txt';
+import reactDom17 from '../vendor/cdn/react-dom-17.0.2.min.js.txt';
+import arco from '../vendor/cdn/arco-web-react-2.66.18.min.js.txt';
 import babel from '../vendor/cdn/babel-standalone-7.26.10.min.js.txt';
 import vue from '../vendor/cdn/vue-3.5.13.global.prod.js.txt';
 import emojiPicker from '../vendor/cdn/emoji-picker-element-1.26.3.bundle.js.txt';
@@ -21,6 +24,9 @@ const LIBS: VendoredLib[] = [
   { id: 'tailwind', hosts: new Set(['cdn.tailwindcss.com']), path: /^\/(?:[\d.]+\/?)?$/, body: tailwind },
   { id: 'react', hosts: PACKAGE_CDNS, path: /\/react(?:@18(?:\.[\d.]+)?)?\/umd\/react\.(?:production\.min|development)\.js$|\/ajax\/libs\/react\/18[\d.]*\/umd\/react\.(?:production\.min|development)\.js$/, body: react },
   { id: 'react-dom', hosts: PACKAGE_CDNS, path: /\/react-dom(?:@18(?:\.[\d.]+)?)?\/umd\/react-dom\.(?:production\.min|development)\.js$|\/ajax\/libs\/react-dom\/18[\d.]*\/umd\/react-dom\.(?:production\.min|development)\.js$/, body: reactDom },
+  { id: 'react@17', hosts: PACKAGE_CDNS, path: /\/react@17(?:\.[\d.]+)?\/umd\/react\.(?:production\.min|development)\.js$|\/ajax\/libs\/react\/17[\d.]*\/umd\/react\.(?:production\.min|development)\.js$/, body: react17 },
+  { id: 'react-dom@17', hosts: PACKAGE_CDNS, path: /\/react-dom@17(?:\.[\d.]+)?\/umd\/react-dom\.(?:production\.min|development)\.js$|\/ajax\/libs\/react-dom\/17[\d.]*\/umd\/react-dom\.(?:production\.min|development)\.js$/, body: reactDom17 },
+  { id: 'arco', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?@arco-design\/web-react(?:@2(?:\.[\d.]+)?)?\/dist\/arco(?:\.min)?\.js$/, body: arco },
   { id: 'babel', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?@babel\/standalone(?:@7[\d.]*)?\/babel(?:\.min)?\.js$|\/ajax\/libs\/babel-standalone\/7[\d.]*\/babel(?:\.min)?\.js$/, body: babel },
   { id: 'emoji-picker-element', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?emoji-picker-element(?:@(?:\^|%5E)?1(?:\.[\d.]+)?)?\/(?:index|picker)\.js$/i, body: emojiPicker },
   { id: 'vue', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?vue(?:@3(?:\.[\d.]+)?)?\/dist\/vue\.global(?:\.prod)?\.js$|\/ajax\/libs\/vue\/3[\d.]*\/vue\.global(?:\.prod)?(?:\.min)?\.js$/, body: vue },

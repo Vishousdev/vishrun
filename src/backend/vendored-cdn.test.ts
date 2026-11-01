@@ -6,6 +6,10 @@ test('card CDN URLs map to the bundled libraries', () => {
   expect(vendoredIdFor('https://cdn.tailwindcss.com/3.4.17')).toBe('tailwind');
   expect(vendoredIdFor('https://unpkg.com/react@18/umd/react.production.min.js')).toBe('react');
   expect(vendoredIdFor('https://unpkg.com/react-dom@18/umd/react-dom.production.min.js')).toBe('react-dom');
+  expect(vendoredIdFor('https://unpkg.com/react@17/umd/react.production.min.js')).toBe('react@17');
+  expect(vendoredIdFor('https://unpkg.com/react-dom@17.0.2/umd/react-dom.production.min.js')).toBe('react-dom@17');
+  expect(vendoredIdFor('https://unpkg.com/@arco-design/web-react/dist/arco.min.js')).toBe('arco');
+  expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/@arco-design/web-react@2.66.0/dist/arco.min.js')).toBe('arco');
   expect(vendoredIdFor('https://unpkg.com/@babel/standalone/babel.min.js')).toBe('babel');
   expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.0/babel.min.js')).toBe('babel');
   expect(vendoredIdFor('https://unpkg.com/vue@3/dist/vue.global.js')).toBe('vue');
@@ -15,7 +19,8 @@ test('card CDN URLs map to the bundled libraries', () => {
 });
 
 test('other versions and hosts are not served', () => {
-  expect(vendoredIdFor('https://unpkg.com/react@17/umd/react.production.min.js')).toBeNull();
+  expect(vendoredIdFor('https://unpkg.com/react@16/umd/react.production.min.js')).toBeNull();
+  expect(vendoredIdFor('https://unpkg.com/@arco-design/web-react@1/dist/arco.min.js')).toBeNull();
   expect(vendoredIdFor('https://unpkg.com/vue@2/dist/vue.js')).toBeNull();
   expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/emoji-picker-element@2/index.js')).toBeNull();
   expect(vendoredIdFor('https://cdn.tailwindcss.com.evil.com/')).toBeNull();

@@ -10,6 +10,9 @@ stored with a `.txt` extension so they bundle as text.
 | tailwind-browser-4.1.18.js.txt | @tailwindcss/browser (dist/index.global.js) | 4.1.18 | MIT |
 | react-18.3.1.min.js.txt | react (umd/react.production.min.js) | 18.3.1 | MIT |
 | react-dom-18.3.1.min.js.txt | react-dom (umd/react-dom.production.min.js) | 18.3.1 | MIT |
+| react-17.0.2.min.js.txt | react (umd/react.production.min.js) | 17.0.2 | MIT |
+| react-dom-17.0.2.min.js.txt | react-dom (umd/react-dom.production.min.js) | 17.0.2 | MIT |
+| arco-web-react-2.66.18.min.js.txt | @arco-design/web-react (dist/arco.min.js) | 2.66.18 | MIT |
 | babel-standalone-7.26.10.min.js.txt | @babel/standalone (babel.min.js) | 7.26.10 | MIT |
 | vue-3.5.13.global.prod.js.txt | vue (dist/vue.global.prod.js) | 3.5.13 | MIT |
 | emoji-picker-element-1.26.3.bundle.js.txt | emoji-picker-element + emoji-picker-element-data (en/emojibase) | 1.26.3 / 1.7.0 | Apache-2.0 |
