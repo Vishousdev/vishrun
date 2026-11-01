@@ -4882,11 +4882,52 @@ function stIdOf(block, links) {
   return links[block.id] ?? (block.marker ? MARKER_TO_ST_IDENTIFIER[block.marker] : undefined) ?? block.id;
 }
 
+// src/preset-scripts/st-stand-ins.ts
+var STAND_IN_ATTR = "data-vishrun-st-stand-in";
+function installStandIns(initialPrefill, onPrefill, doc = document) {
+  if (doc.getElementById("start_reply_with"))
+    return () => {};
+  const box = doc.createElement("div");
+  box.setAttribute(STAND_IN_ATTR, "");
+  box.hidden = true;
+  const prefill = doc.createElement("textarea");
+  prefill.id = "start_reply_with";
+  const proto = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value");
+  let timer = null;
+  Object.defineProperty(prefill, "value", {
+    configurable: true,
+    get() {
+      return proto.get.call(this);
+    },
+    set(v) {
+      const prev = proto.get.call(this);
+      proto.set.call(this, v);
+      if (String(v) === prev)
+        return;
+      if (timer)
+        clearTimeout(timer);
+      timer = setTimeout(() => onPrefill(String(v)), 200);
+    }
+  });
+  proto.set.call(prefill, initialPrefill);
+  const show = doc.createElement("input");
+  show.type = "checkbox";
+  show.id = "chat-show-reply-prefix-checkbox";
+  show.checked = true;
+  box.append(prefill, show);
+  doc.body.appendChild(box);
+  return () => {
+    if (timer)
+      clearTimeout(timer);
+    box.remove();
+  };
+}
+
 // src/preset-scripts/page-nodes.ts
 function isHostNode(node) {
   if (!(node instanceof Element))
     return true;
-  if (node.hasAttribute("data-vishrun-preset-script") || node.hasAttribute("data-vishrun-dialog"))
+  if (node.hasAttribute("data-vishrun-preset-script") || node.hasAttribute("data-vishrun-dialog") || node.hasAttribute(STAND_IN_ATTR))
     return true;
   return Object.keys(node).some((k) => k.startsWith("__react"));
 }
@@ -5352,6 +5393,15 @@ function buildThApi(state, script, win) {
       remove: () => {}
     }
   };
+  const activeModel = () => {
+    try {
+      const s = ctx.state;
+      const a = s?.get("connections.active");
+      return typeof a?.model === "string" ? a.model : "";
+    } catch {
+      return "";
+    }
+  };
   const stContext = () => ({
     chatId: ctx.getActiveChat().chatId,
     characterId: undefined,
@@ -5375,7 +5425,7 @@ function buildThApi(state, script, win) {
     getPresetManager: () => {
       return;
     },
-    getChatCompletionModel: () => "",
+    getChatCompletionModel: activeModel,
     saveSettingsDebounced: () => {}
   };
   api.TavernHelper = { ...api };
@@ -5445,6 +5495,7 @@ function installPresetScripts(ctx) {
     for (const f of running.frames)
       f.remove();
     running.stopNodes();
+    running.stopStandIns();
     for (const a of running.actions.values())
       a.destroy();
     running.stopAlias();
@@ -5593,7 +5644,11 @@ They can change this preset and the page. Run them?`,
         }
       });
     };
-    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes() };
+    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
+    const presetId = info.presetId;
+    running.stopStandIns = installStandIns(state.preset?.prefill ?? "", (value) => {
+      presetRpc(ctx, "set_prefill", { presetId, value }).then(() => refreshPreset(state)).catch((e) => console.warn("[vishrun] preset scripts: prefill", e));
+    });
     for (const s of info.scripts)
       frames.push(await startFrame(state, s));
     running.stopAlias = watchStAlias(document, onRows);
@@ -5631,13 +5686,12 @@ They can change this preset and the page. Run them?`,
         emit(running.state, TAVERN_EVENTS.SETTINGS_UPDATED);
     }),
     ctx.events.on("PRESET_CHANGED", () => {
-      if (!running)
-        return sync();
-      const st = running.state;
-      refreshPreset(st).then(() => emit(st, TAVERN_EVENTS.PRESET_CHANGED)).catch(() => {});
+      if (running)
+        refreshPreset(running.state).catch(() => {});
       sync();
     }),
     ctx.events.on("CHAT_SWITCHED", () => sync()),
+    watchActiveConnection(),
     forward("MESSAGE_SENT", TAVERN_EVENTS.MESSAGE_SENT, true),
     forward("MESSAGE_EDITED", TAVERN_EVENTS.MESSAGE_EDITED, true),
     forward("MESSAGE_EDITED", TAVERN_EVENTS.MESSAGE_UPDATED, false),
@@ -5648,6 +5702,21 @@ They can change this preset and the page. Run them?`,
     forward("GENERATION_ENDED", TAVERN_EVENTS.GENERATION_ENDED, false),
     forward("GENERATION_STOPPED", TAVERN_EVENTS.GENERATION_STOPPED, true)
   ];
+  function watchActiveConnection() {
+    const s = ctx.state;
+    if (!s?.subscribe)
+      return () => {};
+    try {
+      return s.subscribe("connections.active", () => {
+        if (!running)
+          return;
+        emit(running.state, TAVERN_EVENTS.CONNECTION_PROFILE_LOADED);
+        emit(running.state, TAVERN_EVENTS.CHATCOMPLETION_MODEL_CHANGED);
+      });
+    } catch {
+      return () => {};
+    }
+  }
   sync();
   return () => {
     for (const u of unsubs)

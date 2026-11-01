@@ -160,12 +160,25 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       if (!found || found.preset.id !== args.presetId) return null;
       const { preset, active } = found;
       const blocks = (Array.isArray(preset.prompt_order) ? preset.prompt_order : []) as unknown as Block[];
+      const completion = (preset.prompts as { completionSettings?: { assistantPrefill?: unknown } } | undefined)?.completionSettings;
       return {
         name: preset.name,
+        prefill: typeof completion?.assistantPrefill === 'string' ? completion.assistantPrefill : '',
         parameters: preset.parameters ?? {},
         metadata: preset.metadata ?? {},
         blocks: blocks.map((b) => ({ ...b, enabled: active.block_states[b.id] ?? b.enabled !== false })),
       };
+    }
+    case 'set_prefill': {
+      const preset = await api.presets.get(String(args.presetId), userId);
+      if (!preset) return false;
+      const prompts = (preset.prompts ?? {}) as Record<string, unknown>;
+      const completion = (prompts.completionSettings ?? {}) as Record<string, unknown>;
+      await api.presets.update(preset.id, {
+        prompts: { ...prompts, completionSettings: { ...completion, assistantPrefill: String(args.value ?? '') } },
+        expected_cache_revision: preset.cache_revision,
+      }, userId);
+      return true;
     }
     case 'set_block_states': {
       const presetId = String(args.presetId);
