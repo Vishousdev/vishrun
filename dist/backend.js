@@ -5986,12 +5986,26 @@ async function handle(op, args, userId) {
         return null;
       const { preset, active } = found;
       const blocks = Array.isArray(preset.prompt_order) ? preset.prompt_order : [];
+      const completion = preset.prompts?.completionSettings;
       return {
         name: preset.name,
+        prefill: typeof completion?.assistantPrefill === "string" ? completion.assistantPrefill : "",
         parameters: preset.parameters ?? {},
         metadata: preset.metadata ?? {},
         blocks: blocks.map((b) => ({ ...b, enabled: active.block_states[b.id] ?? b.enabled !== false }))
       };
+    }
+    case "set_prefill": {
+      const preset = await api.presets.get(String(args.presetId), userId);
+      if (!preset)
+        return false;
+      const prompts = preset.prompts ?? {};
+      const completion = prompts.completionSettings ?? {};
+      await api.presets.update(preset.id, {
+        prompts: { ...prompts, completionSettings: { ...completion, assistantPrefill: String(args.value ?? "") } },
+        expected_cache_revision: preset.cache_revision
+      }, userId);
+      return true;
     }
     case "set_block_states": {
       const presetId = String(args.presetId);

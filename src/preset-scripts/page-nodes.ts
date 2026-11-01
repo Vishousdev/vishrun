@@ -1,3 +1,5 @@
+import { STAND_IN_ATTR } from './st-stand-ins';
+
 // Tracks elements preset scripts add to the page body, so stopping the
 // scripts removes their panels and buttons too. A stopped script cannot
 // handle clicks, and a restarted one would reuse its dead elements by id.
@@ -5,7 +7,7 @@
 
 function isHostNode(node: Node): boolean {
   if (!(node instanceof Element)) return true;
-  if (node.hasAttribute('data-vishrun-preset-script') || node.hasAttribute('data-vishrun-dialog')) return true;
+  if (node.hasAttribute('data-vishrun-preset-script') || node.hasAttribute('data-vishrun-dialog') || node.hasAttribute(STAND_IN_ATTR)) return true;
   return Object.keys(node).some((k) => k.startsWith('__react'));
 }
 

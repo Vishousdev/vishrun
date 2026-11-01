@@ -6,6 +6,7 @@ import { presetRpc } from './rpc';
 import { watchStAlias } from './st-dom-alias';
 import { matchStIds } from './st-ids';
 import { trackPageNodes } from './page-nodes';
+import { installStandIns } from './st-stand-ins';
 import {
   buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshVars, TAVERN_EVENTS,
   type RuntimeState, type ScriptButton,
@@ -31,6 +32,7 @@ interface Running {
   actions: Map<string, SpindleInputBarActionHandle>;
   stopAlias: () => void;
   stopNodes: () => void;
+  stopStandIns: () => void;
 }
 
 const FRAME_ATTR = 'data-vishrun-preset-script';
@@ -100,6 +102,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     if (!running) return;
     for (const f of running.frames) f.remove();
     running.stopNodes();
+    running.stopStandIns();
     for (const a of running.actions.values()) a.destroy();
     running.stopAlias();
     running.state.listeners.clear();
@@ -238,7 +241,13 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         }
       });
     };
-    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes() };
+    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
+    const presetId = info.presetId;
+    running.stopStandIns = installStandIns(state.preset?.prefill ?? '', (value) => {
+      void presetRpc(ctx, 'set_prefill', { presetId, value })
+        .then(() => refreshPreset(state))
+        .catch((e) => console.warn('[vishrun] preset scripts: prefill', e));
+    });
     for (const s of info.scripts) frames.push(await startFrame(state, s));
     running.stopAlias = watchStAlias(document, onRows);
     return;
@@ -269,13 +278,15 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       if (keys.some((k) => k === 'activeChatId' || k === 'activeLoomPresetId' || k === 'activeCharacterId')) sync();
       if (running) emit(running.state, TAVERN_EVENTS.SETTINGS_UPDATED);
     }),
+    // Lumiverse fires this for any preset edit, including the scripts' own
+    // toggles; SillyTavern's PRESET_CHANGED only means another preset was
+    // selected, which restarts the scripts through sync().
     ctx.events.on('PRESET_CHANGED', () => {
-      if (!running) return sync();
-      const st = running.state;
-      void refreshPreset(st).then(() => emit(st, TAVERN_EVENTS.PRESET_CHANGED)).catch(() => {});
+      if (running) void refreshPreset(running.state).catch(() => {});
       sync();
     }),
     ctx.events.on('CHAT_SWITCHED', () => sync()),
+    watchActiveConnection(),
     forward('MESSAGE_SENT', TAVERN_EVENTS.MESSAGE_SENT, true),
     forward('MESSAGE_EDITED', TAVERN_EVENTS.MESSAGE_EDITED, true),
     forward('MESSAGE_EDITED', TAVERN_EVENTS.MESSAGE_UPDATED, false),
@@ -286,6 +297,21 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     forward('GENERATION_ENDED', TAVERN_EVENTS.GENERATION_ENDED, false),
     forward('GENERATION_STOPPED', TAVERN_EVENTS.GENERATION_STOPPED, true),
   ];
+
+  // SillyTavern fires these when the model or connection profile changes.
+  function watchActiveConnection(): () => void {
+    const s = (ctx as unknown as { state?: { subscribe(id: string, fn: (v: unknown) => void): () => void } }).state;
+    if (!s?.subscribe) return () => {};
+    try {
+      return s.subscribe('connections.active', () => {
+        if (!running) return;
+        emit(running.state, TAVERN_EVENTS.CONNECTION_PROFILE_LOADED);
+        emit(running.state, TAVERN_EVENTS.CHATCOMPLETION_MODEL_CHANGED);
+      });
+    } catch {
+      return () => {};
+    }
+  }
 
   sync();
   return () => {

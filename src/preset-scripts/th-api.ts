@@ -45,6 +45,7 @@ export interface PresetBlock {
 
 export interface PresetSnapshot {
   name: string;
+  prefill: string;
   parameters: Record<string, unknown>;
   metadata: Record<string, unknown>;
   blocks: PresetBlock[];
@@ -399,6 +400,17 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     },
   };
 
+  // Model of the active connection, for scripts that pick modes by model.
+  const activeModel = (): string => {
+    try {
+      const s = (ctx as unknown as { state?: { get(id: string): unknown } }).state;
+      const a = s?.get('connections.active') as { model?: unknown } | undefined;
+      return typeof a?.model === 'string' ? a.model : '';
+    } catch {
+      return '';
+    }
+  };
+
   const stContext = () => ({
     chatId: ctx.getActiveChat().chatId,
     characterId: undefined,
@@ -419,7 +431,7 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     chatCompletionSettings: undefined,
     mainApi: undefined,
     getPresetManager: () => undefined,
-    getChatCompletionModel: () => '',
+    getChatCompletionModel: activeModel,
     saveSettingsDebounced: () => {},
   };
   api.TavernHelper = { ...api };
