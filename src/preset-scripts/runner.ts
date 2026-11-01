@@ -5,6 +5,7 @@ import ZOD_SOURCE from '../vendor/cdn/zod-3.25.76-v4.min.js.txt';
 import { presetRpc } from './rpc';
 import { watchStAlias } from './st-dom-alias';
 import { matchStIds } from './st-ids';
+import { trackPageNodes } from './page-nodes';
 import {
   buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshVars, TAVERN_EVENTS,
   type RuntimeState, type ScriptButton,
@@ -29,6 +30,7 @@ interface Running {
   frames: HTMLIFrameElement[];
   actions: Map<string, SpindleInputBarActionHandle>;
   stopAlias: () => void;
+  stopNodes: () => void;
 }
 
 const FRAME_ATTR = 'data-vishrun-preset-script';
@@ -97,6 +99,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
   const stop = () => {
     if (!running) return;
     for (const f of running.frames) f.remove();
+    running.stopNodes();
     for (const a of running.actions.values()) a.destroy();
     running.stopAlias();
     running.state.listeners.clear();
@@ -235,7 +238,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         }
       });
     };
-    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {} };
+    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes() };
     for (const s of info.scripts) frames.push(await startFrame(state, s));
     running.stopAlias = watchStAlias(document, onRows);
     return;

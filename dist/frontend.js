@@ -4882,6 +4882,39 @@ function stIdOf(block, links) {
   return links[block.id] ?? (block.marker ? MARKER_TO_ST_IDENTIFIER[block.marker] : undefined) ?? block.id;
 }
 
+// src/preset-scripts/page-nodes.ts
+function isHostNode(node) {
+  if (!(node instanceof Element))
+    return true;
+  if (node.hasAttribute("data-vishrun-preset-script") || node.hasAttribute("data-vishrun-dialog"))
+    return true;
+  return Object.keys(node).some((k) => k.startsWith("__react"));
+}
+function trackPageNodes(doc = document) {
+  const added = new Set;
+  const observer = new MutationObserver((records) => {
+    for (const r of records) {
+      for (const n of r.addedNodes)
+        if (n instanceof Element && !isHostNode(n))
+          added.add(n);
+    }
+  });
+  observer.observe(doc.body, { childList: true });
+  return () => {
+    for (const r of observer.takeRecords()) {
+      for (const n of r.addedNodes)
+        if (n instanceof Element && !isHostNode(n))
+          added.add(n);
+    }
+    observer.disconnect();
+    for (const el of added) {
+      if (el.parentNode === doc.body && !isHostNode(el))
+        el.remove();
+    }
+    added.clear();
+  };
+}
+
 // src/preset-scripts/dialogs.ts
 function overlay(doc) {
   const root = doc.createElement("div");
@@ -5411,6 +5444,7 @@ function installPresetScripts(ctx) {
       return;
     for (const f of running.frames)
       f.remove();
+    running.stopNodes();
     for (const a of running.actions.values())
       a.destroy();
     running.stopAlias();
@@ -5559,7 +5593,7 @@ They can change this preset and the page. Run them?`,
         }
       });
     };
-    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {} };
+    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes() };
     for (const s of info.scripts)
       frames.push(await startFrame(state, s));
     running.stopAlias = watchStAlias(document, onRows);
