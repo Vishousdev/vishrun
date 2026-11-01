@@ -9,6 +9,7 @@ import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { knownNativeKeys, requestRegexTakeover } from './core/regex-takeover-client';
 import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
+import { installPresetScripts } from './preset-scripts/runner';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -41,6 +42,7 @@ export function setup(ctx: SpindleFrontendContext) {
   // lack the trigger so the Status Bar widget mounts on assistant
   // messages too (greeting already carries the placeholder in the card).
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
+  const disposePresetScripts = installPresetScripts(ctx);
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -214,6 +216,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubMessageEdited();
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
+    disposePresetScripts();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

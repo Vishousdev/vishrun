@@ -5717,7 +5717,7 @@ async function hostRead(op, chatId, userId) {
   const messages = await api.chat.getMessages(chatId);
   return messages.map((m) => {
     const mm = m;
-    return { id: mm.id, content: mm.content, is_user: mm.is_user, role: mm.role };
+    return { id: mm.id, content: mm.content, is_user: mm.is_user, role: mm.role, name: mm.name, hidden: mm.extra?.hidden === true };
   });
 }
 function installHostReadHandler() {
@@ -5820,6 +5820,227 @@ function installMvuMacros() {
   });
 }
 
+// src/preset-scripts/st-ids.ts
+var ST_IDENTIFIER_TO_MARKER = {
+  chatHistory: "chat_history",
+  worldInfoBefore: "world_info_before",
+  worldInfoAfter: "world_info_after",
+  charDescription: "char_description",
+  charPersonality: "char_personality",
+  personaDescription: "persona_description",
+  scenario: "scenario",
+  dialogueExamples: "dialogue_examples",
+  main: "main_prompt",
+  enhanceDefinitions: "enhance_definitions",
+  jailbreak: "jailbreak",
+  nsfw: "nsfw_prompt"
+};
+var MARKER_TO_ST_IDENTIFIER = Object.fromEntries(Object.entries(ST_IDENTIFIER_TO_MARKER).map(([id, marker]) => [marker, id]));
+function stIdOf(block, links) {
+  return links[block.id] ?? (block.marker ? MARKER_TO_ST_IDENTIFIER[block.marker] : undefined) ?? block.id;
+}
+function referencesUnknownIds(metadata, blocks) {
+  const groups = metadata?.baibaiToolkit?.presetPromptGroups?.prompts;
+  if (!groups || typeof groups !== "object")
+    return false;
+  const ids = new Set(blocks.map((b) => stIdOf(b, {})));
+  return Object.keys(groups).some((k) => !ids.has(k));
+}
+
+// src/backend/preset-scripts.ts
+var CONSENT_PATH = "preset-scripts-consent.json";
+var stIdsPath = (presetId) => `preset-st-ids-${presetId.replace(/[^\w-]/g, "")}.json`;
+async function readStIds(presetId, userId) {
+  try {
+    const parsed = JSON.parse(await api.userStorage.read(stIdsPath(presetId), userId));
+    return parsed && typeof parsed === "object" && parsed.map && typeof parsed.map === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function isRequest(p) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "vr_preset" && typeof r.requestId === "string" && typeof r.op === "string";
+}
+function enabledScripts(metadata) {
+  const th = metadata?.tavern_helper;
+  const out = [];
+  const walk = (list) => {
+    if (!Array.isArray(list))
+      return;
+    for (const raw of list) {
+      if (!raw || typeof raw !== "object")
+        continue;
+      const s = raw;
+      if (s.enabled === false)
+        continue;
+      if (s.type === "folder") {
+        walk(s.scripts);
+        continue;
+      }
+      if (typeof s.content !== "string" || !s.content.trim())
+        continue;
+      const buttons = s.button;
+      out.push({
+        id: String(s.id ?? s.name ?? out.length),
+        name: String(s.name ?? ""),
+        content: s.content,
+        data: s.data && typeof s.data === "object" ? s.data : {},
+        buttons: buttons?.enabled === false || !Array.isArray(buttons?.buttons) ? [] : buttons.buttons.filter((b) => typeof b?.name === "string").map((b) => ({ name: String(b.name), visible: b.visible !== false }))
+      });
+    }
+  };
+  walk(th?.scripts);
+  return out;
+}
+async function readConsent(userId) {
+  try {
+    const raw = await api.userStorage.read(CONSENT_PATH, userId);
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+function parseValue(v) {
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
+}
+async function readVars(scope, chatId, userId) {
+  const raw = scope === "global" ? await api.variables.global.list(userId) : chatId ? await api.variables.chat.list(chatId) : {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw))
+    out[k] = parseValue(v);
+  return out;
+}
+async function writeVars(scope, chatId, next, userId) {
+  const prev = await readVars(scope, chatId, userId);
+  for (const [k, v] of Object.entries(next)) {
+    const s = typeof v === "string" ? v : JSON.stringify(v);
+    if (scope === "global")
+      await api.variables.global.set(k, s, userId);
+    else if (chatId)
+      await api.variables.chat.set(chatId, k, s);
+  }
+  for (const k of Object.keys(prev)) {
+    if (k in next)
+      continue;
+    if (scope === "global")
+      await api.variables.global.delete(k, userId);
+    else if (chatId)
+      await api.variables.chat.delete(chatId, k);
+  }
+}
+async function activePreset(chatId, userId) {
+  const active = await api.presets.getActive(chatId ?? undefined, userId);
+  if (!active.preset_id)
+    return null;
+  const preset = await api.presets.get(active.preset_id, userId);
+  if (!preset)
+    return null;
+  return { active, preset };
+}
+async function handle(op, args, userId) {
+  const chatId = typeof args.chatId === "string" ? args.chatId : null;
+  switch (op) {
+    case "active_scripts": {
+      const found = await activePreset(chatId, userId);
+      if (!found)
+        return null;
+      const { preset } = found;
+      const consent = await readConsent(userId);
+      const stIds = await readStIds(preset.id, userId);
+      const blocks = Array.isArray(preset.prompt_order) ? preset.prompt_order : [];
+      return {
+        presetId: preset.id,
+        presetName: preset.name,
+        consent: consent[preset.id] ?? null,
+        scripts: enabledScripts(preset.metadata),
+        stIds: stIds?.map ?? {},
+        stIdsNeeded: !stIds && referencesUnknownIds(preset.metadata ?? {}, blocks)
+      };
+    }
+    case "set_consent": {
+      const consent = await readConsent(userId);
+      consent[String(args.presetId)] = args.allowed === true;
+      await api.userStorage.write(CONSENT_PATH, JSON.stringify(consent), userId);
+      return true;
+    }
+    case "set_st_ids": {
+      const map = {};
+      for (const [k, v] of Object.entries(args.map ?? {}))
+        if (typeof v === "string")
+          map[k] = v;
+      const file = args.declined === true ? { map: {}, declined: true } : { map };
+      await api.userStorage.write(stIdsPath(String(args.presetId)), JSON.stringify(file), userId);
+      return true;
+    }
+    case "get_preset": {
+      const found = await activePreset(chatId, userId);
+      if (!found || found.preset.id !== args.presetId)
+        return null;
+      const { preset, active } = found;
+      const blocks = Array.isArray(preset.prompt_order) ? preset.prompt_order : [];
+      return {
+        name: preset.name,
+        parameters: preset.parameters ?? {},
+        metadata: preset.metadata ?? {},
+        blocks: blocks.map((b) => ({ ...b, enabled: active.block_states[b.id] ?? b.enabled !== false }))
+      };
+    }
+    case "set_block_states": {
+      const presetId = String(args.presetId);
+      const states = args.states ?? {};
+      for (const [blockId, enabled] of Object.entries(states)) {
+        await api.presets.blocks.update(presetId, blockId, { enabled: enabled === true }, userId);
+      }
+      return true;
+    }
+    case "set_hidden": {
+      if (!chatId)
+        return false;
+      const ids = Array.isArray(args.messageIds) ? args.messageIds.filter((x) => typeof x === "string") : [];
+      for (let i = 0;i < ids.length; i += 500) {
+        await api.chat.setMessagesHidden(chatId, ids.slice(i, i + 500), args.hidden === true);
+      }
+      return true;
+    }
+    case "vars_get":
+      return readVars(args.scope === "chat" ? "chat" : "global", chatId, userId);
+    case "vars_replace":
+      await writeVars(args.scope === "chat" ? "chat" : "global", chatId, args.vars ?? {}, userId);
+      return true;
+    case "toast": {
+      const kind = ["success", "warning", "error", "info"].includes(String(args.kind)) ? String(args.kind) : "info";
+      api.toast[kind](String(args.message ?? ""), typeof args.title === "string" ? { title: args.title } : undefined);
+      return true;
+    }
+    default:
+      throw new Error(`unknown op ${op}`);
+  }
+}
+function installPresetScriptsHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (!isRequest(payload))
+      return;
+    const { requestId, op, args } = payload;
+    (async () => {
+      try {
+        const result = await handle(op, args ?? {}, userId);
+        api.sendToFrontend({ type: "vr_preset_response", requestId, result }, userId);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        api.sendToFrontend({ type: "vr_preset_response", requestId, error }, userId);
+      }
+    })();
+  });
+}
+
 // src/backend/index.ts
 installFetchExternalHandler();
 installWidgetFetchHandler();
@@ -5830,6 +6051,7 @@ installThHelpersHandler();
 installRegexTakeoverHandler();
 installHostReadHandler();
 installMvuMacros();
+installPresetScriptsHandler();
 function setup() {}
 export {
   setup
