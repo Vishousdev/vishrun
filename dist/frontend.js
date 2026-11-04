@@ -1238,6 +1238,19 @@ async function transformHtmlForExternalScripts(html, ctx) {
   return transformHtmlForCdnScripts(withTailwind, ctx);
 }
 
+// src/core/jsr-libraries.ts
+var USES_VUE = /(?<![\w$.'"`-])Vue(?![\w$'"`-])/;
+var LOADS_VUE = /vue(?:@[^/'"]*)?\/dist\/vue\.global|vue\.global(?:\.prod)?(?:\.min)?\.js/i;
+var VUE_TAG = '<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>';
+function withJsrGlobalLibraries(html) {
+  if (!USES_VUE.test(html) || LOADS_VUE.test(html))
+    return html;
+  const head = /<head\b[^>]*>/i.exec(html);
+  if (head)
+    return html.slice(0, head.index + head[0].length) + VUE_TAG + html.slice(head.index + head[0].length);
+  return VUE_TAG + html;
+}
+
 // src/core/font-proxy.ts
 var FONT_LINK_RE = /<link\b[^>]*\bhref\s*=\s*["'](https?:\/\/fonts\.googleapis\.com\/[^"']+)["'][^>]*>/gi;
 var FONT_STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
@@ -2398,7 +2411,7 @@ function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
-  const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
+  const withExternalScripts = await transformHtmlForExternalScripts(withJsrGlobalLibraries(html), ctx);
   const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
   const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
   const stripped = rewriteCssExternalUrls(stripExternalAudioSrc(stripExternalImageSrc(withoutCdnJQuery)));
@@ -5725,6 +5738,131 @@ They can change this preset and the page. Run them?`,
   };
 }
 
+// src/hooks/html-codeblocks.ts
+var ROW = "[data-message-id]";
+var CODEBLOCK = '[class*="_codeBlock_"]';
+var WRAP_ATTR = "data-vishrun-codeblock";
+var SOURCE_ATTR = "data-vishrun-codeblock-source";
+function isFrontendCode(text) {
+  return /html>|<head>|<body/i.test(text);
+}
+function hashText(s) {
+  let h = 5381;
+  for (let i = 0;i < s.length; i++)
+    h = (h << 5) + h + s.charCodeAt(i) | 0;
+  return (h >>> 0).toString(36) + ":" + s.length;
+}
+function blockOf(code) {
+  return code.closest(CODEBLOCK) ?? code.closest("pre") ?? code;
+}
+function installHtmlCodeblocks(ctx) {
+  const frames = new Map;
+  const pending = new Set;
+  let generating = false;
+  let timer = null;
+  const restore = (block) => {
+    const entry = frames.get(block);
+    if (!entry)
+      return;
+    frames.delete(block);
+    const iframe = entry.wrap.querySelector("iframe");
+    if (iframe)
+      destroyWidgetIframe(iframe, "codeblock-replaced");
+    entry.wrap.remove();
+    block.style.removeProperty("display");
+    block.removeAttribute(SOURCE_ATTR);
+  };
+  const render = async (block, row, text, key, index) => {
+    pending.add(block);
+    try {
+      const { chatId, characterId } = ctx.getActiveChat();
+      let html = text;
+      if (chatId && /\{\{[^}]+\}\}/.test(html)) {
+        html = (await resolveMacrosBatch(ctx, chatId, characterId ?? null, [html]).catch(() => [html]))[0] ?? html;
+      }
+      const messageId = row.getAttribute("data-message-id") ?? "";
+      const iframe = await buildWidgetIframe(html, "html code block", `codeblock-${index}`, messageId, ctx);
+      if (!block.isConnected || frames.has(block)) {
+        destroyWidgetIframe(iframe, "codeblock-stale");
+        return;
+      }
+      const wrap = document.createElement("div");
+      wrap.setAttribute(WRAP_ATTR, "");
+      wrap.appendChild(iframe);
+      block.before(wrap);
+      block.style.display = "none";
+      block.setAttribute(SOURCE_ATTR, key);
+      frames.set(block, { wrap, key });
+    } catch (e) {
+      console.warn("[vishrun] html code block render failed", e);
+    } finally {
+      pending.delete(block);
+    }
+  };
+  const scan = () => {
+    timer = null;
+    for (const [block] of frames)
+      if (!block.isConnected)
+        restore(block);
+    for (const wrap of document.querySelectorAll(`[${WRAP_ATTR}]`)) {
+      const next = wrap.nextElementSibling;
+      if (!next || !frames.has(next))
+        wrap.remove();
+    }
+    const rows = [...document.querySelectorAll(ROW)].filter((r) => !r.parentElement?.closest(ROW));
+    const last = rows[rows.length - 1];
+    for (const row of rows) {
+      if (generating && row === last)
+        continue;
+      row.querySelectorAll("pre > code").forEach((code, index) => {
+        const block = blockOf(code);
+        if (pending.has(block))
+          return;
+        const text = code.textContent ?? "";
+        if (!isFrontendCode(text)) {
+          restore(block);
+          return;
+        }
+        const key = hashText(text);
+        if (frames.get(block)?.key === key)
+          return;
+        restore(block);
+        render(block, row, text, key, index);
+      });
+    }
+  };
+  const schedule = () => {
+    if (timer)
+      return;
+    timer = setTimeout(scan, 150);
+  };
+  const observer = new MutationObserver(schedule);
+  observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+  const unsubs = [
+    ctx.events.on("GENERATION_STARTED", () => {
+      generating = true;
+    }),
+    ctx.events.on("GENERATION_ENDED", () => {
+      generating = false;
+      schedule();
+    }),
+    ctx.events.on("GENERATION_STOPPED", () => {
+      generating = false;
+      schedule();
+    })
+  ];
+  schedule();
+  return () => {
+    observer.disconnect();
+    if (timer)
+      clearTimeout(timer);
+    for (const u of unsubs)
+      u();
+    for (const block of [...frames.keys()])
+      restore(block);
+  };
+}
+
 // src/frontend.ts
 function touchesActiveChat(payload) {
   const p = payload || {};
@@ -5737,6 +5875,7 @@ function setup(ctx) {
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const disposePresetScripts = installPresetScripts(ctx);
+  const disposeHtmlCodeblocks = installHtmlCodeblocks(ctx);
   let inflightCharacterId = null;
   let lastLoadedCharacterId = null;
   async function loadFor(characterId) {
@@ -5869,6 +6008,7 @@ function setup(ctx) {
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
     disposePresetScripts();
+    disposeHtmlCodeblocks();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

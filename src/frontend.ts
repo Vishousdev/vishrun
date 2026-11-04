@@ -10,6 +10,7 @@ import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { knownNativeKeys, requestRegexTakeover } from './core/regex-takeover-client';
 import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
 import { installPresetScripts } from './preset-scripts/runner';
+import { installHtmlCodeblocks } from './hooks/html-codeblocks';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -43,6 +44,7 @@ export function setup(ctx: SpindleFrontendContext) {
   // messages too (greeting already carries the placeholder in the card).
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const disposePresetScripts = installPresetScripts(ctx);
+  const disposeHtmlCodeblocks = installHtmlCodeblocks(ctx);
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -217,6 +219,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
     disposePresetScripts();
+    disposeHtmlCodeblocks();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
