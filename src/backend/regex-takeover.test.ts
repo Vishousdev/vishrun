@@ -48,3 +48,25 @@ test('nativeDisplayKeys lists enabled display rows only', async () => {
   } as unknown as RegexApi;
   expect(await nativeDisplayKeys(api, 'c1', 'u')).toEqual(['<TXT>(.*?)</TXT>\u0000<b>$1</b>']);
 });
+
+test('rewrites $0 in the host copies, prompt rows included, once', async () => {
+  const { rewriteDollarZeroRows } = await import('./regex-takeover');
+  const zero = { find_regex: '(?:<msg>|<rn>)([\\s\\S]+?)(?:<\\/msg>|<\\/rn>)', replace_string: '``` $0 ```', disabled: false };
+  const { api, updates } = fakeApi([
+    { id: 'z', target: ['display', 'prompt'], ...zero, metadata: {} },
+    { id: 'done', target: ['display'], ...zero, metadata: { vishrun: { dollarZero: true } } },
+    { id: 'locked', target: ['display'], ...zero, can_mutate: false },
+  ]);
+  const script = { findRegex: '/(?:<msg>|<rn>)([\\s\\S]+?)(?:<\\/msg>|<\\/rn>)/g', replaceString: '``` $0 ```' };
+  expect(await rewriteDollarZeroRows(api, 'c1', [script], 'u', () => 7)).toBe(1);
+  expect(updates).toEqual([['z', { replace_string: '``` $& ```', metadata: { vishrun: { dollarZero: true, original: '``` $0 ```', at: 7 } } }]]);
+});
+
+test('nativeDisplayKeys reports a rewritten row by its original text', async () => {
+  const { nativeDisplayKeys } = await import('./regex-takeover');
+  const { api } = fakeApi([
+    { id: 'z', target: ['display'], find_regex: 'p', replace_string: '[$&]', disabled: false, metadata: { vishrun: { dollarZero: true, original: '[$0]' } } },
+    { id: 'edited', target: ['display'], find_regex: 'q', replace_string: '<b>mine</b>', disabled: false, metadata: { vishrun: { dollarZero: true, original: '[$0]' } } },
+  ]);
+  expect(await nativeDisplayKeys(api, 'c1', 'u')).toEqual(['p\u0000[$0]', 'q\u0000<b>mine</b>']);
+});

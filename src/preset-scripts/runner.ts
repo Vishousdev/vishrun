@@ -3,30 +3,87 @@ import JQUERY_SOURCE from '../vendor/jquery-3.5.1.min.js' with { type: 'text' };
 import LODASH_SOURCE from '../vendor/lodash-4.18.1.min.js' with { type: 'text' };
 import ZOD_SOURCE from '../vendor/cdn/zod-3.25.76-v4.min.js.txt';
 import { presetRpc } from './rpc';
-import { watchStAlias } from './st-dom-alias';
+import { RENDER_MARK, watchStAlias } from './st-dom-alias';
 import { matchStIds } from './st-ids';
 import { trackPageNodes } from './page-nodes';
 import { installStandIns } from './st-stand-ins';
+import { isMvuLoader, rewriteMvuZodImport } from './script-imports';
+import { clearMvuSchema } from './mvu-schema';
+import { fetchCdnBundle } from '../core/asset-injector';
 import {
-  buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshVars, TAVERN_EVENTS,
+  buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshRegexes, refreshVars, refreshWorldbooks, TAVERN_EVENTS,
   type RuntimeState, type ScriptButton,
 } from './th-api';
 
-// Runs the active preset's JS-Slash-Runner scripts (metadata.tavern_helper)
-// after per-preset consent. Each script gets a hidden same-origin frame with
-// the JSR globals; like in SillyTavern, `$` works on the main page.
+// Runs JS-Slash-Runner scripts (tavern_helper) from the active preset and the
+// chat's character, each after its own consent, as JS-Slash-Runner asks once
+// per preset and per card. Each script gets a hidden
+// same-origin frame with the JSR globals; like in SillyTavern, `$` works on
+// the main page.
 
-interface ActiveScripts {
-  presetId: string;
-  presetName: string;
+interface ScriptInfo { id: string; name: string; content: string; buttons: ScriptButton[]; data: Record<string, unknown> }
+
+interface PresetScripts {
+  id: string;
+  name: string;
   consent: boolean | null;
   stIds: Record<string, string>;
   stIdsNeeded: boolean;
-  scripts: { id: string; name: string; content: string; buttons: ScriptButton[]; data: Record<string, unknown> }[];
+  scripts: ScriptInfo[];
+}
+
+interface CharacterScripts { id: string; name: string; consent: boolean | null; scripts: ScriptInfo[] }
+
+interface ActiveScripts { preset: PresetScripts | null; character: CharacterScripts | null }
+
+type Source = ({ kind: 'preset' } & PresetScripts) | ({ kind: 'character' } & CharacterScripts);
+
+type RunScript = ScriptInfo & { owner: string };
+
+// JS-Slash-Runner loads these into every script frame; scripts and the
+// modules they import use them as globals.
+const FRAME_LIBRARIES = [
+  'https://unpkg.com/vue@3/dist/vue.global.prod.js',
+  'https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js',
+];
+
+async function frameLibraries(ctx: SpindleFrontendContext): Promise<string[]> {
+  const bodies = await Promise.all(FRAME_LIBRARIES.map((url) => fetchCdnBundle(url, ctx).catch((e) => {
+    console.warn('[vishrun] scripts: library', url, e);
+    return '';
+  })));
+  return bodies.filter(Boolean);
+}
+
+// A row counts as rendered again when its message or its drawn text changes.
+const rowKey = (row: Element, length: number) =>
+  `${row.getAttribute('data-message-id')}:${length}:${row.getAttribute(RENDER_MARK) ?? ''}`;
+
+function waitForMessages(expected: boolean, timeoutMs = 3000): Promise<void> {
+  if (!expected) return Promise.resolve();
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      if (document.querySelector('#chat > .mes .mes_text') || Date.now() - start > timeoutMs) resolve();
+      else setTimeout(check, 100);
+    };
+    check();
+  });
+}
+
+const sourceKey = (s: Source) => `${s.kind}:${s.id}`;
+
+// Scripts to run from a source. MagVarUpdate loaders are skipped, since
+// Vishrun's MVU does that job.
+function runnable(src: Source): RunScript[] {
+  const owner = src.kind === 'preset' ? src.id : `character:${src.id}`;
+  return src.scripts
+    .filter((s) => !isMvuLoader(s.content))
+    .map((s) => ({ ...s, owner, content: rewriteMvuZodImport(s.content) }));
 }
 
 interface Running {
-  presetId: string;
+  key: string;
   state: RuntimeState;
   frames: HTMLIFrameElement[];
   actions: Map<string, SpindleInputBarActionHandle>;
@@ -67,7 +124,7 @@ function ensureFontAwesome(): void {
   document.head.appendChild(link);
 }
 
-function startFrame(state: RuntimeState, script: ActiveScripts['scripts'][number]): Promise<HTMLIFrameElement> {
+function startFrame(state: RuntimeState, script: RunScript, libraries: string[]): Promise<HTMLIFrameElement> {
   return new Promise((resolve) => {
     const frame = document.createElement('iframe');
     frame.setAttribute(FRAME_ATTR, script.name);
@@ -79,6 +136,7 @@ function startFrame(state: RuntimeState, script: ActiveScripts['scripts'][number
       if (!win || !doc) return resolve(frame);
       addScript(doc, jqueryForParent(JQUERY_SOURCE));
       addScript(doc, LODASH_SOURCE);
+      for (const lib of libraries) addScript(doc, lib);
       if (/(?<![\w$.])z(?![\w$])/.test(script.content)) addScript(doc, ZOD_SOURCE);
       const api = buildThApi(state, script, win);
       for (const [k, v] of Object.entries(api)) (win as unknown as Record<string, unknown>)[k] = v;
@@ -106,21 +164,25 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     for (const a of running.actions.values()) a.destroy();
     running.stopAlias();
     running.state.listeners.clear();
+    clearMvuSchema();
     running = null;
   };
 
-  const makeState = (info: ActiveScripts): { state: RuntimeState; actions: Map<string, SpindleInputBarActionHandle> } => {
+  const makeState = (info: ActiveScripts, scripts: RunScript[]): { state: RuntimeState; actions: Map<string, SpindleInputBarActionHandle> } => {
     const buttons = new Map<string, ScriptButton[]>();
     const actions = new Map<string, SpindleInputBarActionHandle>();
     const state: RuntimeState = {
       ctx,
-      presetId: info.presetId,
-      presetName: info.presetName,
+      presetId: info.preset?.id ?? '',
+      presetName: info.preset?.name ?? '',
+      characterId: info.character?.id ?? null,
       preset: null,
-      stIds: info.stIds ?? {},
-      vars: { global: {}, chat: {} },
+      stIds: info.preset?.stIds ?? {},
+      vars: { global: {}, chat: {}, character: {} },
       messages: [],
       character: null,
+      worldbooks: { primary: null, additional: [], all: [] },
+      regexes: { character: [], global: [] },
       listeners: new Map(),
       getButtons: (id) => buttons.get(id) ?? [],
       setButtons: (scriptId, list) => {
@@ -138,22 +200,22 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         }
       },
     };
-    for (const s of info.scripts) state.setButtons(s.id, s.buttons);
+    for (const s of scripts) state.setButtons(s.id, s.buttons);
     return { state, actions };
   };
 
   // One-time link to the original SillyTavern file, so scripts see the
   // prompt identifiers their data refers to.
-  const linkStIds = async (info: ActiveScripts, state: RuntimeState): Promise<void> => {
+  const linkStIds = async (info: PresetScripts, state: RuntimeState): Promise<void> => {
     const res = await ctx.ui.showConfirm({
       title: 'Link the original preset file?',
-      message: `Some scripts in "${info.presetName}" refer to entries by their SillyTavern IDs, which Lumiverse does not keep on import. ` +
+      message: `Some scripts in "${info.name}" refer to entries by their SillyTavern IDs, which Lumiverse does not keep on import. ` +
         'Pick the original SillyTavern preset file (.json) once so quick switches can find their entries.',
       confirmLabel: 'Pick file',
       cancelLabel: 'Skip',
     });
     if (!res.confirmed) {
-      await presetRpc(ctx, 'set_st_ids', { presetId: info.presetId, declined: true }).catch(() => {});
+      await presetRpc(ctx, 'set_st_ids', { presetId: info.id, declined: true }).catch(() => {});
       return;
     }
     const toast = (kind: string, message: string) => void presetRpc(ctx, 'toast', { kind, message }).catch(() => {});
@@ -167,7 +229,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         toast('error', `This file does not look like the same preset (${matched} of ${state.preset.blocks.length} entries matched).`);
         return;
       }
-      await presetRpc(ctx, 'set_st_ids', { presetId: info.presetId, map: result.map });
+      await presetRpc(ctx, 'set_st_ids', { presetId: info.id, map: result.map });
       state.stIds = result.map;
       toast('success', `Linked ${matched} of ${state.preset.blocks.length} entries to the original file.`);
     } catch (e) {
@@ -178,42 +240,68 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
   const syncOnce = async () => {
     const chatId = ctx.getActiveChat().chatId;
     const info = await presetRpc<ActiveScripts | null>(ctx, 'active_scripts', { chatId }).catch((e) => {
-      console.warn('[vishrun] preset scripts:', e);
+      console.warn('[vishrun] scripts:', e);
       return undefined;
     });
     if (info === undefined) return;
     const chatChanged = chatId !== lastChatId;
     lastChatId = chatId;
 
-    if (running && info && running.presetId === info.presetId) {
+    const sources: Source[] = [];
+    if (info?.preset) sources.push({ kind: 'preset', ...info.preset });
+    if (info?.character) sources.push({ kind: 'character', ...info.character });
+    const wanted = sources.filter((s) => runnable(s).length > 0 && !declined.has(sourceKey(s)));
+    const key = wanted.map(sourceKey).join('|');
+
+    if (running && running.key === key) {
+      const st = running.state;
+      const presetId = info?.preset?.id ?? '';
+      if (st.presetId !== presetId) {
+        st.presetId = presetId;
+        st.presetName = info?.preset?.name ?? '';
+        st.stIds = info?.preset?.stIds ?? {};
+        await refreshPreset(st).catch(() => {});
+      }
       if (chatChanged) {
-        await Promise.all([refreshVars(running.state), refreshMessages(running.state), refreshPreset(running.state), refreshCharacter(running.state)]).catch(() => {});
-        emit(running.state, TAVERN_EVENTS.CHAT_CHANGED, chatId);
+        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st)]).catch(() => {});
+        emit(st, TAVERN_EVENTS.CHAT_CHANGED, chatId);
       }
       return;
     }
     stop();
-    if (!info || info.scripts.length === 0 || declined.has(info.presetId)) return;
+    if (!info || wanted.length === 0) return;
 
-    let allowed = info.consent;
-    if (allowed === null) {
-      const names = info.scripts.map((s) => `• ${s.name}`).join('\n');
-      const res = await ctx.ui.showConfirm({
-        title: 'Run preset scripts?',
-        message: `The preset "${info.presetName}" includes scripts:\n${names}\n\nThey can change this preset and the page. Run them?`,
-        confirmLabel: 'Run',
-        cancelLabel: 'Not now',
-      });
-      allowed = res.confirmed;
-      if (allowed) await presetRpc(ctx, 'set_consent', { presetId: info.presetId, allowed: true }).catch(() => {});
+    const allowed: Source[] = [];
+    for (const src of wanted) {
+      let ok = src.consent;
+      if (ok === null) {
+        const names = runnable(src).map((s) => `• ${s.name}`).join('\n');
+        const what = src.kind === 'preset' ? `The preset "${src.name}"` : `The character "${src.name}"`;
+        const res = await ctx.ui.showConfirm({
+          title: src.kind === 'preset' ? 'Run preset scripts?' : 'Run character scripts?',
+          message: `${what} includes scripts:\n${names}\n\nThey can change ${src.kind === 'preset' ? 'this preset' : 'this chat'} and the page. Run them?`,
+          confirmLabel: 'Run',
+          cancelLabel: 'Not now',
+        });
+        ok = res.confirmed;
+        if (ok) {
+          const args = src.kind === 'preset' ? { presetId: src.id } : { characterId: src.id };
+          await presetRpc(ctx, 'set_consent', { ...args, allowed: true }).catch(() => {});
+        }
+      }
+      if (ok) allowed.push(src); else declined.add(sourceKey(src));
     }
-    if (!allowed) { declined.add(info.presetId); return; }
+    if (allowed.length === 0) return;
+    // Declined sources are left out of the key on the next sync too.
+    const runKey = allowed.map(sourceKey).join('|');
 
-    const { state, actions } = makeState(info);
-    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state)]).catch((e) => {
-      console.warn('[vishrun] preset scripts: initial load', e);
+    const scripts = allowed.flatMap(runnable);
+    const { state, actions } = makeState(info, scripts);
+    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state)]).catch((e) => {
+      console.warn('[vishrun] scripts: initial load', e);
     });
-    if (info.stIdsNeeded) await linkStIds(info, state);
+    const presetSource = allowed.find((s) => s.kind === 'preset');
+    if (presetSource && info.preset?.stIdsNeeded) await linkStIds(info.preset, state);
     ensureFontAwesome();
     const frames: HTMLIFrameElement[] = [];
     // SillyTavern emits *_MESSAGE_RENDERED when a message is drawn; Lumiverse's
@@ -224,7 +312,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       for (const row of rows) {
         const idx = Number(row.getAttribute('data-message-index'));
         const msg = state.messages[idx];
-        const key = `${row.getAttribute('data-message-id')}:${msg?.content.length ?? -1}`;
+        const key = rowKey(row, msg?.content.length ?? -1);
         if (seen.get(row) === key) continue;
         seen.set(row, key);
         fresh.push(row);
@@ -236,21 +324,26 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
           const idx = Number(row.getAttribute('data-message-index'));
           const msg = state.messages[idx];
           if (!msg) continue;
-          seen.set(row, `${row.getAttribute('data-message-id')}:${msg.content.length}`);
+          seen.set(row, rowKey(row, msg.content.length));
           emit(state, msg.is_user ? TAVERN_EVENTS.USER_MESSAGE_RENDERED : TAVERN_EVENTS.CHARACTER_MESSAGE_RENDERED, idx);
         }
       });
     };
-    running = { presetId: info.presetId, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
-    const presetId = info.presetId;
-    running.stopStandIns = installStandIns(state.preset?.prefill ?? '', (value) => {
-      void presetRpc(ctx, 'set_prefill', { presetId, value })
-        .then(() => refreshPreset(state))
-        .catch((e) => console.warn('[vishrun] preset scripts: prefill', e));
-    });
-    for (const s of info.scripts) frames.push(await startFrame(state, s));
+    running = { key: runKey, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
+    if (info.preset) {
+      running.stopStandIns = installStandIns(state.preset?.prefill ?? '', (value) => {
+        if (!state.presetId) return;
+        void presetRpc(ctx, 'set_prefill', { presetId: state.presetId, value })
+          .then(() => refreshPreset(state))
+          .catch((e) => console.warn('[vishrun] scripts: prefill', e));
+      });
+    }
+    // Like JS-Slash-Runner, scripts start once the chat is on the page, so
+    // their first pass over the messages finds them.
     running.stopAlias = watchStAlias(document, onRows);
-    return;
+    await waitForMessages(state.messages.length > 0);
+    const libraries = await frameLibraries(ctx);
+    for (const s of scripts) frames.push(await startFrame(state, s, libraries));
   };
 
   const sync = (): void => {

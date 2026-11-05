@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { hostPatternOf, selectTakeoverCandidates, takeoverReasons } from './takeover-policy';
+import { hostPatternOf, rewriteDollarZero, selectDollarZeroRows, selectTakeoverCandidates, takeoverReasons } from './takeover-policy';
 
 test('reasons cover what the host renderer drops', () => {
   expect(takeoverReasons('<div><script>x()</script></div>')).toEqual(['script']);
@@ -26,6 +26,23 @@ test('only renderable, non-prompt scripts that need Vishrun are selected', () =>
     { scriptName: 'unknown', findRegex: '\\d+(x)', replaceString: '<script></script>' },
   ]);
   expect(picked.map((p) => p.name)).toEqual(['js']);
+});
+
+test('$0 alone is fixed in place, not taken over', () => {
+  const scripts = [
+    { scriptName: 'zero', findRegex: '/(?:<msg>|<rn>)([\\s\\S]+?)(?:<\\/msg>|<\\/rn>)/g', replaceString: '```\n$0\n```' },
+    { scriptName: 'zero-tag', findRegex: '<a>(.*?)</a>', replaceString: '<b>$0</b>' },
+    { scriptName: 'zero-js', findRegex: '<c>(.*?)</c>', replaceString: '<script>1</script>$0' },
+    { scriptName: 'ten', findRegex: '<d>', replaceString: '$10' },
+  ];
+  expect(selectTakeoverCandidates(scripts).map((p) => p.name)).toEqual(['zero-js']);
+  expect(selectDollarZeroRows(scripts).map((s) => s.replaceString)).toEqual(['```\n$0\n```', '<b>$0</b>']);
+});
+
+test('rewriteDollarZero maps $0 to $& and keeps $10', () => {
+  expect(rewriteDollarZero('``` $0 ``` $0')).toBe('``` $& ``` $&');
+  expect(rewriteDollarZero('$10 $1')).toBe('$10 $1');
+  expect('x<a>y</a>'.replace(/<a>.*<\/a>/, rewriteDollarZero('[$0]'))).toBe('x[<a>y</a>]');
 });
 
 test('host pattern parsing strips the literal slashes and flags', () => {

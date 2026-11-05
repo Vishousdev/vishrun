@@ -4,8 +4,15 @@ import { inputDialog, popupDialog, splitNamedArgs } from './dialogs';
 import { clickSend, parseSlash, setComposerText, splitPipeline } from '../render/slash-runner';
 import { getCharacter, getChatMessages as hostChatMessages, updateMessageContent, type HostMessage } from '../lumiverse/host-api';
 import { stIdOf } from './st-ids';
+import { setMvuSchema } from './mvu-schema';
+import {
+  fromLorebookPatch, fromWorldbookEntry, planReplace, toLorebookEntry, toWorldbookEntry,
+  type ApplyPlan, type HostEntry,
+} from './worldbook-format';
+import { planRegexReplace, toTavernRegex, type HostRegexRow } from './regex-format';
+import { resolveMacrosBatch } from '../core/macro-resolver';
 
-// JS-Slash-Runner globals for preset scripts. Sync getters (getVariables,
+// JS-Slash-Runner globals for preset and character scripts. Sync getters (getVariables,
 // getPreset, getLastMessageId) read caches that the runtime keeps fresh.
 
 export const TAVERN_EVENTS: Record<string, string> = {
@@ -55,16 +62,24 @@ type Listener = (...args: unknown[]) => unknown;
 
 export interface ScriptButton { name: string; visible: boolean }
 
+/** owner: preset id, or `character:<id>` for card scripts. */
+export interface RuntimeScript { id: string; owner: string; data: Record<string, unknown> }
+
 export interface RuntimeState {
   ctx: SpindleFrontendContext;
   presetId: string;
   presetName: string;
+  characterId: string | null;
   preset: PresetSnapshot | null;
   /** Lumiverse block id → SillyTavern identifier, when known. */
   stIds: Record<string, string>;
-  vars: { global: Record<string, unknown>; chat: Record<string, unknown> };
+  vars: { global: Record<string, unknown>; chat: Record<string, unknown>; character: Record<string, unknown> };
   messages: HostMessage[];
   character: Record<string, unknown> | null;
+  /** The character's lorebook names and all lorebook names, for JSR's sync getters. */
+  worldbooks: { primary: string | null; additional: string[]; all: string[] };
+  /** Regex rows of the chat's character and the global ones, for JSR's sync getter. */
+  regexes: { character: HostRegexRow[]; global: HostRegexRow[] };
   listeners: Map<string, Set<Listener>>;
   setButtons(scriptId: string, buttons: ScriptButton[]): void;
   getButtons(scriptId: string): ScriptButton[];
@@ -87,16 +102,32 @@ export async function refreshPreset(state: RuntimeState): Promise<void> {
 
 export async function refreshVars(state: RuntimeState): Promise<void> {
   const chatId = state.ctx.getActiveChat().chatId;
-  const [global, chat] = await Promise.all([
+  const characterId = state.characterId;
+  const [global, chat, character] = await Promise.all([
     presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'global' }),
     chatId ? presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'chat', chatId }) : Promise.resolve({}),
+    characterId ? presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'character', characterId }) : Promise.resolve({}),
   ]);
-  state.vars = { global, chat };
+  state.vars = { global, chat, character };
 }
 
 export async function refreshCharacter(state: RuntimeState): Promise<void> {
   const id = state.ctx.getActiveChat().characterId;
   state.character = id ? ((await getCharacter(id).catch(() => null)) as Record<string, unknown> | null) : null;
+}
+
+export async function refreshWorldbooks(state: RuntimeState): Promise<void> {
+  const chatId = state.ctx.getActiveChat().chatId;
+  const [own, all] = await Promise.all([
+    presetRpc<{ primary: string | null; additional: string[] }>(state.ctx, 'wb_char_names', { chatId }),
+    presetRpc<string[]>(state.ctx, 'wb_all_names', {}),
+  ]);
+  state.worldbooks = { primary: own.primary, additional: own.additional, all };
+}
+
+export async function refreshRegexes(state: RuntimeState): Promise<void> {
+  const chatId = state.ctx.getActiveChat().chatId;
+  state.regexes = await presetRpc<RuntimeState['regexes']>(state.ctx, 'regex_rows', { chatId });
 }
 
 export async function refreshMessages(state: RuntimeState): Promise<void> {
@@ -135,10 +166,10 @@ function toStPreset(p: PresetSnapshot, stIds: Record<string, string>): Record<st
   };
 }
 
-export function buildThApi(state: RuntimeState, script: { id: string; data: Record<string, unknown> }, win: Window) {
+export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Window) {
   const ctx = state.ctx;
   const clone = <T>(v: T): T => (v === undefined ? v : (win as unknown as { JSON: JSON }).JSON.parse(JSON.stringify(v)));
-  const scriptVarsKey = `vishrun:preset-script-vars:${state.presetId}:${script.id}`;
+  const scriptVarsKey = `vishrun:preset-script-vars:${script.owner}:${script.id}`;
 
   const readScriptVars = (): Record<string, unknown> => {
     try {
@@ -155,6 +186,7 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     if (type === 'global') return state.vars.global;
     if (type === 'script') return readScriptVars();
     if (type === 'chat') return state.vars.chat;
+    if (type === 'character') return state.vars.character;
     return {};
   };
 
@@ -165,10 +197,11 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
       try { localStorage.setItem(scriptVarsKey, JSON.stringify(copy)); } catch { /* quota */ }
       return;
     }
-    if (type !== 'global' && type !== 'chat') return;
+    if (type !== 'global' && type !== 'chat' && type !== 'character') return;
+    if (type === 'character' && !state.characterId) return;
     state.vars[type] = copy;
     const chatId = ctx.getActiveChat().chatId;
-    void presetRpc(ctx, 'vars_replace', { scope: type, chatId, vars: copy })
+    void presetRpc(ctx, 'vars_replace', { scope: type, chatId, characterId: state.characterId, vars: copy })
       .catch((e) => console.warn('[vishrun] preset script vars write', e));
   };
 
@@ -209,6 +242,62 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
 
   const lastMessageId = () => state.messages.length - 1;
 
+  // Lorebooks. Each call reads the book fresh, so concurrent edits elsewhere
+  // are not overwritten from a stale copy.
+  const wbRpc = <T>(op: string, args: Record<string, unknown>) =>
+    presetRpc<T>(ctx, op, { chatId: ctx.getActiveChat().chatId, ...args });
+  const entriesOf = (name: unknown) => wbRpc<HostEntry[]>('wb_entries', { name: String(name ?? '') });
+  const applyTo = (name: unknown, plan: Partial<ApplyPlan>) =>
+    wbRpc<{ entries: HostEntry[]; created: string[] }>('wb_apply', { name: String(name ?? ''), create: [], update: [], delete: [], ...plan });
+  const isCurrentChar = (name: unknown) =>
+    name === undefined || name === 'current' || (state.character !== null && name === state.character.name);
+  const charBooks = (name: unknown) =>
+    clone(isCurrentChar(name)
+      ? { primary: state.worldbooks.primary, additional: state.worldbooks.additional }
+      : { primary: null, additional: [] });
+  const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+
+  // Regexes. JSR's `type` option, or its older `scope` + `enable_state` form,
+  // which tags each regex with its scope.
+  const presetRows = () => state.regexes.global.filter((r) => r.preset_id && r.preset_id === state.presetId);
+  const globalRows = () => state.regexes.global.filter((r) => !r.preset_id);
+  const regexesFor = (opt: unknown): unknown[] => {
+    const o = isPlainObject(opt) ? opt : {};
+    if (typeof o.type === 'string') {
+      if (o.type === 'character') return isCurrentChar(o.name) ? state.regexes.character.map(toTavernRegex) : [];
+      if (o.type === 'preset') return o.name === undefined || o.name === 'in_use' || o.name === state.presetName ? presetRows().map(toTavernRegex) : [];
+      return globalRows().map(toTavernRegex);
+    }
+    const scope = typeof o.scope === 'string' ? o.scope : 'all';
+    let out: Record<string, unknown>[] = [];
+    if (scope === 'all' || scope === 'global') out = out.concat(globalRows().map((r) => ({ ...toTavernRegex(r), scope: 'global' })));
+    if (scope === 'all' || scope === 'character') out = out.concat(state.regexes.character.map((r) => ({ ...toTavernRegex(r), scope: 'character' })));
+    if (o.enable_state === 'enabled' || o.enable_state === 'disabled') out = out.filter((r) => r.enabled === (o.enable_state === 'enabled'));
+    return out;
+  };
+  const getTavernRegexes = (opt?: unknown) => clone(regexesFor(opt));
+  const applyRegexes = async (scope: 'global' | 'character', rows: HostRegexRow[], next: unknown[]) => {
+    const plan = planRegexReplace(rows, next);
+    if (plan.create.length === 0 && plan.update.length === 0) return;
+    await presetRpc(ctx, 'regex_apply', { chatId: ctx.getActiveChat().chatId, scope, ...plan });
+  };
+  // Adds and updates only; regexes left out of the list are kept.
+  const replaceTavernRegexes = async (regexes: unknown, opt?: unknown) => {
+    const o = isPlainObject(opt) ? opt : {};
+    const items = list(regexes);
+    if (typeof o.type === 'string') {
+      if (o.type === 'character' && isCurrentChar(o.name)) await applyRegexes('character', state.regexes.character, items);
+      else if (o.type === 'global') await applyRegexes('global', globalRows(), items);
+    } else {
+      const scope = typeof o.scope === 'string' ? o.scope : 'all';
+      const isGlobal = (r: unknown) => isPlainObject(r) && r.scope === 'global';
+      if (scope === 'all' || scope === 'global') await applyRegexes('global', globalRows(), items.filter(isGlobal));
+      if (scope === 'all' || scope === 'character') await applyRegexes('character', state.regexes.character, items.filter((r) => !isGlobal(r)));
+    }
+    await refreshRegexes(state).catch(() => {});
+    (ctx as { display?: { invalidate?: (vars: string[]) => void } }).display?.invalidate?.(['*']);
+  };
+
   const resolveRange = (range: unknown): [number, number] => {
     const last = lastMessageId();
     const norm = (n: number) => (n < 0 ? last + 1 + n : n);
@@ -235,6 +324,29 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     return clone(out);
   };
 
+  // SillyTavern macros Lumiverse has no equivalent for.
+  const charAvatar = () => (state.character?.id ? `/api/v1/characters/${String(state.character.id)}/avatar` : '');
+  const userAvatar = () => {
+    try {
+      const s = (ctx as unknown as { state?: { get(id: string): unknown } }).state;
+      const id = s?.get('persona.activeId');
+      return typeof id === 'string' && id ? `/api/v1/personas/${id}/avatar` : '';
+    } catch {
+      return '';
+    }
+  };
+  const localMacros = (text: string) => text
+    .replace(/\{\{lastMessageId\}\}/gi, String(lastMessageId()))
+    .replace(/\{\{charAvatarPath\}\}/gi, charAvatar())
+    .replace(/\{\{userAvatarPath\}\}/gi, userAvatar());
+  const resolveMacros = async (text: string): Promise<string> => {
+    const local = localMacros(text);
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId || !local.includes('{{')) return local;
+    const characterId = typeof state.character?.id === 'string' ? state.character.id : null;
+    return (await resolveMacrosBatch(ctx, chatId, characterId, [local]).catch(() => [local]))[0] ?? local;
+  };
+
   const triggerSlash = async (command: unknown): Promise<string> => {
     let pipe = '';
     for (const step of splitPipeline(String(command ?? ''))) {
@@ -242,6 +354,9 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
       if (!parsed) continue;
       const rest = parsed.rest.replace(/\{\{pipe\}\}/g, pipe);
       switch (parsed.name) {
+        case 'pass':
+          pipe = await resolveMacros(rest);
+          break;
         case 'send':
         case 'setinput':
           setComposerText(rest);
@@ -298,7 +413,7 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
 
   const api: Record<string, unknown> = {
     getVariables: (opt?: unknown) => clone(getVars(opt)),
-    getAllVariables: () => clone({ ...state.vars.global, ...state.vars.chat }),
+    getAllVariables: () => clone({ ...state.vars.global, ...state.vars.character, ...state.vars.chat }),
     replaceVariables: (vars: Record<string, unknown>, opt?: unknown) => setVars(vars, opt),
     updateVariablesWith: (fn: (v: Record<string, unknown>) => unknown, opt?: unknown) => {
       const draft = JSON.parse(JSON.stringify(getVars(opt)));
@@ -331,6 +446,59 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     setPreset,
     replacePreset: setPreset,
     getChatMessages,
+    getTavernRegexes,
+    replaceTavernRegexes,
+    updateTavernRegexesWith: async (fn: (r: unknown[]) => unknown, opt?: unknown) => {
+      const next = list(await fn(getTavernRegexes(opt)));
+      await replaceTavernRegexes(next, opt);
+      return clone(next);
+    },
+    isCharacterTavernRegexesEnabled: () => true,
+    getCharWorldbookNames: charBooks,
+    getCharLorebooks: (opt?: unknown) => charBooks(isPlainObject(opt) ? opt.name : undefined),
+    getCurrentCharPrimaryLorebook: () => state.worldbooks.primary,
+    getWorldbookNames: () => clone(state.worldbooks.all),
+    getLorebooks: () => clone(state.worldbooks.all),
+    getWorldbook: async (name: unknown) => clone((await entriesOf(name)).map(toWorldbookEntry)),
+    replaceWorldbook: async (name: unknown, entries: unknown) => {
+      await applyTo(name, planReplace(await entriesOf(name), list(entries)));
+    },
+    updateWorldbookWith: async (name: unknown, fn: (e: unknown[]) => unknown) => {
+      const cur = await entriesOf(name);
+      const next = await fn(clone(cur.map(toWorldbookEntry)));
+      const r = await applyTo(name, planReplace(cur, list(next)));
+      return clone(r.entries.map(toWorldbookEntry));
+    },
+    createWorldbookEntries: async (name: unknown, entries: unknown) => {
+      const r = await applyTo(name, { create: list(entries).map(fromWorldbookEntry) });
+      const all = r.entries.map(toWorldbookEntry);
+      return clone({ worldbook: all, new_entries: all.filter((e) => r.created.includes(String(e.uid))) });
+    },
+    deleteWorldbookEntries: async (name: unknown, predicate: (e: unknown) => unknown) => {
+      const cur = await entriesOf(name);
+      const gone = cur.filter((e) => predicate(clone(toWorldbookEntry(e))));
+      const r = await applyTo(name, { delete: gone.map((e) => e.id) });
+      return clone({ worldbook: r.entries.map(toWorldbookEntry), deleted_entries: gone.map(toWorldbookEntry) });
+    },
+    getLorebookEntries: async (name: unknown) => clone((await entriesOf(name)).map(toLorebookEntry)),
+    setLorebookEntries: async (name: unknown, entries: unknown) => {
+      const ids = new Set((await entriesOf(name)).map((e) => e.id));
+      const update = list(entries)
+        .filter((e): e is Record<string, unknown> => isPlainObject(e) && ids.has(String(e.uid)))
+        .map((e) => ({ id: String(e.uid), patch: fromLorebookPatch(e) }));
+      const r = await applyTo(name, { update });
+      return clone(r.entries.map(toLorebookEntry));
+    },
+    createLorebookEntries: async (name: unknown, entries: unknown) => {
+      const r = await applyTo(name, { create: list(entries).map(fromLorebookPatch) });
+      return clone({ entries: r.entries.map(toLorebookEntry), new_uids: r.created });
+    },
+    deleteLorebookEntries: async (name: unknown, uids: unknown) => {
+      const want = new Set(list(uids).map(String));
+      const gone = (await entriesOf(name)).filter((e) => want.has(e.id)).map((e) => e.id);
+      const r = await applyTo(name, { delete: gone });
+      return clone({ entries: r.entries.map(toLorebookEntry), delete_occurred: gone.length > 0 });
+    },
     setChatMessages: async (msgs: unknown) => {
       if (!Array.isArray(msgs)) return;
       const chatId = ctx.getActiveChat().chatId;
@@ -388,7 +556,9 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     iframe_events: {},
     errorCatched: (fn: unknown) => fn,
     waitGlobalInitialized: async () => undefined,
-    substitudeMacros: (text: unknown) => String(text ?? ''),
+    // JSR's version is synchronous, so only macros known locally resolve here.
+    substitudeMacros: (text: unknown) => localMacros(String(text ?? ''))
+      .replace(/\{\{char\}\}/gi, typeof state.character?.name === 'string' ? state.character.name : '{{char}}'),
     getTavernHelperVersion: () => '4.0.0',
     toastr: {
       success: toast('success'),
@@ -432,8 +602,10 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     mainApi: undefined,
     getPresetManager: () => undefined,
     getChatCompletionModel: activeModel,
+    isMobile: () => /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent),
     saveSettingsDebounced: () => {},
   };
   api.TavernHelper = { ...api };
+  api.__vishrunMvuZod = { registerMvuSchema: setMvuSchema };
   return api;
 }

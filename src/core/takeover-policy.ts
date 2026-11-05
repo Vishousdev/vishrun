@@ -15,6 +15,7 @@ const JS_URL_RE = /javascript\s*:/i;
 const BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
 // Native replacement only knows $1..$99, $& and named groups.
 const DOLLAR_ZERO_RE = /\$0(?!\d)/;
+const DOLLAR_ZERO_ALL_RE = /\$0(?!\d)/g;
 // Fenced HTML renders as a code block natively, as a frame in SillyTavern.
 const HTML_FENCE_RE = /```(?:html)?[ \t]*\r?\n\s*</i;
 
@@ -38,6 +39,17 @@ export interface TakeoverCandidate {
   reasons: TakeoverReason[];
 }
 
+// SillyTavern's $0 is the whole match, which is $& in JavaScript.
+export function rewriteDollarZero(replaceString: string): string {
+  return replaceString.replace(DOLLAR_ZERO_ALL_RE, '$$&');
+}
+
+// $0 alone is fixed in the host's row (see rewriteDollarZero), so it is not
+// a reason to take the row over.
+function needsTakeover(reasons: TakeoverReason[]): boolean {
+  return reasons.some((r) => r !== 'dollar-zero');
+}
+
 // Card scripts Vishrun renders itself and the native renderer would break.
 export function selectTakeoverCandidates(scripts: RawRegexScript[]): TakeoverCandidate[] {
   const renderable = new Set(
@@ -48,9 +60,22 @@ export function selectTakeoverCandidates(scripts: RawRegexScript[]): TakeoverCan
     if (!renderable.has(i)) return;
     if (typeof s.findRegex !== 'string' || typeof s.replaceString !== 'string') return;
     const reasons = takeoverReasons(s.replaceString);
-    if (reasons.length === 0) return;
+    if (!needsTakeover(reasons)) return;
     out.push({ name: s.scriptName ?? '', findRegex: s.findRegex, replaceString: s.replaceString, reasons });
   });
+  return out;
+}
+
+// Card scripts the host keeps rendering whose $0 it would print as text.
+export function selectDollarZeroRows(scripts: RawRegexScript[]): Array<{ findRegex: string; replaceString: string }> {
+  const taken = new Set(selectTakeoverCandidates(scripts).map((c) => c.findRegex + '\u0000' + c.replaceString));
+  const out: Array<{ findRegex: string; replaceString: string }> = [];
+  for (const s of scripts) {
+    if (typeof s.findRegex !== 'string' || typeof s.replaceString !== 'string') continue;
+    if (!DOLLAR_ZERO_RE.test(s.replaceString)) continue;
+    if (taken.has(s.findRegex + '\u0000' + s.replaceString)) continue;
+    out.push({ findRegex: s.findRegex, replaceString: s.replaceString });
+  }
   return out;
 }
 

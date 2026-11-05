@@ -1,8 +1,9 @@
 import { api } from './common';
 import { referencesUnknownIds, type BlockLike } from '../preset-scripts/st-ids';
 
-// Backend side of the preset script runtime (src/preset-scripts). The
-// frontend has no preset, variable or storage API, so it calls these ops.
+// Backend side of the script runtime (src/preset-scripts) for preset and
+// character scripts. The frontend has no preset, variable or storage API, so
+// it calls these ops.
 
 export interface PresetScript {
   id: string;
@@ -28,6 +29,8 @@ interface PresetRpcRequest {
 
 const CONSENT_PATH = 'preset-scripts-consent.json';
 const stIdsPath = (presetId: string) => `preset-st-ids-${presetId.replace(/[^\w-]/g, '')}.json`;
+const charVarsPath = (characterId: string) => `character-vars-${characterId.replace(/[^\w-]/g, '')}.json`;
+const charConsentKey = (characterId: string) => `character:${characterId}`;
 
 interface StIdsFile { map: Record<string, string>; declined?: boolean }
 
@@ -90,9 +93,34 @@ function parseValue(v: string): unknown {
   try { return JSON.parse(v); } catch { return v; }
 }
 
-type VarScope = 'global' | 'chat';
+type VarScope = 'global' | 'chat' | 'character';
 
-async function readVars(scope: VarScope, chatId: string | null, userId: string): Promise<Record<string, unknown>> {
+async function cardOf(characterId: string, userId: string): Promise<{ id: string; name: string; extensions?: unknown } | null> {
+  const c = await api.characters.get(characterId, userId).catch(() => null);
+  return (c as { id: string; name: string; extensions?: unknown } | null) ?? null;
+}
+
+async function chatCharacterId(chatId: string | null, userId: string): Promise<string | null> {
+  if (!chatId) return null;
+  const chat = await api.chats.get(chatId, userId).catch(() => null);
+  const id = (chat as { character_id?: unknown } | null)?.character_id;
+  return typeof id === 'string' && id ? id : null;
+}
+
+// Character variables start from the card's tavern_helper.variables. Writes
+// are kept in user storage so the card itself is never changed.
+async function readCharacterVars(characterId: string, userId: string): Promise<Record<string, unknown>> {
+  try {
+    const parsed = JSON.parse(await api.userStorage.read(charVarsPath(characterId), userId));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch { /* not written yet */ }
+  const card = await cardOf(characterId, userId);
+  const vars = (card?.extensions as { tavern_helper?: { variables?: unknown } } | undefined)?.tavern_helper?.variables;
+  return vars && typeof vars === 'object' && !Array.isArray(vars) ? vars as Record<string, unknown> : {};
+}
+
+async function readVars(scope: VarScope, chatId: string | null, userId: string, characterId: string | null = null): Promise<Record<string, unknown>> {
+  if (scope === 'character') return characterId ? readCharacterVars(characterId, userId) : {};
   const raw = scope === 'global'
     ? await api.variables.global.list(userId)
     : chatId ? await api.variables.chat.list(chatId) : {};
@@ -101,7 +129,11 @@ async function readVars(scope: VarScope, chatId: string | null, userId: string):
   return out;
 }
 
-async function writeVars(scope: VarScope, chatId: string | null, next: Record<string, unknown>, userId: string): Promise<void> {
+async function writeVars(scope: VarScope, chatId: string | null, next: Record<string, unknown>, userId: string, characterId: string | null = null): Promise<void> {
+  if (scope === 'character') {
+    if (characterId) await api.userStorage.write(charVarsPath(characterId), JSON.stringify(next), userId);
+    return;
+  }
   const prev = await readVars(scope, chatId, userId);
   for (const [k, v] of Object.entries(next)) {
     const s = typeof v === 'string' ? v : JSON.stringify(v);
@@ -115,6 +147,81 @@ async function writeVars(scope: VarScope, chatId: string | null, next: Record<st
   }
 }
 
+// ── lorebooks for scripts (JSR worldbook/lorebook API) ──────────────────────
+
+interface WbBook { id: string; name: string }
+interface WbApi {
+  list(o: { limit?: number; offset?: number; userId?: string }): Promise<{ data: WbBook[]; total: number }>;
+  get(id: string, userId?: string): Promise<WbBook | null>;
+  entries: {
+    list(id: string, o: { limit?: number; offset?: number; userId?: string }): Promise<{ data: unknown[]; total: number }>;
+    create(bookId: string, input: Record<string, unknown>, userId?: string): Promise<{ id: string }>;
+    update(entryId: string, input: Record<string, unknown>, userId?: string): Promise<unknown>;
+    delete(entryId: string, userId?: string): Promise<boolean>;
+  };
+}
+const wb = () => (api as unknown as { world_books: WbApi }).world_books;
+
+async function characterBookIds(chatId: string | null, userId: string): Promise<string[]> {
+  const characterId = await chatCharacterId(chatId, userId);
+  const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+  const ids = (card as { world_book_ids?: unknown } | null)?.world_book_ids;
+  return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === 'string') : [];
+}
+
+async function allBooks(userId: string): Promise<WbBook[]> {
+  const out: WbBook[] = [];
+  for (let offset = 0; ; offset += 200) {
+    const page = await wb().list({ limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total) break;
+  }
+  return out;
+}
+
+// Book names are not unique in Lumiverse; the character's own books win.
+async function bookIdByName(name: string, chatId: string | null, userId: string): Promise<string> {
+  const books = await allBooks(userId);
+  const own = new Set(await characterBookIds(chatId, userId));
+  const hit = books.find((b) => b.name === name && own.has(b.id)) ?? books.find((b) => b.name === name);
+  if (!hit) throw new Error(`Lorebook '${name}' not found`);
+  return hit.id;
+}
+
+async function bookEntries(bookId: string, userId: string): Promise<unknown[]> {
+  const out: unknown[] = [];
+  for (let offset = 0; ; offset += 200) {
+    const page = await wb().entries.list(bookId, { limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total) break;
+  }
+  return out;
+}
+
+// ── regexes for scripts (JSR TavernRegex API) ───────────────────────────────
+
+interface RxApi {
+  list(o: { scope?: string; scopeId?: string; limit?: number; offset?: number; userId?: string }): Promise<{ data: unknown[]; total: number }>;
+  create(input: Record<string, unknown>, userId?: string): Promise<unknown>;
+  update(id: string, input: Record<string, unknown>, userId?: string): Promise<unknown>;
+}
+const rx = () => (api as unknown as { regex_scripts: RxApi }).regex_scripts;
+
+async function regexRows(scope: 'global' | 'character', scopeId: string | undefined, userId: string): Promise<unknown[]> {
+  const out: unknown[] = [];
+  for (let offset = 0; ; offset += 200) {
+    const page = await rx().list({ scope, ...(scopeId ? { scopeId } : {}), limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total) break;
+  }
+  return out;
+}
+
+const records = (v: unknown): Record<string, unknown>[] =>
+  Array.isArray(v) ? v.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object' && !Array.isArray(x)) : [];
+
+const scopeArg = (s: unknown): VarScope => (s === 'chat' || s === 'character' ? s : 'global');
+
 async function activePreset(chatId: string | null, userId: string) {
   const active = await api.presets.getActive(chatId ?? undefined, userId);
   if (!active.preset_id) return null;
@@ -127,24 +234,33 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
   const chatId = typeof args.chatId === 'string' ? args.chatId : null;
   switch (op) {
     case 'active_scripts': {
-      const found = await activePreset(chatId, userId);
-      if (!found) return null;
-      const { preset } = found;
       const consent = await readConsent(userId);
-      const stIds = await readStIds(preset.id, userId);
-      const blocks = (Array.isArray(preset.prompt_order) ? preset.prompt_order : []) as unknown as BlockLike[];
-      return {
-        presetId: preset.id,
-        presetName: preset.name,
-        consent: consent[preset.id] ?? null,
-        scripts: enabledScripts(preset.metadata),
-        stIds: stIds?.map ?? {},
-        stIdsNeeded: !stIds && referencesUnknownIds(preset.metadata ?? {}, blocks),
-      };
+      const found = await activePreset(chatId, userId);
+      let preset = null;
+      if (found) {
+        const p = found.preset;
+        const stIds = await readStIds(p.id, userId);
+        const blocks = (Array.isArray(p.prompt_order) ? p.prompt_order : []) as unknown as BlockLike[];
+        preset = {
+          id: p.id,
+          name: p.name,
+          consent: consent[p.id] ?? null,
+          scripts: enabledScripts(p.metadata),
+          stIds: stIds?.map ?? {},
+          stIdsNeeded: !stIds && referencesUnknownIds(p.metadata ?? {}, blocks),
+        };
+      }
+      const characterId = await chatCharacterId(chatId, userId);
+      const card = characterId ? await cardOf(characterId, userId) : null;
+      const character = card
+        ? { id: card.id, name: card.name, consent: consent[charConsentKey(card.id)] ?? null, scripts: enabledScripts(card.extensions) }
+        : null;
+      return { preset, character };
     }
     case 'set_consent': {
       const consent = await readConsent(userId);
-      consent[String(args.presetId)] = args.allowed === true;
+      const key = typeof args.characterId === 'string' ? charConsentKey(args.characterId) : String(args.presetId);
+      consent[key] = args.allowed === true;
       await api.userStorage.write(CONSENT_PATH, JSON.stringify(consent), userId);
       return true;
     }
@@ -197,10 +313,56 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       return true;
     }
     case 'vars_get':
-      return readVars(args.scope === 'chat' ? 'chat' : 'global', chatId, userId);
+      return readVars(scopeArg(args.scope), chatId, userId, typeof args.characterId === 'string' ? args.characterId : null);
     case 'vars_replace':
-      await writeVars(args.scope === 'chat' ? 'chat' : 'global', chatId, (args.vars ?? {}) as Record<string, unknown>, userId);
+      await writeVars(scopeArg(args.scope), chatId, (args.vars ?? {}) as Record<string, unknown>, userId,
+        typeof args.characterId === 'string' ? args.characterId : null);
       return true;
+    case 'wb_char_names': {
+      const books = await Promise.all((await characterBookIds(chatId, userId)).map((id) => wb().get(id, userId).catch(() => null)));
+      const names = books.filter((b): b is WbBook => !!b).map((b) => b.name);
+      return { primary: names[0] ?? null, additional: names.slice(1) };
+    }
+    case 'wb_all_names':
+      return [...new Set((await allBooks(userId)).map((b) => b.name))];
+    case 'wb_entries':
+      return bookEntries(await bookIdByName(String(args.name ?? ''), chatId, userId), userId);
+    case 'wb_apply': {
+      const bookId = await bookIdByName(String(args.name ?? ''), chatId, userId);
+      // Only entries of this book, whatever ids the script passes.
+      const own = new Set((await bookEntries(bookId, userId)).map((e) => (e as { id?: unknown }).id));
+      const created: string[] = [];
+      for (const id of Array.isArray(args.delete) ? args.delete : []) {
+        if (own.has(id)) await wb().entries.delete(String(id), userId);
+      }
+      for (const u of records(args.update)) {
+        if (own.has(u.id) && u.patch && typeof u.patch === 'object') await wb().entries.update(String(u.id), u.patch as Record<string, unknown>, userId);
+      }
+      for (const input of records(args.create)) created.push((await wb().entries.create(bookId, input, userId)).id);
+      return { entries: await bookEntries(bookId, userId), created };
+    }
+    case 'regex_rows': {
+      const characterId = await chatCharacterId(chatId, userId);
+      const [character, global] = await Promise.all([
+        characterId ? regexRows('character', characterId, userId) : Promise.resolve([]),
+        regexRows('global', undefined, userId),
+      ]);
+      return { character, global };
+    }
+    case 'regex_apply': {
+      // The character always comes from the chat, never from the script.
+      const scope = args.scope === 'global' ? 'global' : 'character';
+      const characterId = scope === 'character' ? await chatCharacterId(chatId, userId) : null;
+      if (scope === 'character' && !characterId) return false;
+      const own = new Set((await regexRows(scope, characterId ?? undefined, userId)).map((r) => (r as { id?: unknown }).id));
+      for (const u of records(args.update)) {
+        if (own.has(u.id) && u.patch && typeof u.patch === 'object') await rx().update(String(u.id), u.patch as Record<string, unknown>, userId);
+      }
+      for (const input of records(args.create)) {
+        await rx().create({ ...input, scope, ...(characterId ? { scope_id: characterId } : {}) }, userId);
+      }
+      return true;
+    }
     case 'toast': {
       const kind = ['success', 'warning', 'error', 'info'].includes(String(args.kind)) ? String(args.kind) as 'info' : 'info';
       api.toast[kind](String(args.message ?? ''), typeof args.title === 'string' ? { title: args.title } : undefined);
