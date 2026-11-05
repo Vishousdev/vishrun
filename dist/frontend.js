@@ -6012,6 +6012,10 @@ function buildThApi(state, script, win) {
 }
 
 // src/preset-scripts/runner.ts
+var resyncHook = null;
+function resyncScripts() {
+  resyncHook?.();
+}
 var FRAME_LIBRARIES = [
   "https://unpkg.com/vue@3/dist/vue.global.prod.js",
   "https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"
@@ -6237,10 +6241,8 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
           cancelLabel: "Not now"
         });
         ok = res.confirmed;
-        if (ok) {
-          const args = src.kind === "preset" ? { presetId: src.id } : { characterId: src.id };
-          await presetRpc(ctx, "set_consent", { ...args, allowed: true }).catch(() => {});
-        }
+        const args = src.kind === "preset" ? { presetId: src.id } : { characterId: src.id };
+        await presetRpc(ctx, "set_consent", { ...args, allowed: ok }).catch(() => {});
       }
       if (ok)
         allowed.push(src);
@@ -6363,8 +6365,14 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
       return () => {};
     }
   }
+  resyncHook = () => {
+    declined.clear();
+    stop();
+    sync();
+  };
   sync();
   return () => {
+    resyncHook = null;
     for (const u of unsubs)
       u();
     stop();
@@ -6496,6 +6504,403 @@ function installHtmlCodeblocks(ctx) {
   };
 }
 
+// src/settings/tree.ts
+function renderTree(value, path, open, depth = 0) {
+  const box = document.createElement("div");
+  box.className = depth === 0 ? "vr-tree" : "vr-tree-children";
+  if (!value || typeof value !== "object") {
+    box.append(leaf("", value));
+    return box;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    const childPath = `${path}.${key}`;
+    if (child && typeof child === "object" && Object.keys(child).length > 0) {
+      const details = document.createElement("details");
+      details.open = open.has(childPath);
+      const summary = document.createElement("summary");
+      const k = document.createElement("span");
+      k.className = "vr-key";
+      k.textContent = key;
+      summary.append(k, document.createTextNode(Array.isArray(child) ? ` [${child.length}]` : ` {${Object.keys(child).length}}`));
+      details.append(summary, renderTree(child, childPath, open, depth + 1));
+      details.addEventListener("toggle", () => {
+        if (details.open)
+          open.add(childPath);
+        else
+          open.delete(childPath);
+      });
+      box.append(details);
+    } else {
+      box.append(leaf(key, child));
+    }
+  }
+  return box;
+}
+function leaf(key, value) {
+  const row = document.createElement("div");
+  row.className = "vr-leaf";
+  if (key) {
+    const k = document.createElement("span");
+    k.className = "vr-key";
+    k.textContent = `${key}: `;
+    row.append(k);
+  }
+  row.append(document.createTextNode(format(value)));
+  return row;
+}
+function format(value) {
+  if (typeof value === "string")
+    return JSON.stringify(value);
+  if (value === undefined)
+    return "undefined";
+  if (Array.isArray(value))
+    return "[]";
+  if (value && typeof value === "object")
+    return "{}";
+  return String(value);
+}
+
+// src/settings/widget-status.ts
+var HTML_RE = /<(?:!doctype|html|head|body|div|span|p|a|img|style|script|link|table|tr|td|ul|ol|li|button|input|select|textarea|label|form|section|article|header|footer|nav|main|aside|details|summary|svg|canvas|audio|video|iframe|br|hr|b|i|u|s|em|strong|small|font|center|h[1-6]|pre|code|blockquote)\b/i;
+function isWidget(s) {
+  return s.promptOnly !== true && typeof s.findRegex === "string" && HTML_RE.test(s.replaceString ?? "");
+}
+function widgetStatus(scripts, nativeKeys) {
+  const compiled = new Map(compileScripts(scripts).map((c) => [c.sourceIndex, c]));
+  const out = [];
+  scripts.forEach((s, i) => {
+    if (!isWidget(s))
+      return;
+    const name = s.scriptName || "(unnamed)";
+    let state;
+    if (s.disabled)
+      state = "off";
+    else if (nativeKeys?.has(hostPatternOf(s.findRegex ?? "") + "\x00" + (s.replaceString ?? "")))
+      state = "lumiverse";
+    else if (compiled.get(i) && compiled.get(i).kind !== "unknown")
+      state = "vishrun";
+    else
+      state = "unsupported";
+    out.push({ name, state });
+  });
+  return out;
+}
+
+// src/settings/panel.ts
+var README_URL = "https://github.com/Vishousdev/vishrun#readme";
+var STYLE = `
+.vr-settings { display: flex; flex-direction: column; gap: 12px; color: var(--lumiverse-text); font-size: 14px; }
+.vr-settings[hidden], .vr-settings [hidden] { display: none !important; }
+.vr-settings .vr-header { display: flex; flex-direction: column; gap: 4px; }
+.vr-settings .vr-title { font-weight: 600; }
+.vr-settings .vr-dim { color: var(--lumiverse-text-muted, var(--lumiverse-text-dim)); font-size: 13px; }
+.vr-settings a { color: var(--lumiverse-primary); }
+.vr-settings .vr-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+.vr-settings .vr-row-main { display: flex; flex-direction: column; min-width: 0; }
+.vr-settings .vr-row-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.vr-settings .vr-allow { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius, 8px); background: var(--lumiverse-fill-subtle); }
+.vr-settings .vr-subhead { margin-top: 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--lumiverse-text-muted, var(--lumiverse-text-dim)); }
+.vr-settings .vr-list { margin-left: 4px; padding-left: 12px; border-left: 2px solid var(--lumiverse-border); }
+.vr-settings .vr-list.vr-off { opacity: .55; }
+.vr-settings .vr-script + .vr-script { border-top: 1px solid var(--lumiverse-border); }
+.vr-settings .vr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vr-settings button.vr-link { background: none; border: 1px solid var(--lumiverse-border); border-radius: var(--lumiverse-radius, 6px); color: var(--lumiverse-text); padding: 2px 10px; cursor: pointer; font-size: 12px; }
+.vr-settings button.vr-link:hover { background: var(--lumiverse-fill-subtle); }
+.vr-settings .vr-view { display: flex; flex-direction: column; gap: 8px; padding: 4px 0 10px; }
+.vr-settings .vr-label { font-size: 12px; font-weight: 600; color: var(--lumiverse-text-muted, var(--lumiverse-text-dim)); }
+.vr-settings .vr-notes { white-space: pre-wrap; word-break: break-word; }
+.vr-settings pre.vr-code { margin: 0; max-height: 320px; overflow: auto; padding: 8px; border-radius: var(--lumiverse-radius, 6px); background: var(--lumiverse-fill-subtle); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+.vr-settings .vr-tree { font-family: ui-monospace, monospace; font-size: 12px; }
+.vr-settings .vr-tree details > summary { cursor: pointer; padding: 1px 0; }
+.vr-settings .vr-tree .vr-tree-children { padding-left: 14px; border-left: 1px solid var(--lumiverse-border); margin-left: 4px; }
+.vr-settings .vr-tree .vr-key { color: var(--lumiverse-text-muted, var(--lumiverse-text-dim)); }
+.vr-settings .vr-tree .vr-leaf { padding: 1px 0; word-break: break-word; }
+`;
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls)
+    node.className = cls;
+  if (text !== undefined)
+    node.textContent = text;
+  return node;
+}
+function installSettingsPanel(ctx) {
+  const root = ctx.ui.mount("settings_extensions");
+  root.classList.add("vr-settings");
+  const style = el("style");
+  style.textContent = STYLE;
+  let content = el("div", "vr-settings");
+  content.append(el("div", "vr-dim", "Loading…"));
+  root.append(style, content);
+  let handles = [];
+  const expanded = new Map;
+  const openViews = new Set;
+  const openTree = new Set;
+  let rendering = null;
+  let again = false;
+  let stale = true;
+  const comp = ctx.components;
+  const track = (h) => {
+    handles.push(h);
+    return h;
+  };
+  const section = (parent, key, title, badge) => {
+    const host = el("div");
+    parent.append(host);
+    const h = track(comp.mountCollapsibleSection(host, {
+      title,
+      ...badge !== undefined ? { badge } : {},
+      defaultExpanded: expanded.get(key) ?? false,
+      onToggle: (open) => {
+        expanded.set(key, open);
+        if (open)
+          refresh();
+      }
+    }));
+    return h.body;
+  };
+  const ids = (kind, id) => kind === "preset" ? { presetId: id } : { characterId: id };
+  const scriptRow = (parent, kind, ownerId, consent, s) => {
+    const row = el("div", "vr-script");
+    const line = el("div", "vr-row");
+    const main = el("div", "vr-row-main");
+    main.append(el("span", "vr-name", s.name || "(unnamed)"));
+    const actions = el("div", "vr-row-actions");
+    const viewKey = `${kind}:${ownerId}:${s.id}`;
+    const viewBtn = el("button", "vr-link", openViews.has(viewKey) ? "Hide" : "View");
+    viewBtn.type = "button";
+    actions.append(viewBtn);
+    const switchHost = el("span");
+    actions.append(switchHost);
+    if (isMvuLoader(s.content)) {
+      track(comp.mountBadge(switchHost, { text: "Handled by Vishrun", color: "info", size: "sm" }));
+    } else {
+      track(comp.mountSwitch(switchHost, {
+        checked: s.enabled,
+        size: "sm",
+        ariaLabel: `Run ${s.name}`,
+        onChange: (on) => {
+          presetRpc(ctx, "set_script_enabled", { ...ids(kind, ownerId), scriptId: s.id, enabled: on }).then(() => {
+            if (consent === true)
+              resyncScripts();
+            refresh();
+          }).catch((e) => console.warn("[vishrun] settings: script switch", e));
+        }
+      }));
+    }
+    line.append(main, actions);
+    row.append(line);
+    const view = el("div", "vr-view");
+    view.hidden = !openViews.has(viewKey);
+    if (s.info.trim())
+      view.append(el("div", "vr-label", "Author notes"), el("div", "vr-notes", s.info));
+    const buttons = s.buttons.filter((b) => b.visible).map((b) => b.name);
+    if (buttons.length)
+      view.append(el("div", "vr-label", "Buttons (Extras menu)"), el("div", "vr-notes", buttons.join(", ")));
+    view.append(el("div", "vr-label", "Code"), el("pre", "vr-code", s.content));
+    row.append(view);
+    viewBtn.addEventListener("click", () => {
+      view.hidden = !view.hidden;
+      if (view.hidden)
+        openViews.delete(viewKey);
+      else
+        openViews.add(viewKey);
+      viewBtn.textContent = view.hidden ? "View" : "Hide";
+    });
+    parent.append(row);
+  };
+  const sourceBlock = (parent, kind, src) => {
+    const all = src.all ?? [];
+    if (all.length === 0) {
+      parent.append(el("div", "vr-dim", kind === "character" ? "This character has no scripts." : "This preset has no scripts."));
+      return;
+    }
+    const allow = el("div", "vr-allow");
+    const main = el("div", "vr-row-main");
+    const label = kind === "character" ? "Allow this character's scripts" : "Allow this preset's scripts";
+    main.append(el("span", "vr-title", label));
+    main.append(el("span", "vr-dim", src.consent === null ? "Not decided yet. You will be asked when they first run." : kind === "character" ? "Scripts only run while this chat is open." : "Scripts run while this preset is active."));
+    const switchHost = el("span");
+    allow.append(main, switchHost);
+    parent.append(allow);
+    track(comp.mountSwitch(switchHost, {
+      checked: src.consent === true,
+      ariaLabel: label,
+      onChange: (on) => {
+        presetRpc(ctx, "set_consent", { ...ids(kind, src.id), allowed: on }).then(() => {
+          resyncScripts();
+          refresh();
+        }).catch((e) => console.warn("[vishrun] settings: consent switch", e));
+      }
+    }));
+    parent.append(el("div", "vr-subhead", `Scripts · ${all.length}`));
+    const list = el("div", src.consent === true ? "vr-list" : "vr-list vr-off");
+    parent.append(list);
+    for (const s of all)
+      scriptRow(list, kind, src.id, src.consent, s);
+  };
+  const WIDGET_LABEL = {
+    vishrun: ["Vishrun", "primary"],
+    lumiverse: ["Lumiverse", "info"],
+    unsupported: ["Not supported", "danger"],
+    off: ["Off", "neutral"]
+  };
+  const widgetsBlock = (parent, characterId) => {
+    const card = getActiveCard();
+    if (!card || card.characterId !== characterId) {
+      parent.append(el("div", "vr-dim", "Not loaded yet. Try again in a moment."));
+      return;
+    }
+    const widgets = widgetStatus(card.scripts, card.nativeKeys);
+    if (widgets.length === 0) {
+      parent.append(el("div", "vr-dim", "This character has no widgets."));
+      return;
+    }
+    parent.append(el("div", "vr-dim", 'Who draws each widget in messages. "Not supported" widgets do not show.'));
+    const list = el("div", "vr-list");
+    for (const w of widgets) {
+      const row = el("div", "vr-row vr-script");
+      row.append(el("span", "vr-name", w.name));
+      const badgeHost = el("span");
+      row.append(badgeHost);
+      const [text, color] = WIDGET_LABEL[w.state];
+      track(comp.mountBadge(badgeHost, { text, color, size: "sm" }));
+      list.append(row);
+    }
+    parent.append(list);
+  };
+  const variablesBlock = async (parent, chatId, characterId) => {
+    const refreshBtn = el("button", "vr-link", "Refresh");
+    refreshBtn.type = "button";
+    refreshBtn.addEventListener("click", () => refresh());
+    const top = el("div", "vr-row");
+    top.append(el("span", "vr-dim", "Read-only. Updates as the chat changes."), refreshBtn);
+    parent.append(top);
+    const messages = await getChatMessages(chatId).catch(() => []);
+    const last = messages[messages.length - 1];
+    const [mvu, chat, character, global] = await Promise.all([
+      last ? fetchVariablesSnapshot({ chatId, currentMessageId: last.id, currentMessageIndex: messages.length - 1 }, ctx) : Promise.resolve({ stat_data: {} }),
+      presetRpc(ctx, "vars_get", { scope: "chat", chatId }).catch(() => ({})),
+      characterId ? presetRpc(ctx, "vars_get", { scope: "character", characterId }).catch(() => ({})) : Promise.resolve({}),
+      presetRpc(ctx, "vars_get", { scope: "global" }).catch(() => ({}))
+    ]);
+    const blocks = [
+      ["mvu", "MVU values", mvu.stat_data],
+      ["chat", "Chat variables", chat],
+      ["character", "Character variables", character],
+      ["global", "Global variables", global]
+    ];
+    for (const [key, title, value] of blocks) {
+      const count = value && typeof value === "object" ? Object.keys(value).length : 0;
+      const body = section(parent, `vars:${key}`, title, count);
+      body.append(count === 0 ? el("div", "vr-dim", "Empty.") : renderTree(value, key, openTree));
+    }
+  };
+  const render = async () => {
+    const { chatId } = ctx.getActiveChat();
+    const info = await presetRpc(ctx, "active_scripts", { chatId }).catch(() => null);
+    const next = el("div", "vr-settings");
+    next.hidden = true;
+    root.append(next);
+    const old = handles;
+    handles = [];
+    const header = el("div", "vr-header");
+    header.append(el("span", "vr-title", `Vishrun v${ctx.manifest?.version ?? ""}`));
+    const warn = el("span", "vr-dim", "Card and preset scripts run with full access to Lumiverse while they are active. Only allow ones you trust. ");
+    const more = el("a", undefined, "Read more");
+    more.href = README_URL;
+    more.target = "_blank";
+    more.rel = "noopener noreferrer";
+    warn.append(more);
+    header.append(warn);
+    next.append(header);
+    const charTitle = chatId && info?.character ? `Character scripts · ${info.character.name}` : "Character scripts";
+    const charBody = section(next, "character", charTitle, info?.character?.all?.length || undefined);
+    if (!chatId)
+      charBody.append(el("div", "vr-dim", "Open a chat to see its character's scripts and variables."));
+    else if (!info?.character)
+      charBody.append(el("div", "vr-dim", "This chat has no character."));
+    else
+      sourceBlock(charBody, "character", info.character);
+    const charId = chatId && info?.character ? info.character.id : null;
+    if (charId) {
+      const card = getActiveCard();
+      const count = card && card.characterId === charId ? widgetStatus(card.scripts, card.nativeKeys).length : undefined;
+      const widgetsBody = section(next, "widgets", "Widgets", count || undefined);
+      if (expanded.get("widgets"))
+        widgetsBlock(widgetsBody, charId);
+    }
+    if (chatId) {
+      const varsBody = section(next, "variables", "Variables");
+      if (expanded.get("variables"))
+        await variablesBlock(varsBody, chatId, info?.character?.id ?? null);
+    }
+    const presetTitle = info?.preset ? `Preset scripts · ${info.preset.name}` : "Preset scripts";
+    const presetBody = section(next, "preset", presetTitle, info?.preset?.all?.length || undefined);
+    if (!info?.preset)
+      presetBody.append(el("div", "vr-dim", "No active preset."));
+    else
+      sourceBlock(presetBody, "preset", info.preset);
+    for (const h of old) {
+      try {
+        h.destroy();
+      } catch {}
+    }
+    content.remove();
+    next.hidden = false;
+    content = next;
+  };
+  const visible = () => root.isConnected && root.getClientRects().length > 0;
+  function refresh() {
+    if (!visible()) {
+      stale = true;
+      return;
+    }
+    stale = false;
+    if (rendering) {
+      again = true;
+      return;
+    }
+    rendering = render().catch((e) => console.warn("[vishrun] settings: render", e)).finally(() => {
+      rendering = null;
+      if (again) {
+        again = false;
+        refresh();
+      }
+    });
+  }
+  const io = new IntersectionObserver((entries) => {
+    if (entries.some((e) => e.isIntersecting) && stale)
+      refresh();
+  });
+  io.observe(root);
+  const poll = setInterval(() => {
+    if (stale && visible())
+      refresh();
+  }, 1000);
+  const events = ["CHAT_SWITCHED", "PRESET_CHANGED", "MESSAGE_SENT", "MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "GENERATION_ENDED"];
+  const unsubs = events.map((name) => ctx.events.on(name, () => refresh()));
+  unsubs.push(ctx.events.on("SETTINGS_UPDATED", (payload) => {
+    const p = payload || {};
+    const keys = Array.isArray(p.keys) ? p.keys : [p.key];
+    if (keys.some((k) => k === "activeChatId" || k === "activeLoomPresetId" || k === "activeCharacterId"))
+      refresh();
+  }));
+  refresh();
+  return () => {
+    clearInterval(poll);
+    io.disconnect();
+    for (const u of unsubs)
+      u();
+    for (const h of handles) {
+      try {
+        h.destroy();
+      } catch {}
+    }
+    root.remove();
+  };
+}
+
 // src/frontend.ts
 function touchesActiveChat(payload) {
   const p = payload || {};
@@ -6509,6 +6914,7 @@ function setup(ctx) {
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const disposePresetScripts = installPresetScripts(ctx);
   const disposeHtmlCodeblocks = installHtmlCodeblocks(ctx);
+  const disposeSettingsPanel = installSettingsPanel(ctx);
   let inflightCharacterId = null;
   let lastLoadedCharacterId = null;
   async function loadFor(characterId) {
@@ -6642,6 +7048,7 @@ function setup(ctx) {
     unsubStatusBarInject();
     disposePresetScripts();
     disposeHtmlCodeblocks();
+    disposeSettingsPanel();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

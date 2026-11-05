@@ -5877,6 +5877,7 @@ function referencesUnknownIds(metadata, blocks) {
 
 // src/backend/preset-scripts.ts
 var CONSENT_PATH = "preset-scripts-consent.json";
+var SWITCHES_PATH = "script-switches.json";
 var stIdsPath = (presetId) => `preset-st-ids-${presetId.replace(/[^\w-]/g, "")}.json`;
 var charVarsPath = (characterId) => `character-vars-${characterId.replace(/[^\w-]/g, "")}.json`;
 var charConsentKey = (characterId) => `character:${characterId}`;
@@ -5894,20 +5895,18 @@ function isRequest(p) {
   const r = p;
   return r.type === "vr_preset" && typeof r.requestId === "string" && typeof r.op === "string";
 }
-function enabledScripts(metadata) {
+function listScripts(metadata) {
   const th = metadata?.tavern_helper;
   const out = [];
-  const walk = (list) => {
+  const walk = (list, folderOn) => {
     if (!Array.isArray(list))
       return;
     for (const raw of list) {
       if (!raw || typeof raw !== "object")
         continue;
       const s = raw;
-      if (s.enabled === false)
-        continue;
       if (s.type === "folder") {
-        walk(s.scripts);
+        walk(s.scripts, folderOn && s.enabled !== false);
         continue;
       }
       if (typeof s.content !== "string" || !s.content.trim())
@@ -5917,13 +5916,36 @@ function enabledScripts(metadata) {
         id: String(s.id ?? s.name ?? out.length),
         name: String(s.name ?? ""),
         content: s.content,
+        info: typeof s.info === "string" ? s.info : "",
+        defaultEnabled: folderOn && s.enabled !== false,
         data: s.data && typeof s.data === "object" ? s.data : {},
         buttons: buttons?.enabled === false || !Array.isArray(buttons?.buttons) ? [] : buttons.buttons.filter((b) => typeof b?.name === "string").map((b) => ({ name: String(b.name), visible: b.visible !== false }))
       });
     }
   };
-  walk(th?.scripts);
+  walk(th?.scripts, true);
   return out;
+}
+function enabledScripts(metadata, switches = {}) {
+  return listScripts(metadata).filter((s) => switches[s.id] ?? s.defaultEnabled).map(({ id, name, content, buttons, data }) => ({ id, name, content, buttons, data }));
+}
+function scriptsForPage(metadata, switches = {}) {
+  return listScripts(metadata).map(({ id, name, content, info, buttons, defaultEnabled }) => ({
+    id,
+    name,
+    content,
+    info,
+    buttons,
+    enabled: switches[id] ?? defaultEnabled
+  }));
+}
+async function readSwitches(userId) {
+  try {
+    const parsed = JSON.parse(await api.userStorage.read(SWITCHES_PATH, userId));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 async function readConsent(userId) {
   try {
@@ -6055,7 +6077,7 @@ async function handle(op, args, userId) {
   const chatId = typeof args.chatId === "string" ? args.chatId : null;
   switch (op) {
     case "active_scripts": {
-      const consent = await readConsent(userId);
+      const [consent, switches] = await Promise.all([readConsent(userId), readSwitches(userId)]);
       const found = await activePreset(chatId, userId);
       let preset = null;
       if (found) {
@@ -6066,14 +6088,21 @@ async function handle(op, args, userId) {
           id: p.id,
           name: p.name,
           consent: consent[p.id] ?? null,
-          scripts: enabledScripts(p.metadata),
+          scripts: enabledScripts(p.metadata, switches[p.id]),
+          all: scriptsForPage(p.metadata, switches[p.id]),
           stIds: stIds?.map ?? {},
           stIdsNeeded: !stIds && referencesUnknownIds(p.metadata ?? {}, blocks)
         };
       }
       const characterId = await chatCharacterId(chatId, userId);
       const card = characterId ? await cardOf(characterId, userId) : null;
-      const character = card ? { id: card.id, name: card.name, consent: consent[charConsentKey(card.id)] ?? null, scripts: enabledScripts(card.extensions) } : null;
+      const character = card ? {
+        id: card.id,
+        name: card.name,
+        consent: consent[charConsentKey(card.id)] ?? null,
+        scripts: enabledScripts(card.extensions, switches[charConsentKey(card.id)]),
+        all: scriptsForPage(card.extensions, switches[charConsentKey(card.id)])
+      } : null;
       return { preset, character };
     }
     case "set_consent": {
@@ -6081,6 +6110,15 @@ async function handle(op, args, userId) {
       const key = typeof args.characterId === "string" ? charConsentKey(args.characterId) : String(args.presetId);
       consent[key] = args.allowed === true;
       await api.userStorage.write(CONSENT_PATH, JSON.stringify(consent), userId);
+      return true;
+    }
+    case "set_script_enabled": {
+      const owner = typeof args.characterId === "string" ? charConsentKey(args.characterId) : String(args.presetId ?? "");
+      if (!owner || typeof args.scriptId !== "string")
+        return false;
+      const switches = await readSwitches(userId);
+      switches[owner] = { ...switches[owner] ?? {}, [args.scriptId]: args.enabled === true };
+      await api.userStorage.write(SWITCHES_PATH, JSON.stringify(switches), userId);
       return true;
     }
     case "set_st_ids": {

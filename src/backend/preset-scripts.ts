@@ -28,6 +28,7 @@ interface PresetRpcRequest {
 }
 
 const CONSENT_PATH = 'preset-scripts-consent.json';
+const SWITCHES_PATH = 'script-switches.json';
 const stIdsPath = (presetId: string) => `preset-st-ids-${presetId.replace(/[^\w-]/g, '')}.json`;
 const charVarsPath = (characterId: string) => `character-vars-${characterId.replace(/[^\w-]/g, '')}.json`;
 const charConsentKey = (characterId: string) => `character:${characterId}`;
@@ -49,23 +50,34 @@ function isRequest(p: unknown): p is PresetRpcRequest {
   return r.type === 'vr_preset' && typeof r.requestId === 'string' && typeof r.op === 'string';
 }
 
-// Flattens tavern_helper folders into the enabled scripts, in order.
-export function enabledScripts(metadata: unknown): PresetScript[] {
+export interface ListedScript extends PresetScript {
+  /** Author notes (`info`). */
+  info: string;
+  /** On/off as the card or preset ships it; a disabled folder turns its scripts off. */
+  defaultEnabled: boolean;
+}
+
+/** Vishrun-side per-script switches: owner (preset id or `character:<id>`) -> script id -> on. */
+export type ScriptSwitches = Record<string, Record<string, boolean>>;
+
+// Flattens tavern_helper folders into every script with code, in order.
+export function listScripts(metadata: unknown): ListedScript[] {
   const th = (metadata as { tavern_helper?: { scripts?: unknown } } | null)?.tavern_helper;
-  const out: PresetScript[] = [];
-  const walk = (list: unknown): void => {
+  const out: ListedScript[] = [];
+  const walk = (list: unknown, folderOn: boolean): void => {
     if (!Array.isArray(list)) return;
     for (const raw of list) {
       if (!raw || typeof raw !== 'object') continue;
       const s = raw as Record<string, unknown>;
-      if (s.enabled === false) continue;
-      if (s.type === 'folder') { walk(s.scripts); continue; }
+      if (s.type === 'folder') { walk(s.scripts, folderOn && s.enabled !== false); continue; }
       if (typeof s.content !== 'string' || !s.content.trim()) continue;
       const buttons = (s.button as { enabled?: boolean; buttons?: unknown } | undefined);
       out.push({
         id: String(s.id ?? s.name ?? out.length),
         name: String(s.name ?? ''),
         content: s.content,
+        info: typeof s.info === 'string' ? s.info : '',
+        defaultEnabled: folderOn && s.enabled !== false,
         data: s.data && typeof s.data === 'object' ? s.data as Record<string, unknown> : {},
         buttons: buttons?.enabled === false || !Array.isArray(buttons?.buttons)
           ? []
@@ -75,8 +87,31 @@ export function enabledScripts(metadata: unknown): PresetScript[] {
       });
     }
   };
-  walk(th?.scripts);
+  walk(th?.scripts, true);
   return out;
+}
+
+// The scripts that run: a Vishrun switch wins over how the script ships.
+export function enabledScripts(metadata: unknown, switches: Record<string, boolean> = {}): PresetScript[] {
+  return listScripts(metadata)
+    .filter((s) => switches[s.id] ?? s.defaultEnabled)
+    .map(({ id, name, content, buttons, data }) => ({ id, name, content, buttons, data }));
+}
+
+// Every script with its effective switch, for the settings page.
+function scriptsForPage(metadata: unknown, switches: Record<string, boolean> = {}) {
+  return listScripts(metadata).map(({ id, name, content, info, buttons, defaultEnabled }) => ({
+    id, name, content, info, buttons, enabled: switches[id] ?? defaultEnabled,
+  }));
+}
+
+async function readSwitches(userId: string): Promise<ScriptSwitches> {
+  try {
+    const parsed = JSON.parse(await api.userStorage.read(SWITCHES_PATH, userId));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 async function readConsent(userId: string): Promise<Record<string, boolean>> {
@@ -234,7 +269,7 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
   const chatId = typeof args.chatId === 'string' ? args.chatId : null;
   switch (op) {
     case 'active_scripts': {
-      const consent = await readConsent(userId);
+      const [consent, switches] = await Promise.all([readConsent(userId), readSwitches(userId)]);
       const found = await activePreset(chatId, userId);
       let preset = null;
       if (found) {
@@ -245,7 +280,8 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
           id: p.id,
           name: p.name,
           consent: consent[p.id] ?? null,
-          scripts: enabledScripts(p.metadata),
+          scripts: enabledScripts(p.metadata, switches[p.id]),
+          all: scriptsForPage(p.metadata, switches[p.id]),
           stIds: stIds?.map ?? {},
           stIdsNeeded: !stIds && referencesUnknownIds(p.metadata ?? {}, blocks),
         };
@@ -253,7 +289,13 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       const characterId = await chatCharacterId(chatId, userId);
       const card = characterId ? await cardOf(characterId, userId) : null;
       const character = card
-        ? { id: card.id, name: card.name, consent: consent[charConsentKey(card.id)] ?? null, scripts: enabledScripts(card.extensions) }
+        ? {
+          id: card.id,
+          name: card.name,
+          consent: consent[charConsentKey(card.id)] ?? null,
+          scripts: enabledScripts(card.extensions, switches[charConsentKey(card.id)]),
+          all: scriptsForPage(card.extensions, switches[charConsentKey(card.id)]),
+        }
         : null;
       return { preset, character };
     }
@@ -262,6 +304,14 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       const key = typeof args.characterId === 'string' ? charConsentKey(args.characterId) : String(args.presetId);
       consent[key] = args.allowed === true;
       await api.userStorage.write(CONSENT_PATH, JSON.stringify(consent), userId);
+      return true;
+    }
+    case 'set_script_enabled': {
+      const owner = typeof args.characterId === 'string' ? charConsentKey(args.characterId) : String(args.presetId ?? '');
+      if (!owner || typeof args.scriptId !== 'string') return false;
+      const switches = await readSwitches(userId);
+      switches[owner] = { ...(switches[owner] ?? {}), [args.scriptId]: args.enabled === true };
+      await api.userStorage.write(SWITCHES_PATH, JSON.stringify(switches), userId);
       return true;
     }
     case 'set_st_ids': {
