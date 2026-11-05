@@ -5879,6 +5879,7 @@ function referencesUnknownIds(metadata, blocks) {
 var CONSENT_PATH = "preset-scripts-consent.json";
 var stIdsPath = (presetId) => `preset-st-ids-${presetId.replace(/[^\w-]/g, "")}.json`;
 var charVarsPath = (characterId) => `character-vars-${characterId.replace(/[^\w-]/g, "")}.json`;
+var charConsentKey = (characterId) => `character:${characterId}`;
 async function readStIds(presetId, userId) {
   try {
     const parsed = JSON.parse(await api.userStorage.read(stIdsPath(presetId), userId));
@@ -5993,6 +5994,53 @@ async function writeVars(scope, chatId, next, userId, characterId = null) {
       await api.variables.chat.delete(chatId, k);
   }
 }
+var wb = () => api.world_books;
+async function characterBookIds(chatId, userId) {
+  const characterId = await chatCharacterId(chatId, userId);
+  const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+  const ids = card?.world_book_ids;
+  return Array.isArray(ids) ? ids.filter((x) => typeof x === "string") : [];
+}
+async function allBooks(userId) {
+  const out = [];
+  for (let offset = 0;; offset += 200) {
+    const page = await wb().list({ limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total)
+      break;
+  }
+  return out;
+}
+async function bookIdByName(name, chatId, userId) {
+  const books = await allBooks(userId);
+  const own = new Set(await characterBookIds(chatId, userId));
+  const hit = books.find((b) => b.name === name && own.has(b.id)) ?? books.find((b) => b.name === name);
+  if (!hit)
+    throw new Error(`Lorebook '${name}' not found`);
+  return hit.id;
+}
+async function bookEntries(bookId, userId) {
+  const out = [];
+  for (let offset = 0;; offset += 200) {
+    const page = await wb().entries.list(bookId, { limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total)
+      break;
+  }
+  return out;
+}
+var rx = () => api.regex_scripts;
+async function regexRows(scope, scopeId, userId) {
+  const out = [];
+  for (let offset = 0;; offset += 200) {
+    const page = await rx().list({ scope, ...scopeId ? { scopeId } : {}, limit: 200, offset, userId });
+    out.push(...page.data);
+    if (page.data.length < 200 || out.length >= page.total)
+      break;
+  }
+  return out;
+}
+var records = (v) => Array.isArray(v) ? v.filter((x) => !!x && typeof x === "object" && !Array.isArray(x)) : [];
 var scopeArg = (s) => s === "chat" || s === "character" ? s : "global";
 async function activePreset(chatId, userId) {
   const active = await api.presets.getActive(chatId ?? undefined, userId);
@@ -6025,12 +6073,13 @@ async function handle(op, args, userId) {
       }
       const characterId = await chatCharacterId(chatId, userId);
       const card = characterId ? await cardOf(characterId, userId) : null;
-      const character = card ? { id: card.id, name: card.name, scripts: enabledScripts(card.extensions) } : null;
+      const character = card ? { id: card.id, name: card.name, consent: consent[charConsentKey(card.id)] ?? null, scripts: enabledScripts(card.extensions) } : null;
       return { preset, character };
     }
     case "set_consent": {
       const consent = await readConsent(userId);
-      consent[String(args.presetId)] = args.allowed === true;
+      const key = typeof args.characterId === "string" ? charConsentKey(args.characterId) : String(args.presetId);
+      consent[key] = args.allowed === true;
       await api.userStorage.write(CONSENT_PATH, JSON.stringify(consent), userId);
       return true;
     }
@@ -6092,6 +6141,54 @@ async function handle(op, args, userId) {
     case "vars_replace":
       await writeVars(scopeArg(args.scope), chatId, args.vars ?? {}, userId, typeof args.characterId === "string" ? args.characterId : null);
       return true;
+    case "wb_char_names": {
+      const books = await Promise.all((await characterBookIds(chatId, userId)).map((id) => wb().get(id, userId).catch(() => null)));
+      const names = books.filter((b) => !!b).map((b) => b.name);
+      return { primary: names[0] ?? null, additional: names.slice(1) };
+    }
+    case "wb_all_names":
+      return [...new Set((await allBooks(userId)).map((b) => b.name))];
+    case "wb_entries":
+      return bookEntries(await bookIdByName(String(args.name ?? ""), chatId, userId), userId);
+    case "wb_apply": {
+      const bookId = await bookIdByName(String(args.name ?? ""), chatId, userId);
+      const own = new Set((await bookEntries(bookId, userId)).map((e) => e.id));
+      const created = [];
+      for (const id of Array.isArray(args.delete) ? args.delete : []) {
+        if (own.has(id))
+          await wb().entries.delete(String(id), userId);
+      }
+      for (const u of records(args.update)) {
+        if (own.has(u.id) && u.patch && typeof u.patch === "object")
+          await wb().entries.update(String(u.id), u.patch, userId);
+      }
+      for (const input of records(args.create))
+        created.push((await wb().entries.create(bookId, input, userId)).id);
+      return { entries: await bookEntries(bookId, userId), created };
+    }
+    case "regex_rows": {
+      const characterId = await chatCharacterId(chatId, userId);
+      const [character, global] = await Promise.all([
+        characterId ? regexRows("character", characterId, userId) : Promise.resolve([]),
+        regexRows("global", undefined, userId)
+      ]);
+      return { character, global };
+    }
+    case "regex_apply": {
+      const scope = args.scope === "global" ? "global" : "character";
+      const characterId = scope === "character" ? await chatCharacterId(chatId, userId) : null;
+      if (scope === "character" && !characterId)
+        return false;
+      const own = new Set((await regexRows(scope, characterId ?? undefined, userId)).map((r) => r.id));
+      for (const u of records(args.update)) {
+        if (own.has(u.id) && u.patch && typeof u.patch === "object")
+          await rx().update(String(u.id), u.patch, userId);
+      }
+      for (const input of records(args.create)) {
+        await rx().create({ ...input, scope, ...characterId ? { scope_id: characterId } : {} }, userId);
+      }
+      return true;
+    }
     case "toast": {
       const kind = ["success", "warning", "error", "info"].includes(String(args.kind)) ? String(args.kind) : "info";
       api.toast[kind](String(args.message ?? ""), typeof args.title === "string" ? { title: args.title } : undefined);

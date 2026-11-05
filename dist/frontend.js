@@ -4255,6 +4255,7 @@ var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
 var JS_URL_RE = /javascript\s*:/i;
 var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
 var DOLLAR_ZERO_RE = /\$0(?!\d)/;
+var DOLLAR_ZERO_ALL_RE = /\$0(?!\d)/g;
 var HTML_FENCE_RE = /```(?:html)?[ \t]*\r?\n\s*</i;
 function takeoverReasons(replaceString) {
   const r = [];
@@ -4273,6 +4274,9 @@ function takeoverReasons(replaceString) {
   if (HTML_FENCE_RE.test(replaceString))
     r.push("html-fence");
   return r;
+}
+function rewriteDollarZero(replaceString) {
+  return replaceString.replace(DOLLAR_ZERO_ALL_RE, "$$&");
 }
 function needsTakeover(reasons) {
   return reasons.some((r) => r !== "dollar-zero");
@@ -4780,6 +4784,22 @@ function presetRpc(ctx, op, args = {}) {
 var ROW_SELECTOR = "[data-message-id][data-message-index]";
 var TEXT_SELECTORS = ['[class*="_prose_"]', '[class*="_content_"]'];
 var MARK = "data-vishrun-st-alias";
+var PRE_MARK = "data-vishrun-st-pre";
+var RENDER_MARK = "data-vishrun-st-render";
+var renders = 0;
+function wrapFencedCode(text) {
+  let wrapped = 0;
+  for (const code of [...text.children]) {
+    if (code.tagName !== "CODE")
+      continue;
+    const pre = code.ownerDocument.createElement("pre");
+    pre.setAttribute(PRE_MARK, "");
+    code.replaceWith(pre);
+    pre.appendChild(code);
+    wrapped++;
+  }
+  return wrapped;
+}
 function isTopRow(el) {
   return !el.parentElement?.closest(ROW_SELECTOR);
 }
@@ -4798,14 +4818,20 @@ function applyStAlias(doc = document) {
     const idx = row.getAttribute("data-message-index") ?? "";
     if (row.getAttribute("mesid") !== idx)
       row.setAttribute("mesid", idx);
-    if (!row.querySelector(".mes_text")) {
-      for (const sel of TEXT_SELECTORS) {
-        const text = row.querySelector(sel);
-        if (text) {
-          text.classList.add("mes_text");
-          break;
-        }
-      }
+    let text = null;
+    for (const sel of TEXT_SELECTORS) {
+      text = row.querySelector(sel);
+      if (text)
+        break;
+    }
+    for (const el of row.querySelectorAll(".mes_text"))
+      if (el !== text)
+        el.classList.remove("mes_text");
+    if (text) {
+      if (!text.classList.contains("mes_text"))
+        text.classList.add("mes_text");
+      if (wrapFencedCode(text) > 0)
+        row.setAttribute(RENDER_MARK, String(++renders));
     }
   }
   return rows;
@@ -4819,14 +4845,21 @@ function clearStAlias(doc = document) {
   for (const row of doc.querySelectorAll(`${ROW_SELECTOR}.mes`)) {
     row.classList.remove("mes");
     row.removeAttribute("mesid");
+    row.removeAttribute(RENDER_MARK);
   }
   for (const el of doc.querySelectorAll(".mes_text"))
     el.classList.remove("mes_text");
+  for (const pre of doc.querySelectorAll(`pre[${PRE_MARK}]`))
+    pre.replaceWith(...pre.childNodes);
 }
 function watchStAlias(doc = document, onRows) {
   let scheduled = false;
+  let timer;
   const run = () => {
+    if (!scheduled)
+      return;
     scheduled = false;
+    clearTimeout(timer);
     const rows = applyStAlias(doc);
     if (onRows && rows.length)
       onRows(rows);
@@ -4836,10 +4869,13 @@ function watchStAlias(doc = document, onRows) {
       return;
     scheduled = true;
     requestAnimationFrame(run);
+    timer = setTimeout(run, 100);
   });
   observer.observe(doc.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "data-message-index"] });
+  scheduled = true;
   run();
   return () => {
+    clearTimeout(timer);
     observer.disconnect();
     clearStAlias(doc);
   };
@@ -5105,6 +5141,326 @@ function splitNamedArgs(rest) {
   return { named, text: s.trim() };
 }
 
+// src/preset-scripts/worldbook-format.ts
+var POSITION_TO_JSR = {
+  0: "before_character_definition",
+  1: "after_character_definition",
+  2: "before_author_note",
+  3: "after_author_note",
+  4: "at_depth",
+  5: "before_example_messages",
+  6: "after_example_messages",
+  7: "outlet"
+};
+var POSITION_FROM_JSR = Object.fromEntries(Object.entries(POSITION_TO_JSR).map(([n, s]) => [s, Number(n)]));
+var LOGIC = ["and_any", "not_all", "not_any", "and_all"];
+var ROLES = ["system", "user", "assistant"];
+var isObj = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+var num = (v, d) => typeof v === "number" && Number.isFinite(v) ? v : d;
+var positive = (v) => typeof v === "number" && v > 0 ? v : null;
+var strs = (v) => Array.isArray(v) ? v.map(String) : [];
+var roleOf = (r) => typeof r === "string" && ROLES.includes(r) ? r : "system";
+function toWorldbookEntry(e) {
+  return {
+    uid: e.id,
+    name: e.comment,
+    enabled: !e.disabled,
+    strategy: {
+      type: e.constant ? "constant" : e.vectorized ? "vectorized" : "selective",
+      keys: [...e.key],
+      keys_secondary: { logic: LOGIC[e.selective_logic] ?? "and_any", keys: [...e.keysecondary] },
+      scan_depth: e.scan_depth ?? "same_as_global"
+    },
+    position: {
+      type: POSITION_TO_JSR[e.position] ?? "at_depth",
+      role: roleOf(e.role),
+      depth: e.depth,
+      order: e.order_value
+    },
+    content: e.content,
+    probability: e.use_probability ? e.probability : 100,
+    recursion: {
+      prevent_incoming: e.exclude_recursion,
+      prevent_outgoing: e.prevent_recursion,
+      delay_until: e.delay_until_recursion ? 1 : null
+    },
+    effect: { sticky: positive(e.sticky), cooldown: positive(e.cooldown), delay: positive(e.delay) },
+    group: e.group_name,
+    groupOverride: e.group_override,
+    groupWeight: e.group_weight,
+    caseSensitive: e.case_sensitive,
+    matchWholeWords: e.match_whole_words,
+    automationId: e.automation_id ?? ""
+  };
+}
+function fromWorldbookEntry(raw) {
+  const e = isObj(raw) ? raw : {};
+  const strategy = isObj(e.strategy) ? e.strategy : {};
+  const secondary = isObj(strategy.keys_secondary) ? strategy.keys_secondary : {};
+  const position = isObj(e.position) ? e.position : {};
+  const recursion = isObj(e.recursion) ? e.recursion : {};
+  const effect = isObj(e.effect) ? e.effect : {};
+  const type = typeof strategy.type === "string" ? strategy.type : undefined;
+  const logic = LOGIC.indexOf(secondary.logic ?? "and_any");
+  const out = {
+    comment: String(e.name ?? ""),
+    disabled: !(e.enabled ?? true),
+    constant: type ? type === "constant" : true,
+    selective: type === "selective",
+    vectorized: type === "vectorized",
+    key: strs(strategy.keys),
+    keysecondary: strs(secondary.keys),
+    selective_logic: logic < 0 ? 0 : logic,
+    scan_depth: typeof strategy.scan_depth === "number" ? strategy.scan_depth : null,
+    position: POSITION_FROM_JSR[String(position.type ?? "at_depth")] ?? 4,
+    role: roleOf(position.role),
+    depth: num(position.depth, 4),
+    order_value: num(position.order, 100),
+    content: String(e.content ?? ""),
+    use_probability: true,
+    probability: num(e.probability, 100),
+    exclude_recursion: recursion.prevent_incoming === true,
+    prevent_recursion: recursion.prevent_outgoing === true,
+    delay_until_recursion: !!recursion.delay_until,
+    sticky: num(effect.sticky, 0),
+    cooldown: num(effect.cooldown, 0),
+    delay: num(effect.delay, 0)
+  };
+  if (typeof e.group === "string")
+    out.group_name = e.group;
+  if (typeof e.groupOverride === "boolean")
+    out.group_override = e.groupOverride;
+  if (typeof e.groupWeight === "number")
+    out.group_weight = e.groupWeight;
+  if (typeof e.caseSensitive === "boolean")
+    out.case_sensitive = e.caseSensitive;
+  if (typeof e.matchWholeWords === "boolean")
+    out.match_whole_words = e.matchWholeWords;
+  if (typeof e.automationId === "string")
+    out.automation_id = e.automationId || null;
+  return out;
+}
+var same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+function diff(current, next) {
+  const base = fromWorldbookEntry(toWorldbookEntry(current));
+  const patch = {};
+  for (const [k, v] of Object.entries(next))
+    if (!same(base[k], v))
+      patch[k] = v;
+  return patch;
+}
+function planReplace(current, next) {
+  const byId = new Map(current.map((e) => [e.id, e]));
+  const kept = new Set;
+  const plan = { create: [], update: [], delete: [] };
+  for (const raw of next) {
+    const uid = isObj(raw) && raw.uid !== undefined ? String(raw.uid) : "";
+    const cur = byId.get(uid);
+    if (cur && !kept.has(uid)) {
+      kept.add(uid);
+      const patch = diff(cur, fromWorldbookEntry(raw));
+      if (Object.keys(patch).length > 0)
+        plan.update.push({ id: uid, patch });
+    } else {
+      plan.create.push(fromWorldbookEntry(raw));
+    }
+  }
+  for (const e of current)
+    if (!kept.has(e.id))
+      plan.delete.push(e.id);
+  return plan;
+}
+function toLorebookEntry(e, index) {
+  const atDepth = e.position === 4;
+  const keys = [...e.key];
+  const filters = [...e.keysecondary];
+  return {
+    uid: e.id,
+    display_index: index,
+    comment: e.comment,
+    enabled: !e.disabled,
+    type: e.constant ? "constant" : e.vectorized ? "vectorized" : "selective",
+    position: atDepth ? `at_depth_as_${roleOf(e.role)}` : POSITION_TO_JSR[e.position] ?? "before_character_definition",
+    depth: atDepth ? e.depth : null,
+    order: e.order_value,
+    probability: e.probability,
+    key: keys,
+    keys,
+    logic: LOGIC[e.selective_logic] ?? "and_any",
+    filter: filters,
+    filters,
+    scan_depth: e.scan_depth ?? "same_as_global",
+    case_sensitive: e.case_sensitive,
+    match_whole_words: e.match_whole_words,
+    use_group_scoring: "same_as_global",
+    automation_id: e.automation_id,
+    exclude_recursion: e.exclude_recursion,
+    prevent_recursion: e.prevent_recursion,
+    delay_until_recursion: e.delay_until_recursion,
+    content: e.content,
+    group: e.group_name,
+    group_prioritized: e.group_override,
+    group_weight: e.group_weight,
+    sticky: positive(e.sticky),
+    cooldown: positive(e.cooldown),
+    delay: positive(e.delay)
+  };
+}
+function fromLorebookPatch(raw) {
+  const e = isObj(raw) ? raw : {};
+  const out = {};
+  const has = (k) => Object.prototype.hasOwnProperty.call(e, k);
+  if (has("comment"))
+    out.comment = String(e.comment ?? "");
+  if (has("enabled"))
+    out.disabled = e.enabled === false;
+  if (has("type")) {
+    out.constant = e.type === "constant";
+    out.selective = e.type === "selective";
+    out.vectorized = e.type === "vectorized";
+  }
+  if (typeof e.position === "string") {
+    const m = /^at_depth_as_(system|assistant|user)$/.exec(e.position);
+    if (m) {
+      out.position = 4;
+      out.role = m[1];
+    } else if (e.position in POSITION_FROM_JSR) {
+      out.position = POSITION_FROM_JSR[e.position];
+    }
+  }
+  if (typeof e.depth === "number")
+    out.depth = e.depth;
+  if (typeof e.order === "number")
+    out.order_value = e.order;
+  if (typeof e.probability === "number")
+    out.probability = e.probability;
+  if (has("keys") || has("key"))
+    out.key = strs(e.keys ?? e.key);
+  if (has("filters") || has("filter"))
+    out.keysecondary = strs(e.filters ?? e.filter);
+  if (typeof e.logic === "string") {
+    const i = LOGIC.indexOf(e.logic);
+    if (i >= 0)
+      out.selective_logic = i;
+  }
+  if (has("scan_depth"))
+    out.scan_depth = typeof e.scan_depth === "number" ? e.scan_depth : null;
+  if (typeof e.case_sensitive === "boolean")
+    out.case_sensitive = e.case_sensitive;
+  if (typeof e.match_whole_words === "boolean")
+    out.match_whole_words = e.match_whole_words;
+  if (has("automation_id"))
+    out.automation_id = typeof e.automation_id === "string" && e.automation_id ? e.automation_id : null;
+  if (typeof e.exclude_recursion === "boolean")
+    out.exclude_recursion = e.exclude_recursion;
+  if (typeof e.prevent_recursion === "boolean")
+    out.prevent_recursion = e.prevent_recursion;
+  if (has("delay_until_recursion"))
+    out.delay_until_recursion = !!e.delay_until_recursion;
+  if (has("content"))
+    out.content = String(e.content ?? "");
+  if (typeof e.group === "string")
+    out.group_name = e.group;
+  if (typeof e.group_prioritized === "boolean")
+    out.group_override = e.group_prioritized;
+  if (typeof e.group_weight === "number")
+    out.group_weight = e.group_weight;
+  for (const k of ["sticky", "cooldown", "delay"])
+    if (has(k))
+      out[k] = num(e[k], 0);
+  return out;
+}
+
+// src/preset-scripts/regex-format.ts
+var isObj2 = (v) => !!v && typeof v === "object" && !Array.isArray(v);
+var targetsOf = (t) => Array.isArray(t) ? t : [t];
+function vishrunMeta(row) {
+  const v = row.metadata?.vishrun;
+  return isObj2(v) ? v : {};
+}
+function splitRegexLiteral(find) {
+  const m = find.match(/^\/(.+)\/([dgimsuvy]*)$/s);
+  return m ? { pattern: m[1], flags: m[2] || "gi" } : { pattern: find, flags: "gi" };
+}
+function toTavernRegex(row) {
+  const v = vishrunMeta(row);
+  const targets = targetsOf(row.target);
+  const placement = row.placement ?? [];
+  return {
+    id: row.id,
+    script_name: row.name,
+    enabled: !row.disabled || v.takeover === true,
+    find_regex: `/${row.find_regex}/${row.flags ?? ""}`,
+    trim_strings: [...row.trim_strings ?? []],
+    replace_string: v.dollarZero === true && typeof v.original === "string" ? v.original : row.replace_string,
+    source: {
+      user_input: placement.includes("user_input"),
+      ai_output: placement.includes("ai_output"),
+      slash_command: false,
+      world_info: placement.includes("world_info"),
+      reasoning: placement.includes("reasoning")
+    },
+    destination: { display: targets.includes("display"), prompt: targets.includes("prompt") },
+    run_on_edit: row.run_on_edit,
+    min_depth: typeof row.min_depth === "number" ? row.min_depth : null,
+    max_depth: typeof row.max_depth === "number" ? row.max_depth : null
+  };
+}
+function fromTavernRegex(raw) {
+  const t = isObj2(raw) ? raw : {};
+  const source = isObj2(t.source) ? t.source : {};
+  const destination = isObj2(t.destination) ? t.destination : {};
+  const { pattern, flags } = splitRegexLiteral(String(t.find_regex ?? ""));
+  const placement = ["user_input", "ai_output", "world_info", "reasoning"].filter((p) => source[p] === true);
+  const target = [...destination.display === true ? ["display"] : [], ...destination.prompt === true ? ["prompt"] : []];
+  const original = String(t.replace_string ?? "");
+  const replace = rewriteDollarZero(original);
+  return {
+    name: String(t.script_name ?? "") || `未命名-${String(t.id ?? "")}`,
+    find_regex: pattern,
+    flags,
+    replace_string: replace,
+    placement: [...placement],
+    target: target.length > 0 ? target : ["response"],
+    min_depth: typeof t.min_depth === "number" ? t.min_depth : null,
+    max_depth: typeof t.max_depth === "number" ? t.max_depth : null,
+    trim_strings: Array.isArray(t.trim_strings) ? t.trim_strings.map(String) : [],
+    run_on_edit: t.run_on_edit === true,
+    disabled: t.enabled === false,
+    ...replace !== original ? { metadata: { vishrun: { dollarZero: true, original } } } : {}
+  };
+}
+var same2 = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+function planRegexReplace(current, next) {
+  const byId = new Map(current.map((r) => [r.id, r]));
+  const plan = { create: [], update: [] };
+  for (const raw of next) {
+    const row = isObj2(raw) ? byId.get(String(raw.id ?? "")) : undefined;
+    if (!row) {
+      plan.create.push(fromTavernRegex(raw));
+      continue;
+    }
+    if (row.can_mutate === false)
+      continue;
+    const want = fromTavernRegex(raw);
+    const have = fromTavernRegex(toTavernRegex(row));
+    const patch = {};
+    for (const k of ["name", "find_regex", "flags", "placement", "target", "min_depth", "max_depth", "trim_strings", "run_on_edit"]) {
+      if (!same2(have[k], want[k]))
+        patch[k] = want[k];
+    }
+    if (!same2(have.replace_string, want.replace_string)) {
+      patch.replace_string = want.replace_string;
+      patch.metadata = { ...row.metadata ?? {}, ...want.metadata ?? {} };
+    }
+    if (have.disabled !== want.disabled && vishrunMeta(row).takeover !== true)
+      patch.disabled = want.disabled;
+    if (Object.keys(patch).length > 0)
+      plan.update.push({ id: row.id, patch });
+  }
+  return plan;
+}
+
 // src/preset-scripts/th-api.ts
 var TAVERN_EVENTS = {
   APP_READY: "app_ready",
@@ -5160,6 +5516,18 @@ async function refreshVars(state) {
 async function refreshCharacter(state) {
   const id = state.ctx.getActiveChat().characterId;
   state.character = id ? await getCharacter(id).catch(() => null) : null;
+}
+async function refreshWorldbooks(state) {
+  const chatId = state.ctx.getActiveChat().chatId;
+  const [own, all] = await Promise.all([
+    presetRpc(state.ctx, "wb_char_names", { chatId }),
+    presetRpc(state.ctx, "wb_all_names", {})
+  ]);
+  state.worldbooks = { primary: own.primary, additional: own.additional, all };
+}
+async function refreshRegexes(state) {
+  const chatId = state.ctx.getActiveChat().chatId;
+  state.regexes = await presetRpc(state.ctx, "regex_rows", { chatId });
 }
 async function refreshMessages(state) {
   const chatId = state.ctx.getActiveChat().chatId;
@@ -5274,6 +5642,59 @@ function buildThApi(state, script, win) {
       await applyPreset(preset);
   };
   const lastMessageId = () => state.messages.length - 1;
+  const wbRpc = (op, args) => presetRpc(ctx, op, { chatId: ctx.getActiveChat().chatId, ...args });
+  const entriesOf = (name) => wbRpc("wb_entries", { name: String(name ?? "") });
+  const applyTo = (name, plan) => wbRpc("wb_apply", { name: String(name ?? ""), create: [], update: [], delete: [], ...plan });
+  const isCurrentChar = (name) => name === undefined || name === "current" || state.character !== null && name === state.character.name;
+  const charBooks = (name) => clone(isCurrentChar(name) ? { primary: state.worldbooks.primary, additional: state.worldbooks.additional } : { primary: null, additional: [] });
+  const list = (v) => Array.isArray(v) ? v : [];
+  const presetRows = () => state.regexes.global.filter((r) => r.preset_id && r.preset_id === state.presetId);
+  const globalRows = () => state.regexes.global.filter((r) => !r.preset_id);
+  const regexesFor = (opt) => {
+    const o = isPlainObject(opt) ? opt : {};
+    if (typeof o.type === "string") {
+      if (o.type === "character")
+        return isCurrentChar(o.name) ? state.regexes.character.map(toTavernRegex) : [];
+      if (o.type === "preset")
+        return o.name === undefined || o.name === "in_use" || o.name === state.presetName ? presetRows().map(toTavernRegex) : [];
+      return globalRows().map(toTavernRegex);
+    }
+    const scope = typeof o.scope === "string" ? o.scope : "all";
+    let out = [];
+    if (scope === "all" || scope === "global")
+      out = out.concat(globalRows().map((r) => ({ ...toTavernRegex(r), scope: "global" })));
+    if (scope === "all" || scope === "character")
+      out = out.concat(state.regexes.character.map((r) => ({ ...toTavernRegex(r), scope: "character" })));
+    if (o.enable_state === "enabled" || o.enable_state === "disabled")
+      out = out.filter((r) => r.enabled === (o.enable_state === "enabled"));
+    return out;
+  };
+  const getTavernRegexes = (opt) => clone(regexesFor(opt));
+  const applyRegexes = async (scope, rows, next) => {
+    const plan = planRegexReplace(rows, next);
+    if (plan.create.length === 0 && plan.update.length === 0)
+      return;
+    await presetRpc(ctx, "regex_apply", { chatId: ctx.getActiveChat().chatId, scope, ...plan });
+  };
+  const replaceTavernRegexes = async (regexes, opt) => {
+    const o = isPlainObject(opt) ? opt : {};
+    const items = list(regexes);
+    if (typeof o.type === "string") {
+      if (o.type === "character" && isCurrentChar(o.name))
+        await applyRegexes("character", state.regexes.character, items);
+      else if (o.type === "global")
+        await applyRegexes("global", globalRows(), items);
+    } else {
+      const scope = typeof o.scope === "string" ? o.scope : "all";
+      const isGlobal = (r) => isPlainObject(r) && r.scope === "global";
+      if (scope === "all" || scope === "global")
+        await applyRegexes("global", globalRows(), items.filter(isGlobal));
+      if (scope === "all" || scope === "character")
+        await applyRegexes("character", state.regexes.character, items.filter((r) => !isGlobal(r)));
+    }
+    await refreshRegexes(state).catch(() => {});
+    ctx.display?.invalidate?.(["*"]);
+  };
   const resolveRange = (range) => {
     const last = lastMessageId();
     const norm = (n) => n < 0 ? last + 1 + n : n;
@@ -5302,6 +5723,25 @@ function buildThApi(state, script, win) {
     }
     return clone(out);
   };
+  const charAvatar = () => state.character?.id ? `/api/v1/characters/${String(state.character.id)}/avatar` : "";
+  const userAvatar = () => {
+    try {
+      const s = ctx.state;
+      const id = s?.get("persona.activeId");
+      return typeof id === "string" && id ? `/api/v1/personas/${id}/avatar` : "";
+    } catch {
+      return "";
+    }
+  };
+  const localMacros = (text) => text.replace(/\{\{lastMessageId\}\}/gi, String(lastMessageId())).replace(/\{\{charAvatarPath\}\}/gi, charAvatar()).replace(/\{\{userAvatarPath\}\}/gi, userAvatar());
+  const resolveMacros = async (text) => {
+    const local = localMacros(text);
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId || !local.includes("{{"))
+      return local;
+    const characterId = typeof state.character?.id === "string" ? state.character.id : null;
+    return (await resolveMacrosBatch(ctx, chatId, characterId, [local]).catch(() => [local]))[0] ?? local;
+  };
   const triggerSlash = async (command) => {
     let pipe = "";
     for (const step of splitPipeline(String(command ?? ""))) {
@@ -5310,6 +5750,9 @@ function buildThApi(state, script, win) {
         continue;
       const rest = parsed.rest.replace(/\{\{pipe\}\}/g, pipe);
       switch (parsed.name) {
+        case "pass":
+          pipe = await resolveMacros(rest);
+          break;
         case "send":
         case "setinput":
           setComposerText(rest);
@@ -5393,6 +5836,57 @@ function buildThApi(state, script, win) {
     setPreset,
     replacePreset: setPreset,
     getChatMessages,
+    getTavernRegexes,
+    replaceTavernRegexes,
+    updateTavernRegexesWith: async (fn, opt) => {
+      const next = list(await fn(getTavernRegexes(opt)));
+      await replaceTavernRegexes(next, opt);
+      return clone(next);
+    },
+    isCharacterTavernRegexesEnabled: () => true,
+    getCharWorldbookNames: charBooks,
+    getCharLorebooks: (opt) => charBooks(isPlainObject(opt) ? opt.name : undefined),
+    getCurrentCharPrimaryLorebook: () => state.worldbooks.primary,
+    getWorldbookNames: () => clone(state.worldbooks.all),
+    getLorebooks: () => clone(state.worldbooks.all),
+    getWorldbook: async (name) => clone((await entriesOf(name)).map(toWorldbookEntry)),
+    replaceWorldbook: async (name, entries) => {
+      await applyTo(name, planReplace(await entriesOf(name), list(entries)));
+    },
+    updateWorldbookWith: async (name, fn) => {
+      const cur = await entriesOf(name);
+      const next = await fn(clone(cur.map(toWorldbookEntry)));
+      const r = await applyTo(name, planReplace(cur, list(next)));
+      return clone(r.entries.map(toWorldbookEntry));
+    },
+    createWorldbookEntries: async (name, entries) => {
+      const r = await applyTo(name, { create: list(entries).map(fromWorldbookEntry) });
+      const all = r.entries.map(toWorldbookEntry);
+      return clone({ worldbook: all, new_entries: all.filter((e) => r.created.includes(String(e.uid))) });
+    },
+    deleteWorldbookEntries: async (name, predicate) => {
+      const cur = await entriesOf(name);
+      const gone = cur.filter((e) => predicate(clone(toWorldbookEntry(e))));
+      const r = await applyTo(name, { delete: gone.map((e) => e.id) });
+      return clone({ worldbook: r.entries.map(toWorldbookEntry), deleted_entries: gone.map(toWorldbookEntry) });
+    },
+    getLorebookEntries: async (name) => clone((await entriesOf(name)).map(toLorebookEntry)),
+    setLorebookEntries: async (name, entries) => {
+      const ids = new Set((await entriesOf(name)).map((e) => e.id));
+      const update = list(entries).filter((e) => isPlainObject(e) && ids.has(String(e.uid))).map((e) => ({ id: String(e.uid), patch: fromLorebookPatch(e) }));
+      const r = await applyTo(name, { update });
+      return clone(r.entries.map(toLorebookEntry));
+    },
+    createLorebookEntries: async (name, entries) => {
+      const r = await applyTo(name, { create: list(entries).map(fromLorebookPatch) });
+      return clone({ entries: r.entries.map(toLorebookEntry), new_uids: r.created });
+    },
+    deleteLorebookEntries: async (name, uids) => {
+      const want = new Set(list(uids).map(String));
+      const gone = (await entriesOf(name)).filter((e) => want.has(e.id)).map((e) => e.id);
+      const r = await applyTo(name, { delete: gone });
+      return clone({ entries: r.entries.map(toLorebookEntry), delete_occurred: gone.length > 0 });
+    },
     setChatMessages: async (msgs) => {
       if (!Array.isArray(msgs))
         return;
@@ -5465,7 +5959,7 @@ function buildThApi(state, script, win) {
     waitGlobalInitialized: async () => {
       return;
     },
-    substitudeMacros: (text) => String(text ?? ""),
+    substitudeMacros: (text) => localMacros(String(text ?? "")).replace(/\{\{char\}\}/gi, typeof state.character?.name === "string" ? state.character.name : "{{char}}"),
     getTavernHelperVersion: () => "4.0.0",
     toastr: {
       success: toast("success"),
@@ -5509,6 +6003,7 @@ function buildThApi(state, script, win) {
       return;
     },
     getChatCompletionModel: activeModel,
+    isMobile: () => /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent),
     saveSettingsDebounced: () => {}
   };
   api.TavernHelper = { ...api };
@@ -5527,6 +6022,21 @@ async function frameLibraries(ctx) {
     return "";
   })));
   return bodies.filter(Boolean);
+}
+var rowKey = (row, length) => `${row.getAttribute("data-message-id")}:${length}:${row.getAttribute(RENDER_MARK) ?? ""}`;
+function waitForMessages(expected, timeoutMs = 3000) {
+  if (!expected)
+    return Promise.resolve();
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const check = () => {
+      if (document.querySelector("#chat > .mes .mes_text") || Date.now() - start > timeoutMs)
+        resolve();
+      else
+        setTimeout(check, 100);
+    };
+    check();
+  });
 }
 var sourceKey = (s) => `${s.kind}:${s.id}`;
 function runnable(src) {
@@ -5618,6 +6128,8 @@ function installPresetScripts(ctx) {
       vars: { global: {}, chat: {}, character: {} },
       messages: [],
       character: null,
+      worldbooks: { primary: null, additional: [], all: [] },
+      regexes: { character: [], global: [] },
       listeners: new Map,
       getButtons: (id) => buttons.get(id) ?? [],
       setButtons: (scriptId, list) => {
@@ -5700,7 +6212,7 @@ function installPresetScripts(ctx) {
         await refreshPreset(st).catch(() => {});
       }
       if (chatChanged) {
-        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st)]).catch(() => {});
+        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st)]).catch(() => {});
         emit(st, TAVERN_EVENTS.CHAT_CHANGED, chatId);
       }
       return;
@@ -5710,26 +6222,25 @@ function installPresetScripts(ctx) {
       return;
     const allowed = [];
     for (const src of wanted) {
-      if (src.kind === "character") {
-        allowed.push(src);
-        continue;
-      }
       let ok = src.consent;
       if (ok === null) {
         const names = runnable(src).map((s) => `• ${s.name}`).join(`
 `);
+        const what = src.kind === "preset" ? `The preset "${src.name}"` : `The character "${src.name}"`;
         const res = await ctx.ui.showConfirm({
-          title: "Run preset scripts?",
-          message: `The preset "${src.name}" includes scripts:
+          title: src.kind === "preset" ? "Run preset scripts?" : "Run character scripts?",
+          message: `${what} includes scripts:
 ${names}
 
-They can change this preset and the page. Run them?`,
+They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the page. Run them?`,
           confirmLabel: "Run",
           cancelLabel: "Not now"
         });
         ok = res.confirmed;
-        if (ok)
-          await presetRpc(ctx, "set_consent", { presetId: src.id, allowed: true }).catch(() => {});
+        if (ok) {
+          const args = src.kind === "preset" ? { presetId: src.id } : { characterId: src.id };
+          await presetRpc(ctx, "set_consent", { ...args, allowed: true }).catch(() => {});
+        }
       }
       if (ok)
         allowed.push(src);
@@ -5741,7 +6252,7 @@ They can change this preset and the page. Run them?`,
     const runKey = allowed.map(sourceKey).join("|");
     const scripts = allowed.flatMap(runnable);
     const { state, actions } = makeState(info, scripts);
-    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state)]).catch((e) => {
+    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state)]).catch((e) => {
       console.warn("[vishrun] scripts: initial load", e);
     });
     const presetSource = allowed.find((s) => s.kind === "preset");
@@ -5755,7 +6266,7 @@ They can change this preset and the page. Run them?`,
       for (const row of rows) {
         const idx = Number(row.getAttribute("data-message-index"));
         const msg = state.messages[idx];
-        const key = `${row.getAttribute("data-message-id")}:${msg?.content.length ?? -1}`;
+        const key = rowKey(row, msg?.content.length ?? -1);
         if (seen.get(row) === key)
           continue;
         seen.set(row, key);
@@ -5770,7 +6281,7 @@ They can change this preset and the page. Run them?`,
           const msg = state.messages[idx];
           if (!msg)
             continue;
-          seen.set(row, `${row.getAttribute("data-message-id")}:${msg.content.length}`);
+          seen.set(row, rowKey(row, msg.content.length));
           emit(state, msg.is_user ? TAVERN_EVENTS.USER_MESSAGE_RENDERED : TAVERN_EVENTS.CHARACTER_MESSAGE_RENDERED, idx);
         }
       });
@@ -5783,10 +6294,11 @@ They can change this preset and the page. Run them?`,
         presetRpc(ctx, "set_prefill", { presetId: state.presetId, value }).then(() => refreshPreset(state)).catch((e) => console.warn("[vishrun] scripts: prefill", e));
       });
     }
+    running.stopAlias = watchStAlias(document, onRows);
+    await waitForMessages(state.messages.length > 0);
     const libraries = await frameLibraries(ctx);
     for (const s of scripts)
       frames.push(await startFrame(state, s, libraries));
-    running.stopAlias = watchStAlias(document, onRows);
   };
   const sync = () => {
     if (syncing) {
