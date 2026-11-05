@@ -5,7 +5,7 @@
   "author": "Vishous",
   "github": "https://github.com/Vishousdev/vishrun",
   "homepage": "https://github.com/Vishousdev/vishrun",
-  "description": "Renders SillyTavern character-card regex_scripts widgets inside Lumiverse (MVP).",
+  "description": "Makes SillyTavern cards and presets work in Lumiverse: in-message widgets, MVU variables and JS-Slash-Runner scripts.",
   "permissions": ["cors_proxy", "chat_mutation", "chats", "characters", "unsafe_eval", "regex_scripts", "regex_scripts_unrestricted", "world_books", "presets"],
   "entry_frontend": "dist/frontend.js",
   "entry_backend": "dist/backend.js",
