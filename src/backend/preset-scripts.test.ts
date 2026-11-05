@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'bun:test';
 
 mock.module('./common', () => ({ api: {} }));
-const { enabledScripts } = await import('./preset-scripts');
+const { enabledScripts, listScripts } = await import('./preset-scripts');
 
 test('preset scripts: flattens folders and skips disabled or empty scripts', () => {
   const metadata = {
@@ -28,4 +28,19 @@ test('preset scripts: flattens folders and skips disabled or empty scripts', () 
 test('preset scripts: no tavern_helper means no scripts', () => {
   expect(enabledScripts({})).toEqual([]);
   expect(enabledScripts(null)).toEqual([]);
+});
+
+test('preset scripts: lists every script with how it ships, and switches win', () => {
+  const metadata = {
+    tavern_helper: {
+      scripts: [
+        { type: 'script', id: 'a', name: 'A', enabled: true, content: 'a()', info: 'by someone' },
+        { type: 'script', id: 'b', name: 'B', enabled: false, content: 'b()' },
+        { type: 'folder', enabled: false, scripts: [{ type: 'script', id: 'c', name: 'C', enabled: true, content: 'c()' }] },
+      ],
+    },
+  };
+  expect(listScripts(metadata).map((s) => [s.id, s.defaultEnabled, s.info])).toEqual([['a', true, 'by someone'], ['b', false, ''], ['c', false, '']]);
+  expect(enabledScripts(metadata).map((s) => s.id)).toEqual(['a']);
+  expect(enabledScripts(metadata, { a: false, b: true, c: true }).map((s) => s.id)).toEqual(['b', 'c']);
 });

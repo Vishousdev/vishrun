@@ -11,6 +11,7 @@ import { knownNativeKeys, requestRegexTakeover } from './core/regex-takeover-cli
 import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
 import { installPresetScripts } from './preset-scripts/runner';
 import { installHtmlCodeblocks } from './hooks/html-codeblocks';
+import { installSettingsPanel } from './settings/panel';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -45,6 +46,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const disposePresetScripts = installPresetScripts(ctx);
   const disposeHtmlCodeblocks = installHtmlCodeblocks(ctx);
+  const disposeSettingsPanel = installSettingsPanel(ctx);
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -220,6 +222,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubStatusBarInject();
     disposePresetScripts();
     disposeHtmlCodeblocks();
+    disposeSettingsPanel();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

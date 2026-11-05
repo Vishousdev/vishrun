@@ -23,18 +23,29 @@ import {
 
 interface ScriptInfo { id: string; name: string; content: string; buttons: ScriptButton[]; data: Record<string, unknown> }
 
-interface PresetScripts {
+/** Every script of a source with its switch, as the settings page shows it. */
+export interface PageScript { id: string; name: string; content: string; info: string; buttons: ScriptButton[]; enabled: boolean }
+
+export interface PresetScripts {
   id: string;
   name: string;
   consent: boolean | null;
+  all?: PageScript[];
   stIds: Record<string, string>;
   stIdsNeeded: boolean;
   scripts: ScriptInfo[];
 }
 
-interface CharacterScripts { id: string; name: string; consent: boolean | null; scripts: ScriptInfo[] }
+export interface CharacterScripts { id: string; name: string; consent: boolean | null; scripts: ScriptInfo[]; all?: PageScript[] }
 
-interface ActiveScripts { preset: PresetScripts | null; character: CharacterScripts | null }
+export interface ActiveScripts { preset: PresetScripts | null; character: CharacterScripts | null }
+
+let resyncHook: (() => void) | null = null;
+
+// Re-reads switches and restarts scripts, after a change on the settings page.
+export function resyncScripts(): void {
+  resyncHook?.();
+}
 
 type Source = ({ kind: 'preset' } & PresetScripts) | ({ kind: 'character' } & CharacterScripts);
 
@@ -284,10 +295,9 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
           cancelLabel: 'Not now',
         });
         ok = res.confirmed;
-        if (ok) {
-          const args = src.kind === 'preset' ? { presetId: src.id } : { characterId: src.id };
-          await presetRpc(ctx, 'set_consent', { ...args, allowed: true }).catch(() => {});
-        }
+        // Both answers are kept; the settings page can change them later.
+        const args = src.kind === 'preset' ? { presetId: src.id } : { characterId: src.id };
+        await presetRpc(ctx, 'set_consent', { ...args, allowed: ok }).catch(() => {});
       }
       if (ok) allowed.push(src); else declined.add(sourceKey(src));
     }
@@ -406,8 +416,14 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     }
   }
 
+  resyncHook = () => {
+    declined.clear();
+    stop();
+    sync();
+  };
   sync();
   return () => {
+    resyncHook = null;
     for (const u of unsubs) u();
     stop();
   };
