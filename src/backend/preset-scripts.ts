@@ -1,8 +1,9 @@
 import { api } from './common';
 import { referencesUnknownIds, type BlockLike } from '../preset-scripts/st-ids';
 
-// Backend side of the preset script runtime (src/preset-scripts). The
-// frontend has no preset, variable or storage API, so it calls these ops.
+// Backend side of the script runtime (src/preset-scripts) for preset and
+// character scripts. The frontend has no preset, variable or storage API, so
+// it calls these ops.
 
 export interface PresetScript {
   id: string;
@@ -28,6 +29,7 @@ interface PresetRpcRequest {
 
 const CONSENT_PATH = 'preset-scripts-consent.json';
 const stIdsPath = (presetId: string) => `preset-st-ids-${presetId.replace(/[^\w-]/g, '')}.json`;
+const charVarsPath = (characterId: string) => `character-vars-${characterId.replace(/[^\w-]/g, '')}.json`;
 
 interface StIdsFile { map: Record<string, string>; declined?: boolean }
 
@@ -90,9 +92,34 @@ function parseValue(v: string): unknown {
   try { return JSON.parse(v); } catch { return v; }
 }
 
-type VarScope = 'global' | 'chat';
+type VarScope = 'global' | 'chat' | 'character';
 
-async function readVars(scope: VarScope, chatId: string | null, userId: string): Promise<Record<string, unknown>> {
+async function cardOf(characterId: string, userId: string): Promise<{ id: string; name: string; extensions?: unknown } | null> {
+  const c = await api.characters.get(characterId, userId).catch(() => null);
+  return (c as { id: string; name: string; extensions?: unknown } | null) ?? null;
+}
+
+async function chatCharacterId(chatId: string | null, userId: string): Promise<string | null> {
+  if (!chatId) return null;
+  const chat = await api.chats.get(chatId, userId).catch(() => null);
+  const id = (chat as { character_id?: unknown } | null)?.character_id;
+  return typeof id === 'string' && id ? id : null;
+}
+
+// Character variables start from the card's tavern_helper.variables. Writes
+// are kept in user storage so the card itself is never changed.
+async function readCharacterVars(characterId: string, userId: string): Promise<Record<string, unknown>> {
+  try {
+    const parsed = JSON.parse(await api.userStorage.read(charVarsPath(characterId), userId));
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+  } catch { /* not written yet */ }
+  const card = await cardOf(characterId, userId);
+  const vars = (card?.extensions as { tavern_helper?: { variables?: unknown } } | undefined)?.tavern_helper?.variables;
+  return vars && typeof vars === 'object' && !Array.isArray(vars) ? vars as Record<string, unknown> : {};
+}
+
+async function readVars(scope: VarScope, chatId: string | null, userId: string, characterId: string | null = null): Promise<Record<string, unknown>> {
+  if (scope === 'character') return characterId ? readCharacterVars(characterId, userId) : {};
   const raw = scope === 'global'
     ? await api.variables.global.list(userId)
     : chatId ? await api.variables.chat.list(chatId) : {};
@@ -101,7 +128,11 @@ async function readVars(scope: VarScope, chatId: string | null, userId: string):
   return out;
 }
 
-async function writeVars(scope: VarScope, chatId: string | null, next: Record<string, unknown>, userId: string): Promise<void> {
+async function writeVars(scope: VarScope, chatId: string | null, next: Record<string, unknown>, userId: string, characterId: string | null = null): Promise<void> {
+  if (scope === 'character') {
+    if (characterId) await api.userStorage.write(charVarsPath(characterId), JSON.stringify(next), userId);
+    return;
+  }
   const prev = await readVars(scope, chatId, userId);
   for (const [k, v] of Object.entries(next)) {
     const s = typeof v === 'string' ? v : JSON.stringify(v);
@@ -115,6 +146,8 @@ async function writeVars(scope: VarScope, chatId: string | null, next: Record<st
   }
 }
 
+const scopeArg = (s: unknown): VarScope => (s === 'chat' || s === 'character' ? s : 'global');
+
 async function activePreset(chatId: string | null, userId: string) {
   const active = await api.presets.getActive(chatId ?? undefined, userId);
   if (!active.preset_id) return null;
@@ -127,20 +160,28 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
   const chatId = typeof args.chatId === 'string' ? args.chatId : null;
   switch (op) {
     case 'active_scripts': {
-      const found = await activePreset(chatId, userId);
-      if (!found) return null;
-      const { preset } = found;
       const consent = await readConsent(userId);
-      const stIds = await readStIds(preset.id, userId);
-      const blocks = (Array.isArray(preset.prompt_order) ? preset.prompt_order : []) as unknown as BlockLike[];
-      return {
-        presetId: preset.id,
-        presetName: preset.name,
-        consent: consent[preset.id] ?? null,
-        scripts: enabledScripts(preset.metadata),
-        stIds: stIds?.map ?? {},
-        stIdsNeeded: !stIds && referencesUnknownIds(preset.metadata ?? {}, blocks),
-      };
+      const found = await activePreset(chatId, userId);
+      let preset = null;
+      if (found) {
+        const p = found.preset;
+        const stIds = await readStIds(p.id, userId);
+        const blocks = (Array.isArray(p.prompt_order) ? p.prompt_order : []) as unknown as BlockLike[];
+        preset = {
+          id: p.id,
+          name: p.name,
+          consent: consent[p.id] ?? null,
+          scripts: enabledScripts(p.metadata),
+          stIds: stIds?.map ?? {},
+          stIdsNeeded: !stIds && referencesUnknownIds(p.metadata ?? {}, blocks),
+        };
+      }
+      const characterId = await chatCharacterId(chatId, userId);
+      const card = characterId ? await cardOf(characterId, userId) : null;
+      const character = card
+        ? { id: card.id, name: card.name, scripts: enabledScripts(card.extensions) }
+        : null;
+      return { preset, character };
     }
     case 'set_consent': {
       const consent = await readConsent(userId);
@@ -197,9 +238,10 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       return true;
     }
     case 'vars_get':
-      return readVars(args.scope === 'chat' ? 'chat' : 'global', chatId, userId);
+      return readVars(scopeArg(args.scope), chatId, userId, typeof args.characterId === 'string' ? args.characterId : null);
     case 'vars_replace':
-      await writeVars(args.scope === 'chat' ? 'chat' : 'global', chatId, (args.vars ?? {}) as Record<string, unknown>, userId);
+      await writeVars(scopeArg(args.scope), chatId, (args.vars ?? {}) as Record<string, unknown>, userId,
+        typeof args.characterId === 'string' ? args.characterId : null);
       return true;
     case 'toast': {
       const kind = ['success', 'warning', 'error', 'info'].includes(String(args.kind)) ? String(args.kind) as 'info' : 'info';

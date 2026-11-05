@@ -4,8 +4,9 @@ import { inputDialog, popupDialog, splitNamedArgs } from './dialogs';
 import { clickSend, parseSlash, setComposerText, splitPipeline } from '../render/slash-runner';
 import { getCharacter, getChatMessages as hostChatMessages, updateMessageContent, type HostMessage } from '../lumiverse/host-api';
 import { stIdOf } from './st-ids';
+import { setMvuSchema } from './mvu-schema';
 
-// JS-Slash-Runner globals for preset scripts. Sync getters (getVariables,
+// JS-Slash-Runner globals for preset and character scripts. Sync getters (getVariables,
 // getPreset, getLastMessageId) read caches that the runtime keeps fresh.
 
 export const TAVERN_EVENTS: Record<string, string> = {
@@ -55,14 +56,18 @@ type Listener = (...args: unknown[]) => unknown;
 
 export interface ScriptButton { name: string; visible: boolean }
 
+/** owner: preset id, or `character:<id>` for card scripts. */
+export interface RuntimeScript { id: string; owner: string; data: Record<string, unknown> }
+
 export interface RuntimeState {
   ctx: SpindleFrontendContext;
   presetId: string;
   presetName: string;
+  characterId: string | null;
   preset: PresetSnapshot | null;
   /** Lumiverse block id → SillyTavern identifier, when known. */
   stIds: Record<string, string>;
-  vars: { global: Record<string, unknown>; chat: Record<string, unknown> };
+  vars: { global: Record<string, unknown>; chat: Record<string, unknown>; character: Record<string, unknown> };
   messages: HostMessage[];
   character: Record<string, unknown> | null;
   listeners: Map<string, Set<Listener>>;
@@ -87,11 +92,13 @@ export async function refreshPreset(state: RuntimeState): Promise<void> {
 
 export async function refreshVars(state: RuntimeState): Promise<void> {
   const chatId = state.ctx.getActiveChat().chatId;
-  const [global, chat] = await Promise.all([
+  const characterId = state.characterId;
+  const [global, chat, character] = await Promise.all([
     presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'global' }),
     chatId ? presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'chat', chatId }) : Promise.resolve({}),
+    characterId ? presetRpc<Record<string, unknown>>(state.ctx, 'vars_get', { scope: 'character', characterId }) : Promise.resolve({}),
   ]);
-  state.vars = { global, chat };
+  state.vars = { global, chat, character };
 }
 
 export async function refreshCharacter(state: RuntimeState): Promise<void> {
@@ -135,10 +142,10 @@ function toStPreset(p: PresetSnapshot, stIds: Record<string, string>): Record<st
   };
 }
 
-export function buildThApi(state: RuntimeState, script: { id: string; data: Record<string, unknown> }, win: Window) {
+export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Window) {
   const ctx = state.ctx;
   const clone = <T>(v: T): T => (v === undefined ? v : (win as unknown as { JSON: JSON }).JSON.parse(JSON.stringify(v)));
-  const scriptVarsKey = `vishrun:preset-script-vars:${state.presetId}:${script.id}`;
+  const scriptVarsKey = `vishrun:preset-script-vars:${script.owner}:${script.id}`;
 
   const readScriptVars = (): Record<string, unknown> => {
     try {
@@ -155,6 +162,7 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     if (type === 'global') return state.vars.global;
     if (type === 'script') return readScriptVars();
     if (type === 'chat') return state.vars.chat;
+    if (type === 'character') return state.vars.character;
     return {};
   };
 
@@ -165,10 +173,11 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
       try { localStorage.setItem(scriptVarsKey, JSON.stringify(copy)); } catch { /* quota */ }
       return;
     }
-    if (type !== 'global' && type !== 'chat') return;
+    if (type !== 'global' && type !== 'chat' && type !== 'character') return;
+    if (type === 'character' && !state.characterId) return;
     state.vars[type] = copy;
     const chatId = ctx.getActiveChat().chatId;
-    void presetRpc(ctx, 'vars_replace', { scope: type, chatId, vars: copy })
+    void presetRpc(ctx, 'vars_replace', { scope: type, chatId, characterId: state.characterId, vars: copy })
       .catch((e) => console.warn('[vishrun] preset script vars write', e));
   };
 
@@ -298,7 +307,7 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
 
   const api: Record<string, unknown> = {
     getVariables: (opt?: unknown) => clone(getVars(opt)),
-    getAllVariables: () => clone({ ...state.vars.global, ...state.vars.chat }),
+    getAllVariables: () => clone({ ...state.vars.global, ...state.vars.character, ...state.vars.chat }),
     replaceVariables: (vars: Record<string, unknown>, opt?: unknown) => setVars(vars, opt),
     updateVariablesWith: (fn: (v: Record<string, unknown>) => unknown, opt?: unknown) => {
       const draft = JSON.parse(JSON.stringify(getVars(opt)));
@@ -435,5 +444,6 @@ export function buildThApi(state: RuntimeState, script: { id: string; data: Reco
     saveSettingsDebounced: () => {},
   };
   api.TavernHelper = { ...api };
+  api.__vishrunMvuZod = { registerMvuSchema: setMvuSchema };
   return api;
 }

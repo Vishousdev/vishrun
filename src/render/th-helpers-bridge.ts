@@ -1,6 +1,7 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import type { SnapshotMessage } from '../backend/th-helpers';
 import { emptyMvuData, type MvuData } from '../core/mvu-data';
+import { applyMvuSchema } from '../preset-scripts/mvu-schema';
 
 const TH_TIMEOUT_MS = 5000;
 
@@ -216,7 +217,7 @@ export function fetchVariablesSnapshot(
       if (payload.ok && payload.result && typeof payload.result === 'object' && !Array.isArray(payload.result)) {
         const r = payload.result as MvuData;
         if (r.stat_data && typeof r.stat_data === 'object') {
-          finish(r);
+          finish(applyMvuSchema(r));
           return;
         }
       }

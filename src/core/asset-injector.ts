@@ -129,6 +129,11 @@ function getCachedBundle(url: string, ctx: SpindleFrontendContext): Promise<stri
   return pending;
 }
 
+// A CDN bundle's text, served from Vishrun's vendored copy when it has one.
+export function fetchCdnBundle(url: string, ctx: SpindleFrontendContext): Promise<string> {
+  return getCachedBundle(url, ctx);
+}
+
 // Test-only.
 export function __resetBundleCacheForTests(): void {
   bundleCache.clear();
