@@ -4274,6 +4274,9 @@ function takeoverReasons(replaceString) {
     r.push("html-fence");
   return r;
 }
+function needsTakeover(reasons) {
+  return reasons.some((r) => r !== "dollar-zero");
+}
 function selectTakeoverCandidates(scripts) {
   const renderable = new Set(compileScripts(scripts).filter((c) => c.kind !== "unknown").map((c) => c.sourceIndex));
   const out = [];
@@ -4283,10 +4286,24 @@ function selectTakeoverCandidates(scripts) {
     if (typeof s.findRegex !== "string" || typeof s.replaceString !== "string")
       return;
     const reasons = takeoverReasons(s.replaceString);
-    if (reasons.length === 0)
+    if (!needsTakeover(reasons))
       return;
     out.push({ name: s.scriptName ?? "", findRegex: s.findRegex, replaceString: s.replaceString, reasons });
   });
+  return out;
+}
+function selectDollarZeroRows(scripts) {
+  const taken = new Set(selectTakeoverCandidates(scripts).map((c) => c.findRegex + "\x00" + c.replaceString));
+  const out = [];
+  for (const s of scripts) {
+    if (typeof s.findRegex !== "string" || typeof s.replaceString !== "string")
+      continue;
+    if (!DOLLAR_ZERO_RE.test(s.replaceString))
+      continue;
+    if (taken.has(s.findRegex + "\x00" + s.replaceString))
+      continue;
+    out.push({ findRegex: s.findRegex, replaceString: s.replaceString });
+  }
   return out;
 }
 function hostPatternOf(findRegex) {
@@ -4722,7 +4739,8 @@ function requestRegexTakeover(ctx, characterId, scripts) {
       type: "regex_takeover",
       requestId,
       characterId,
-      scripts: candidates.map((c) => ({ findRegex: c.findRegex, replaceString: c.replaceString }))
+      scripts: candidates.map((c) => ({ findRegex: c.findRegex, replaceString: c.replaceString })),
+      dollarZero: selectDollarZeroRows(scripts)
     });
   });
   results.set(characterId, pending);

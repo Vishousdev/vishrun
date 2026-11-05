@@ -5611,6 +5611,10 @@ var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]",
 var HTML_TAGS = new Set(("a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col " + "colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 " + "h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark menu meta " + "meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s samp script " + "search section select slot small source span strong style sub summary sup table tbody td template textarea " + "tfoot th thead time title tr track u ul var video wbr font center svg math").split(" "));
 
 // src/core/takeover-policy.ts
+var DOLLAR_ZERO_ALL_RE = /\$0(?!\d)/g;
+function rewriteDollarZero(replaceString) {
+  return replaceString.replace(DOLLAR_ZERO_ALL_RE, "$$&");
+}
 function hostPatternOf(findRegex) {
   const m = findRegex.match(/^\/(.+)\/([dgimsuvy]*)$/s);
   return m ? m[1] : findRegex;
@@ -5627,10 +5631,7 @@ function isTakeoverRequest(p) {
 function targetsOf(t) {
   return Array.isArray(t) ? t : [t];
 }
-async function takeoverCharacterRows(regex, characterId, scripts, userId, now = Date.now) {
-  const wanted = new Set(scripts.map((s) => hostPatternOf(s.findRegex) + "\x00" + s.replaceString));
-  if (wanted.size === 0)
-    return 0;
+async function listRows(regex, characterId, userId) {
   const rows = [];
   for (let offset = 0;; offset += 200) {
     const page = await regex.list({ scope: "character", scopeId: characterId, limit: 200, offset, userId });
@@ -5638,8 +5639,36 @@ async function takeoverCharacterRows(regex, characterId, scripts, userId, now = 
     if (page.data.length < 200 || rows.length >= page.total)
       break;
   }
+  return rows;
+}
+var keyOf = (s) => hostPatternOf(s.findRegex) + "\x00" + s.replaceString;
+async function rewriteDollarZeroRows(regex, characterId, scripts, userId, now = Date.now) {
+  const wanted = new Set(scripts.map(keyOf));
+  if (wanted.size === 0)
+    return 0;
+  let rewritten = 0;
+  for (const row of await listRows(regex, characterId, userId)) {
+    if (row.can_mutate === false)
+      continue;
+    if (!wanted.has(row.find_regex + "\x00" + row.replace_string))
+      continue;
+    const meta = row.metadata ?? {};
+    if (meta.vishrun && typeof meta.vishrun === "object")
+      continue;
+    await regex.update(row.id, {
+      replace_string: rewriteDollarZero(row.replace_string),
+      metadata: { ...meta, vishrun: { dollarZero: true, original: row.replace_string, at: now() } }
+    }, userId);
+    rewritten++;
+  }
+  return rewritten;
+}
+async function takeoverCharacterRows(regex, characterId, scripts, userId, now = Date.now) {
+  const wanted = new Set(scripts.map(keyOf));
+  if (wanted.size === 0)
+    return 0;
   let disabled = 0;
-  for (const row of rows) {
+  for (const row of await listRows(regex, characterId, userId)) {
     if (row.disabled || row.can_mutate === false)
       continue;
     if (!wanted.has(row.find_regex + "\x00" + row.replace_string))
@@ -5659,15 +5688,12 @@ async function takeoverCharacterRows(regex, characterId, scripts, userId, now = 
 }
 async function nativeDisplayKeys(regex, characterId, userId) {
   const out = [];
-  for (let offset = 0;; offset += 200) {
-    const page = await regex.list({ scope: "character", scopeId: characterId, limit: 200, offset, userId });
-    for (const row of page.data) {
-      if (row.disabled || !targetsOf(row.target).includes("display"))
-        continue;
-      out.push(row.find_regex + "\x00" + row.replace_string);
-    }
-    if (page.data.length < 200 || offset + 200 >= page.total)
-      break;
+  for (const row of await listRows(regex, characterId, userId)) {
+    if (row.disabled || !targetsOf(row.target).includes("display"))
+      continue;
+    const v = row.metadata?.vishrun;
+    const fixed = v?.dollarZero === true && typeof v.original === "string" && rewriteDollarZero(v.original) === row.replace_string;
+    out.push(row.find_regex + "\x00" + (fixed ? v.original : row.replace_string));
   }
   return out;
 }
@@ -5677,6 +5703,7 @@ function installRegexTakeoverHandler() {
     if (!isTakeoverRequest(payload))
       return;
     const { requestId, characterId, scripts } = payload;
+    const dollarZero = Array.isArray(payload.dollarZero) ? payload.dollarZero : [];
     (async () => {
       const response = { type: "regex_takeover_response", requestId, disabled: 0 };
       try {
@@ -5691,6 +5718,7 @@ function installRegexTakeoverHandler() {
         } else {
           const regex = api.regex_scripts;
           response.disabled = await takeoverCharacterRows(regex, characterId, scripts, userId);
+          response.rewritten = await rewriteDollarZeroRows(regex, characterId, dollarZero, userId);
           response.native = await nativeDisplayKeys(regex, characterId, userId);
         }
       } catch (err) {

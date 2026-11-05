@@ -1,6 +1,6 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { RawRegexScript } from '../lumiverse/fetch-character';
-import { selectTakeoverCandidates } from './takeover-policy';
+import { selectDollarZeroRows, selectTakeoverCandidates } from './takeover-policy';
 
 const TIMEOUT_MS = 8000;
 let counter = 0;
@@ -21,7 +21,7 @@ export function knownNativeKeys(characterId: string): string[] | undefined {
 }
 
 // Asks the backend to disable the host's copies of this card's Vishrun-rendered
-// scripts and to report which of the card's rows the host keeps rendering.
+// scripts, fix $0 in the rest, and report which rows the host keeps rendering.
 // Once per character per session; failures are retried on the next call.
 export function requestRegexTakeover(
   ctx: SpindleFrontendContext,
@@ -50,6 +50,7 @@ export function requestRegexTakeover(
       requestId,
       characterId,
       scripts: candidates.map((c) => ({ findRegex: c.findRegex, replaceString: c.replaceString })),
+      dollarZero: selectDollarZeroRows(scripts),
     });
   });
   results.set(characterId, pending);
