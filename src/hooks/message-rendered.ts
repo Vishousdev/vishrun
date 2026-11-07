@@ -95,7 +95,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     if (card.nativeKeys && card.nativeKeys.size > 0) {
       for (const c of compiled) {
         const raw = card.scripts[c.sourceIndex];
-        if (raw && card.nativeKeys.has(hostPatternOf(raw.findRegex) + '\u0000' + (raw.replaceString ?? ''))) c.native = true;
+        if (raw?.findRegex && card.nativeKeys.has(hostPatternOf(raw.findRegex) + '\u0000' + (raw.replaceString ?? ''))) c.native = true;
       }
     }
     return compiled.length === 0 ? null : compiled;

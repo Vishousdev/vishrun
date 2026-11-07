@@ -3784,7 +3784,8 @@ var jsYaml = {
 var js_yaml_default = jsYaml;
 
 // src/backend/mvu-yaml-schema.ts
-var YAML_SCHEMA = js_yaml_default.CORE_SCHEMA.extend([js_yaml_default.types.merge]);
+var { merge: merge2 } = js_yaml_default.types;
+var YAML_SCHEMA = js_yaml_default.CORE_SCHEMA.extend([merge2]);
 function yamlLoad(text) {
   return js_yaml_default.load(text, { schema: YAML_SCHEMA });
 }

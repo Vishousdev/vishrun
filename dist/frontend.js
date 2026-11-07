@@ -4631,7 +4631,7 @@ function installMessageHooks(ctx) {
     if (card.nativeKeys && card.nativeKeys.size > 0) {
       for (const c of compiled) {
         const raw = card.scripts[c.sourceIndex];
-        if (raw && card.nativeKeys.has(hostPatternOf(raw.findRegex) + "\x00" + (raw.replaceString ?? "")))
+        if (raw?.findRegex && card.nativeKeys.has(hostPatternOf(raw.findRegex) + "\x00" + (raw.replaceString ?? "")))
           c.native = true;
       }
     }
