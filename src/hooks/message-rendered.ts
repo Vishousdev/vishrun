@@ -79,6 +79,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   let observer: MutationObserver | null = null;
   let observedTarget: Element | null = null;
   let pendingFrame = 0;
+  let pendingTimer = 0;
   let pendingRecords: MutationRecord[] = [];
   // Watcher used when MessageList isn't yet in the DOM at attach time —
   // e.g. user navigated directly into a chat from the characters page,
@@ -158,9 +159,12 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
 
   function handleMutations(records: MutationRecord[]): void {
     if (records.length > 0) pendingRecords.push(...records);
-    if (pendingFrame) return;
-    pendingFrame = requestAnimationFrame(() => {
+    if (pendingFrame || pendingTimer) return;
+    const run = () => {
+      cancelAnimationFrame(pendingFrame);
+      clearTimeout(pendingTimer);
       pendingFrame = 0;
+      pendingTimer = 0;
       const batch = pendingRecords;
       pendingRecords = [];
       const compiled = compiledForActiveCard();
@@ -171,7 +175,10 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       }
       if (allSelf(batch)) return;
       void scanAllNow(compiled);
-    });
+    };
+    pendingFrame = requestAnimationFrame(run);
+    // rAF is paused in hidden tabs; the timer keeps changes rendering there.
+    pendingTimer = window.setTimeout(run, 100);
   }
 
   function attachObserver(): void {
@@ -242,9 +249,11 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   }
 
   function detachObserver(): void {
-    if (pendingFrame) {
+    if (pendingFrame || pendingTimer) {
       cancelAnimationFrame(pendingFrame);
+      clearTimeout(pendingTimer);
       pendingFrame = 0;
+      pendingTimer = 0;
     }
     pendingRecords = [];
     if (bodyWatcher) {

@@ -478,7 +478,10 @@ function isTextAnchor(prefix) {
 }
 var HTML_TAGS = new Set(("a abbr address area article aside audio b base bdi bdo blockquote body br button canvas caption cite code col " + "colgroup data datalist dd del details dfn dialog div dl dt em embed fieldset figcaption figure footer form h1 h2 " + "h3 h4 h5 h6 head header hgroup hr html i iframe img input ins kbd label legend li link main map mark menu meta " + "meter nav noscript object ol optgroup option output p param picture pre progress q rp rt ruby s samp script " + "search section select slot small source span strong style sub summary sup table tbody td template textarea " + "tfoot th thead time title tr track u ul var video wbr font center svg math").split(" "));
 var OPEN_TAG_RE = /^\s*<([A-Za-z][A-Za-z0-9-]*)((?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:"[\s\S]*?"|'[\s\S]*?'|[^\s"'=<>`]+))?)*)\s*\/?>\s*$/;
+var COMMENT_START_RE = /^\s*(?:\^\s*)?<!--/;
 function isStrippedTag(re) {
+  if (COMMENT_START_RE.test(re.source.replace(/\\([^A-Za-z0-9])/g, "$1")))
+    return true;
   const src = re.source.replace(/\\s[*+?]/g, " ").replace(/\\([^A-Za-z0-9])/g, "$1");
   if (src.includes("</"))
     return false;
@@ -2244,6 +2247,33 @@ function buildRawViewportNeutralizerScript() {
 })();</script>`;
 }
 
+// src/render/viewport-vh.ts
+var VAR = "var(--TH-viewport-height)";
+function vhToVar(value) {
+  return value.replace(/(\d+(?:\.\d+)?)vh\b/gi, (match, n) => {
+    const parsed = parseFloat(n);
+    if (!isFinite(parsed))
+      return match;
+    return parsed === 100 ? VAR : `calc(${VAR} * ${parsed / 100})`;
+  });
+}
+function replaceMinHeightVh(content) {
+  if (!/min-?height/i.test(content) || !/\dvh\b/i.test(content))
+    return content;
+  let out = content.replace(/(min-height\s*:\s*)([^;{}]*?\d+(?:\.\d+)?vh)(?=\s*[;}])/gi, (_m, prefix, value) => prefix + vhToVar(value));
+  out = out.replace(/(style\s*=\s*(["']))([^"']*?)(\2)/gi, (match, prefix, _q, style, suffix) => {
+    if (!/min-height\s*:\s*[^;]*vh/i.test(style))
+      return match;
+    return prefix + style.replace(/(min-height\s*:\s*)([^;]*?\d+(?:\.\d+)?vh)/gi, (_m, p, v) => p + vhToVar(v)) + suffix;
+  });
+  out = out.replace(/(\.style\.minHeight\s*=\s*(["']))([\s\S]*?)(\2)/gi, (match, prefix, _q, v, suffix) => /\b\d+(?:\.\d+)?vh\b/i.test(v) ? prefix + vhToVar(v) + suffix : match);
+  out = out.replace(/(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?)(\3\s*\))/gi, (match, prefix, _a, _b, v, suffix) => /\b\d+(?:\.\d+)?vh\b/i.test(v) ? prefix + vhToVar(v) + suffix : match);
+  return out;
+}
+function viewportVarShim() {
+  return "<script>(function(){" + "function set(){var h=0;try{h=window.parent.innerHeight;}catch(e){}" + "if(!h)h=(window.screen&&window.screen.availHeight)||800;" + "document.documentElement.style.setProperty('--TH-viewport-height',h+'px');}" + "set();" + "try{window.parent.addEventListener('resize',set);}catch(e){}" + "})();</script>";
+}
+
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
@@ -2449,7 +2479,7 @@ function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
-  const withExternalScripts = await transformHtmlForExternalScripts(withJsrGlobalLibraries(html), ctx);
+  const withExternalScripts = await transformHtmlForExternalScripts(withJsrGlobalLibraries(replaceMinHeightVh(html)), ctx);
   const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
   const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
   const stripped = rewriteCssExternalUrls(stripExternalAudioSrc(stripExternalImageSrc(withoutCdnJQuery)));
@@ -2485,7 +2515,7 @@ function buildHeadInjection(iframeCtx) {
     greetings: cardGreetings()
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return viewportVarShim() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function cardGreetings() {
   const card = getActiveCard();
@@ -4387,6 +4417,7 @@ function installMessageHooks(ctx) {
   let observer = null;
   let observedTarget = null;
   let pendingFrame = 0;
+  let pendingTimer = 0;
   let pendingRecords = [];
   let bodyWatcher = null;
   const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
@@ -4456,10 +4487,13 @@ function installMessageHooks(ctx) {
   function handleMutations(records) {
     if (records.length > 0)
       pendingRecords.push(...records);
-    if (pendingFrame)
+    if (pendingFrame || pendingTimer)
       return;
-    pendingFrame = requestAnimationFrame(() => {
+    const run = () => {
+      cancelAnimationFrame(pendingFrame);
+      clearTimeout(pendingTimer);
       pendingFrame = 0;
+      pendingTimer = 0;
       const batch = pendingRecords;
       pendingRecords = [];
       const compiled = compiledForActiveCard();
@@ -4470,7 +4504,9 @@ function installMessageHooks(ctx) {
       if (allSelf(batch))
         return;
       scanAllNow(compiled);
-    });
+    };
+    pendingFrame = requestAnimationFrame(run);
+    pendingTimer = window.setTimeout(run, 100);
   }
   function attachObserver() {
     const target = document.querySelector(MESSAGE_LIST_SELECTOR);
@@ -4529,9 +4565,11 @@ function installMessageHooks(ctx) {
     bodyWatcher.observe(document.body, { childList: true, subtree: true });
   }
   function detachObserver() {
-    if (pendingFrame) {
+    if (pendingFrame || pendingTimer) {
       cancelAnimationFrame(pendingFrame);
+      clearTimeout(pendingTimer);
       pendingFrame = 0;
+      pendingTimer = 0;
     }
     pendingRecords = [];
     if (bodyWatcher) {
