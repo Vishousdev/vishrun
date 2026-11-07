@@ -1245,13 +1245,19 @@ async function transformHtmlForExternalScripts(html, ctx) {
 var USES_VUE = /(?<![\w$.'"`-])Vue(?![\w$'"`-])/;
 var LOADS_VUE = /vue(?:@[^/'"]*)?\/dist\/vue\.global|vue\.global(?:\.prod)?(?:\.min)?\.js/i;
 var VUE_TAG = '<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>';
+var USES_ROUTER = /(?<![\w$.'"`-])VueRouter(?![\w$'"`-])/;
+var LOADS_ROUTER = /vue-router\.global(?:\.prod)?(?:\.min)?\.js/i;
+var ROUTER_TAG = '<script src="https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js"></script>';
 function withJsrGlobalLibraries(html) {
-  if (!USES_VUE.test(html) || LOADS_VUE.test(html))
+  const router = USES_ROUTER.test(html) && !LOADS_ROUTER.test(html);
+  const vue = (USES_VUE.test(html) || router) && !LOADS_VUE.test(html);
+  const tags = (vue ? VUE_TAG : "") + (router ? ROUTER_TAG : "");
+  if (!tags)
     return html;
   const head = /<head\b[^>]*>/i.exec(html);
   if (head)
-    return html.slice(0, head.index + head[0].length) + VUE_TAG + html.slice(head.index + head[0].length);
-  return VUE_TAG + html;
+    return html.slice(0, head.index + head[0].length) + tags + html.slice(head.index + head[0].length);
+  return tags + html;
 }
 
 // src/core/font-proxy.ts

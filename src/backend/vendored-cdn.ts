@@ -6,6 +6,7 @@ import reactDom17 from '../vendor/cdn/react-dom-17.0.2.min.js.txt';
 import arco from '../vendor/cdn/arco-web-react-2.66.18.min.js.txt';
 import babel from '../vendor/cdn/babel-standalone-7.26.10.min.js.txt';
 import vue from '../vendor/cdn/vue-3.5.13.global.prod.js.txt';
+import vueRouter from '../vendor/cdn/vue-router-4.6.4.global.prod.js.txt';
 import emojiPicker from '../vendor/cdn/emoji-picker-element-1.26.3.bundle.js.txt';
 
 // Cards load these from public CDNs; the host proxy no longer serves JavaScript,
@@ -30,6 +31,7 @@ const LIBS: VendoredLib[] = [
   { id: 'babel', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?@babel\/standalone(?:@7[\d.]*)?\/babel(?:\.min)?\.js$|\/ajax\/libs\/babel-standalone\/7[\d.]*\/babel(?:\.min)?\.js$/, body: babel },
   { id: 'emoji-picker-element', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?emoji-picker-element(?:@(?:\^|%5E)?1(?:\.[\d.]+)?)?\/(?:index|picker)\.js$/i, body: emojiPicker },
   { id: 'vue', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?vue(?:@3(?:\.[\d.]+)?)?\/dist\/vue\.global(?:\.prod)?\.js$|\/ajax\/libs\/vue\/3[\d.]*\/vue\.global(?:\.prod)?(?:\.min)?\.js$/, body: vue },
+  { id: 'vue-router', hosts: PACKAGE_CDNS, path: /\/(?:npm\/)?vue-router(?:@4(?:\.[\d.]+)?)?\/dist\/vue-router\.global(?:\.prod)?(?:\.min)?\.js$|\/ajax\/libs\/vue-router\/4[\d.]*\/vue-router\.global(?:\.prod)?(?:\.min)?\.js$/, body: vueRouter },
 ];
 
 // The bundled body for a CDN URL, or null when the URL is not one we ship.
