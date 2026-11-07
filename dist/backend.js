@@ -680,6 +680,16 @@ function installFetchExternalHandler() {
     if (!isFetchExternalRequest(payload))
       return;
     const { requestId, url } = payload;
+    if (payload.media === "font") {
+      api.cors(url, { responseType: "arraybuffer", mediaType: "font" }).then((result) => {
+        const r = result ?? {};
+        const contentType = String(r.headers?.["content-type"] ?? "font/woff2").split(";")[0].trim();
+        api.sendToFrontend({ type: "fetch_external_response", requestId, ok: true, body: String(r.body ?? ""), contentType }, userId);
+      }, (err) => {
+        api.sendToFrontend({ type: "fetch_external_response", requestId, ok: false, error: err instanceof Error ? err.message : String(err) }, userId);
+      });
+      return;
+    }
     const vendored = vendoredBodyFor(url);
     if (vendored !== null) {
       api.sendToFrontend({ type: "fetch_external_response", requestId, ok: true, body: vendored }, userId);

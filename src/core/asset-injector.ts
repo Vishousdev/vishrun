@@ -32,6 +32,7 @@ interface FetchExternalResponse {
   ok: boolean;
   body?: string;
   error?: string;
+  contentType?: string;
 }
 
 function isFetchExternalResponse(p: unknown, requestId: string): p is FetchExternalResponse {
@@ -63,7 +64,21 @@ export function fetchViaBackend(
   ctx: SpindleFrontendContext,
   timeoutMs = 30000,
 ): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
+  return fetchExternal(url, ctx, timeoutMs).then((r) => r.body);
+}
+
+// Font files: base64 body plus the content type the host proxy accepted.
+export function fetchFontViaBackend(url: string, ctx: SpindleFrontendContext): Promise<{ body: string; contentType: string }> {
+  return fetchExternal(url, ctx, 30000, 'font').then((r) => ({ body: r.body, contentType: r.contentType || 'font/woff2' }));
+}
+
+function fetchExternal(
+  url: string,
+  ctx: SpindleFrontendContext,
+  timeoutMs: number,
+  media?: 'font',
+): Promise<{ body: string; contentType?: string }> {
+  return new Promise((resolve, reject) => {
     const requestId = nextRequestId();
     let settled = false;
     let unsub: (() => void) | null = null;
@@ -90,8 +105,8 @@ export function fetchViaBackend(
     unsub = ctx.onBackendMessage((payload) => {
       if (!isFetchExternalResponse(payload, requestId)) return;
       if (payload.ok && typeof payload.body === 'string') {
-        const body = payload.body;
-        finish(() => resolve(body));
+        const res = { body: payload.body, contentType: payload.contentType };
+        finish(() => resolve(res));
       } else {
         finish(() => reject(new Error(payload.error || 'fetch_external failed')));
       }
@@ -102,7 +117,7 @@ export function fetchViaBackend(
     }, timeoutMs);
 
     try {
-      ctx.sendToBackend({ type: 'fetch_external', requestId, url });
+      ctx.sendToBackend({ type: 'fetch_external', requestId, url, ...(media ? { media } : {}) });
     } catch (err) {
       finish(() => reject(err instanceof Error ? err : new Error(String(err))));
     }

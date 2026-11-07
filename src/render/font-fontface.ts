@@ -1,88 +1,68 @@
-// TS twin of the fontFaceHelper iframe shim. Same algorithm, lifted out so
-// font-fontface.test.ts can exercise it with happy-dom + injected mocks.
-// The JS string in widget-iframe.ts:fontFaceHelper is a hand-written ES5
-// mirror; any logic change here MUST be mirrored there.
+// Picks the font files a widget needs. Sliced fonts (unicode-range) only
+// load the slices covering characters drawn with that family, at the nearest
+// weight and style, the way a browser does; unsliced fonts always load.
+// Self-contained: widget-iframe.ts injects its source into the frame.
 
-import type { VishrunFontEntry } from '../core/font-proxy';
-
-export interface FontResource { url: string }
-export type FontFetch = (url: string) => Promise<FontResource>;
-
-export interface FontFaceLike {
-  load(): Promise<unknown>;
+export interface FontEntryLike {
+  family: string;
+  url: string;
+  weight?: string;
+  style?: string;
+  range?: string;
+  /** Parsed `range`, kept between calls. */
+  _r?: number[][];
 }
 
-export type FontFaceCtor = new (
-  family: string,
-  source: string,
-  descriptors: Record<string, string>,
-) => FontFaceLike;
-
-export interface FontSetLike {
-  add(face: FontFaceLike): void;
+export interface FontUsage {
+  families: string[];
+  weight: number;
+  style: string;
+  text: string;
 }
 
-export interface VishrunFontsDeps {
-  fetchFont: FontFetch;
-  fontFaceCtor: FontFaceCtor;
-  fontSet: FontSetLike;
-  cache?: Map<string, boolean>;
-  warn?: (msg: string, ...args: unknown[]) => void;
-}
-
-function isFontEntry(v: unknown): v is VishrunFontEntry {
-  return !!v
-    && typeof v === 'object'
-    && typeof (v as VishrunFontEntry).url === 'string'
-    && typeof (v as VishrunFontEntry).family === 'string'
-    && (v as VishrunFontEntry).url.length > 0
-    && (v as VishrunFontEntry).family.length > 0;
-}
-
-export async function processVishrunFonts(
-  root: Document | HTMLElement,
-  deps: VishrunFontsDeps,
-): Promise<void> {
-  const cache = deps.cache ?? new Map<string, boolean>();
-  const warn = deps.warn ?? ((msg: string, ...args: unknown[]) => console.warn(msg, ...args));
-  const scripts = root.querySelectorAll('script[data-vishrun-fonts]');
-  const tasks: Array<Promise<void>> = [];
-
-  for (const s of Array.from(scripts)) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(s.textContent || '[]');
-    } catch {
-      continue;
-    }
-    if (!Array.isArray(parsed)) continue;
-    for (const raw of parsed) {
-      if (!isFontEntry(raw)) continue;
-      const entry = raw;
-      if (cache.get(entry.url)) continue;
-      cache.set(entry.url, true);
-      const task = (async () => {
-        try {
-          const resource = await deps.fetchFont(entry.url);
-          if (!resource || !resource.url) {
-            cache.set(entry.url, false);
-            return;
-          }
-          const face = new deps.fontFaceCtor(entry.family, `url(${resource.url})`, {
-            weight: entry.weight ?? '400',
-            style: entry.style ?? 'normal',
-            display: entry.display ?? 'swap',
-          });
-          await face.load();
-          deps.fontSet.add(face);
-        } catch (err) {
-          cache.set(entry.url, false);
-          warn('[vishrun] fetchFont failed for', entry.url, err);
+export function selectFontEntries<T extends FontEntryLike>(entries: T[], usages: FontUsage[]): T[] {
+  const norm = (s: string) => s.trim().replace(/^['"]|['"]$/g, '').trim().toLowerCase();
+  const ranges = (r: string) =>
+    r.split(',').map((t) => {
+      const m = /^\s*u\+([0-9a-f?]+)(?:-([0-9a-f]+))?\s*$/i.exec(t);
+      if (!m) return [1, 0];
+      if (m[2]) return [parseInt(m[1], 16), parseInt(m[2], 16)];
+      return [parseInt(m[1].replace(/\?/g, '0'), 16), parseInt(m[1].replace(/\?/g, 'f'), 16)];
+    });
+  const weights = (w?: string) => {
+    const n = (x: string) => (x === 'bold' ? 700 : x === 'normal' ? 400 : parseFloat(x));
+    const p = (w || '400').trim().split(/\s+/).map(n).filter((x) => !isNaN(x));
+    return p.length ? [p[0], p[p.length - 1]] : [400, 400];
+  };
+  const out = new Set<T>();
+  const sliced = new Map<string, Array<{ e: T; r: number[][]; w: number[]; italic: boolean }>>();
+  for (const e of entries) {
+    if (!e.range) { out.add(e); continue; }
+    const key = norm(e.family);
+    const list = sliced.get(key) || [];
+    if (!e._r) e._r = ranges(e.range);
+    list.push({ e, r: e._r, w: weights(e.weight), italic: /italic|oblique/i.test(e.style || '') });
+    sliced.set(key, list);
+  }
+  for (const u of usages) {
+    const italic = /italic|oblique/i.test(u.style);
+    const codes = new Set<number>();
+    for (const ch of u.text) codes.add(ch.codePointAt(0) as number);
+    for (const fam of u.families) {
+      const list = sliced.get(norm(fam));
+      if (!list) continue;
+      for (const c of codes) {
+        let best: (typeof list)[number] | null = null;
+        let bestScore = Infinity;
+        for (const s of list) {
+          if (!s.r.some((r) => c >= r[0] && c <= r[1])) continue;
+          const dist = u.weight < s.w[0] ? s.w[0] - u.weight : u.weight > s.w[1] ? u.weight - s.w[1] : 0;
+          const score = dist + (s.italic === italic ? 0 : 10000);
+          if (score < bestScore) { best = s; bestScore = score; }
         }
-      })();
-      tasks.push(task);
+        if (best) out.add(best.e);
+      }
     }
   }
-
-  await Promise.all(tasks);
+  return entries.filter((e) => out.has(e));
 }

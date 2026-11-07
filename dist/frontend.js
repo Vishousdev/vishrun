@@ -1208,6 +1208,12 @@ function nextRequestId2() {
   return `vishrun-fx-${Date.now()}-${++requestCounter2}`;
 }
 function fetchViaBackend(url, ctx, timeoutMs = 30000) {
+  return fetchExternal(url, ctx, timeoutMs).then((r) => r.body);
+}
+function fetchFontViaBackend(url, ctx) {
+  return fetchExternal(url, ctx, 30000, "font").then((r) => ({ body: r.body, contentType: r.contentType || "font/woff2" }));
+}
+function fetchExternal(url, ctx, timeoutMs, media) {
   return new Promise((resolve, reject) => {
     const requestId = nextRequestId2();
     let settled = false;
@@ -1233,8 +1239,8 @@ function fetchViaBackend(url, ctx, timeoutMs = 30000) {
       if (!isFetchExternalResponse(payload, requestId))
         return;
       if (payload.ok && typeof payload.body === "string") {
-        const body = payload.body;
-        finish(() => resolve(body));
+        const res = { body: payload.body, contentType: payload.contentType };
+        finish(() => resolve(res));
       } else {
         finish(() => reject(new Error(payload.error || "fetch_external failed")));
       }
@@ -1243,7 +1249,7 @@ function fetchViaBackend(url, ctx, timeoutMs = 30000) {
       finish(() => reject(new Error("Backend fetch timeout")));
     }, timeoutMs);
     try {
-      ctx.sendToBackend({ type: "fetch_external", requestId, url });
+      ctx.sendToBackend({ type: "fetch_external", requestId, url, ...media ? { media } : {} });
     } catch (err) {
       finish(() => reject(err instanceof Error ? err : new Error(String(err))));
     }
@@ -1392,161 +1398,288 @@ function withJsrGlobalLibraries(html) {
 }
 
 // src/core/font-proxy.ts
-var FONT_LINK_RE = /<link\b[^>]*\bhref\s*=\s*["'](https?:\/\/fonts\.googleapis\.com\/[^"']+)["'][^>]*>/gi;
-var FONT_STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
-var FONT_IMPORT_RE = /@import\s+url\(\s*(['"]?)(https?:\/\/fonts\.googleapis\.com\/[^'")\s]+)\1\s*\)\s*;?/gi;
-var FONT_FACE_BLOCK_RE = /@font-face\s*\{([^}]+)\}/gi;
-var FONT_FACE_URL_RE = /src\s*:[^;]*url\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)/i;
-var FONT_FACE_FAMILY_RE = /font-family\s*:\s*['"]?([^;'"]+?)['"]?\s*;/i;
-var FONT_FACE_WEIGHT_RE = /font-weight\s*:\s*([^;]+?)\s*;/i;
-var FONT_FACE_STYLE_RE = /font-style\s*:\s*([^;]+?)\s*;/i;
-var FONT_FACE_DISPLAY_RE = /font-display\s*:\s*([^;]+?)\s*;/i;
-var fontEntriesCache = new Map;
-function parseFontFaceRules(css) {
-  if (css.indexOf("@font-face") === -1)
-    return [];
-  const out = [];
-  FONT_FACE_BLOCK_RE.lastIndex = 0;
-  let m;
-  while ((m = FONT_FACE_BLOCK_RE.exec(css)) !== null) {
-    const body = m[1];
-    const urlMatch = body.match(FONT_FACE_URL_RE);
-    const familyMatch = body.match(FONT_FACE_FAMILY_RE);
-    if (!urlMatch || !familyMatch)
+var MAX_DEPTH = 3;
+var LINK_RE = /<link\b[^>]*>/gi;
+var STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+var IMPORT_RE = /@import\s+(?:url\(\s*(['"]?)([^'")]+)\1\s*\)|(['"])([^'"]+)\3)[^;]*;?/gi;
+var FONT_FACE_RE = /@font-face\s*\{([^}]*)\}/gi;
+var CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+var attr = (tag, name) => new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i").exec(tag)?.slice(1).find((v) => v !== undefined);
+var decodeEntities = (s) => s.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+function absolute(url, base) {
+  if (/^(?:data|blob):/i.test(url))
+    return url;
+  try {
+    const u = new URL(url, base);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+var descriptor = (body, name) => new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`, "i").exec(body)?.[1].trim();
+function fontSource(src, base) {
+  const urls = [];
+  for (const part of src.split(/,(?![^()]*\))/)) {
+    const m = /url\(\s*(['"]?)([^'")]+)\1\s*\)/i.exec(part);
+    if (!m)
       continue;
-    const entry = {
-      family: familyMatch[1].trim(),
-      url: urlMatch[1]
-    };
-    const w = body.match(FONT_FACE_WEIGHT_RE);
-    const s = body.match(FONT_FACE_STYLE_RE);
-    const d = body.match(FONT_FACE_DISPLAY_RE);
-    if (w)
-      entry.weight = w[1].trim();
-    if (s)
-      entry.style = s[1].trim();
-    if (d)
-      entry.display = d[1].trim();
+    const url = absolute(m[2].trim(), base);
+    if (url)
+      urls.push({ url, woff2: /woff2/i.test(part) });
+  }
+  return (urls.find((u) => u.woff2) ?? urls[0])?.url ?? null;
+}
+function parseFontFaces(css, base) {
+  const out = [];
+  for (const m of css.matchAll(FONT_FACE_RE)) {
+    const body = m[1];
+    const family = descriptor(body, "font-family")?.replace(/^['"]|['"]$/g, "").trim();
+    const src = descriptor(body, "src");
+    const url = src ? fontSource(src, base) : null;
+    if (!family || !url || !/^https?:/i.test(url))
+      continue;
+    const entry = { family, url };
+    const weight = descriptor(body, "font-weight");
+    const style = descriptor(body, "font-style");
+    const display = descriptor(body, "font-display");
+    const range = descriptor(body, "unicode-range");
+    if (weight)
+      entry.weight = weight;
+    if (style)
+      entry.style = style;
+    if (display)
+      entry.display = display;
+    if (range)
+      entry.range = range;
     out.push(entry);
   }
   return out;
 }
-function extractGoogleFontsLinks(html) {
-  if (html.indexOf("fonts.googleapis.com") === -1)
-    return [];
-  const out = [];
-  const seen = new Set;
-  FONT_LINK_RE.lastIndex = 0;
-  let m;
-  while ((m = FONT_LINK_RE.exec(html)) !== null) {
-    const fullTag = m[0];
-    const url = decodeHtmlEntities(m[1]);
-    if (!seen.has(fullTag)) {
-      seen.add(fullTag);
-      out.push({ fullTag, url });
-    }
-  }
-  return out;
+function plainRules(css, base) {
+  return css.replace(FONT_FACE_RE, "").replace(IMPORT_RE, "").replace(CSS_URL_RE, (all, q, u) => {
+    const abs = absolute(u.trim(), base);
+    return abs ? `url(${q}${abs}${q})` : all;
+  }).replace(/<\/style/gi, "<\\/style");
 }
-function extractGoogleFontsImports(html) {
-  if (html.indexOf("fonts.googleapis.com") === -1)
-    return [];
-  if (html.indexOf("@import") === -1)
-    return [];
-  const out = [];
-  const seenBlocks = new Set;
-  FONT_STYLE_BLOCK_RE.lastIndex = 0;
-  let m;
-  while ((m = FONT_STYLE_BLOCK_RE.exec(html)) !== null) {
-    const fullStyleBlock = m[0];
-    const cssContent = m[1];
-    if (cssContent.indexOf("@import") === -1)
-      continue;
-    if (cssContent.indexOf("fonts.googleapis.com") === -1)
-      continue;
-    if (seenBlocks.has(fullStyleBlock))
-      continue;
-    seenBlocks.add(fullStyleBlock);
-    const imports = [];
-    FONT_IMPORT_RE.lastIndex = 0;
-    let im;
-    while ((im = FONT_IMPORT_RE.exec(cssContent)) !== null) {
-      imports.push({ raw: im[0], url: im[2] });
-    }
-    if (imports.length > 0)
-      out.push({ fullStyleBlock, imports });
-  }
-  return out;
-}
-function decodeHtmlEntities(s) {
-  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-}
-function getFontEntries(url, ctx) {
-  const cached = fontEntriesCache.get(url);
+var sheetCache = new Map;
+function fetchSheet(url, fetchText, depth = 0) {
+  const cached = sheetCache.get(url);
   if (cached)
     return cached;
   const pending = (async () => {
-    const raw = await fetchViaBackend(url, ctx);
-    return parseFontFaceRules(raw);
+    const css = await fetchText(url);
+    const children = depth < MAX_DEPTH ? [...css.matchAll(IMPORT_RE)].map((m) => absolute((m[2] ?? m[4]).trim(), url)).filter((u) => !!u) : [];
+    const parts = await Promise.all(children.map((c) => fetchSheet(c, fetchText, depth + 1).catch(() => ({ css: "", fonts: [] }))));
+    return {
+      css: parts.map((p) => p.css).join(`
+`) + plainRules(css, url),
+      fonts: parts.flatMap((p) => p.fonts).concat(parseFontFaces(css, url))
+    };
   })();
-  fontEntriesCache.set(url, pending);
+  sheetCache.set(url, pending);
   pending.catch(() => {
-    if (fontEntriesCache.get(url) === pending)
-      fontEntriesCache.delete(url);
+    if (sheetCache.get(url) === pending)
+      sheetCache.delete(url);
   });
   return pending;
 }
-function htmlSafeJsonStringify(value) {
-  return JSON.stringify(value).replace(/</g, "\\u003c");
-}
-function buildFontConfigScript(entries) {
-  return `<script type="application/vishrun-font-config" data-vishrun-fonts>${htmlSafeJsonStringify(entries)}</script>`;
-}
-async function transformHtmlForGoogleFonts(html, ctx) {
-  const links = extractGoogleFontsLinks(html);
-  const importBlocks = extractGoogleFontsImports(html);
-  if (links.length === 0 && importBlocks.length === 0)
+var htmlSafeJson = (v) => JSON.stringify(v).replace(/</g, "\\u003c");
+var fontScript = (fonts) => fonts.length ? `<script type="application/vishrun-font-config" data-vishrun-fonts>${htmlSafeJson(fonts)}</script>` : "";
+var inlined = (sheet) => fontScript(sheet.fonts) + (sheet.css.trim() ? `<style>${sheet.css}</style>` : "");
+var external = (u) => /^https?:\/\//i.test(u) ? u : null;
+var isStylesheetLink = (tag) => /\bstylesheet\b/i.test(attr(tag, "rel") ?? "");
+async function transformHtmlForStylesheets(html, fetchText) {
+  if (!/<link\b|@import/i.test(html))
     return html;
-  const allUrls = new Set;
-  for (const l of links)
-    allUrls.add(l.url);
-  for (const ib of importBlocks)
-    for (const im of ib.imports)
-      allUrls.add(im.url);
-  const entriesByUrl = new Map;
-  const failed = new Set;
-  await Promise.all(Array.from(allUrls).map(async (u) => {
-    try {
-      entriesByUrl.set(u, await getFontEntries(u, ctx));
-    } catch (err) {
-      failed.add(u);
-      console.warn("[vishrun] Google Fonts fetch failed:", u, err instanceof Error ? err.message : String(err));
-    }
-  }));
+  const load = (url) => fetchSheet(url, fetchText).catch((err) => {
+    console.warn("[vishrun] stylesheet fetch failed:", url, err instanceof Error ? err.message : String(err));
+    return null;
+  });
   let out = html;
-  for (const l of links) {
-    if (failed.has(l.url))
+  for (const tag of new Set(html.match(LINK_RE) ?? [])) {
+    if (!isStylesheetLink(tag))
       continue;
-    const entries = entriesByUrl.get(l.url) ?? [];
-    const replacement = entries.length === 0 ? "" : buildFontConfigScript(entries);
-    out = out.split(l.fullTag).join(replacement);
+    const href = attr(tag, "href");
+    const url = href ? external(decodeEntities(href.trim())) : null;
+    if (!url)
+      continue;
+    const sheet = await load(url);
+    if (sheet)
+      out = out.split(tag).join(inlined(sheet));
   }
-  for (const ib of importBlocks) {
-    let stripped = ib.fullStyleBlock;
-    const scripts = [];
-    for (const imp of ib.imports) {
-      if (failed.has(imp.url))
+  const blocks = [...out.matchAll(STYLE_BLOCK_RE)].filter((m) => m[1].includes("@import"));
+  for (const block of new Set(blocks.map((m) => m[0]))) {
+    let changed = block;
+    const fonts = [];
+    for (const m of block.matchAll(IMPORT_RE)) {
+      const url = external((m[2] ?? m[4]).trim());
+      if (!url)
         continue;
-      stripped = stripped.split(imp.raw).join("");
-      const entries = entriesByUrl.get(imp.url) ?? [];
-      if (entries.length > 0)
-        scripts.push(buildFontConfigScript(entries));
+      const sheet = await load(url);
+      if (!sheet)
+        continue;
+      changed = changed.split(m[0]).join(sheet.css);
+      fonts.push(fontScript(sheet.fonts));
     }
-    if (stripped === ib.fullStyleBlock && scripts.length === 0)
-      continue;
-    out = out.split(ib.fullStyleBlock).join(scripts.join("") + stripped);
+    if (changed !== block)
+      out = out.split(block).join(fonts.join("") + changed);
   }
   return out;
+}
+function transformHtmlForExternalStylesheets(html, ctx) {
+  return transformHtmlForStylesheets(html, (url) => fetchViaBackend(url, ctx));
+}
+
+// src/render/font-fontface.ts
+function selectFontEntries(entries, usages) {
+  const norm = (s) => s.trim().replace(/^['"]|['"]$/g, "").trim().toLowerCase();
+  const ranges = (r) => r.split(",").map((t) => {
+    const m = /^\s*u\+([0-9a-f?]+)(?:-([0-9a-f]+))?\s*$/i.exec(t);
+    if (!m)
+      return [1, 0];
+    if (m[2])
+      return [parseInt(m[1], 16), parseInt(m[2], 16)];
+    return [parseInt(m[1].replace(/\?/g, "0"), 16), parseInt(m[1].replace(/\?/g, "f"), 16)];
+  });
+  const weights = (w) => {
+    const n = (x) => x === "bold" ? 700 : x === "normal" ? 400 : parseFloat(x);
+    const p = (w || "400").trim().split(/\s+/).map(n).filter((x) => !isNaN(x));
+    return p.length ? [p[0], p[p.length - 1]] : [400, 400];
+  };
+  const out = new Set;
+  const sliced = new Map;
+  for (const e of entries) {
+    if (!e.range) {
+      out.add(e);
+      continue;
+    }
+    const key = norm(e.family);
+    const list = sliced.get(key) || [];
+    if (!e._r)
+      e._r = ranges(e.range);
+    list.push({ e, r: e._r, w: weights(e.weight), italic: /italic|oblique/i.test(e.style || "") });
+    sliced.set(key, list);
+  }
+  for (const u of usages) {
+    const italic = /italic|oblique/i.test(u.style);
+    const codes = new Set;
+    for (const ch of u.text)
+      codes.add(ch.codePointAt(0));
+    for (const fam of u.families) {
+      const list = sliced.get(norm(fam));
+      if (!list)
+        continue;
+      for (const c of codes) {
+        let best = null;
+        let bestScore = Infinity;
+        for (const s of list) {
+          if (!s.r.some((r) => c >= r[0] && c <= r[1]))
+            continue;
+          const dist = u.weight < s.w[0] ? s.w[0] - u.weight : u.weight > s.w[1] ? u.weight - s.w[1] : 0;
+          const score = dist + (s.italic === italic ? 0 : 1e4);
+          if (score < bestScore) {
+            best = s;
+            bestScore = score;
+          }
+        }
+        if (best)
+          out.add(best.e);
+      }
+    }
+  }
+  return entries.filter((e) => out.has(e));
+}
+
+// src/render/font-cache.ts
+var cache = new Map;
+function fontBlobUrl(url, ctx, fetchFont = fetchFontViaBackend) {
+  const hit = cache.get(url);
+  if (hit)
+    return hit;
+  const pending = fetchFont(url, ctx).then(({ body, contentType }) => {
+    const bin = atob(body);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0;i < bin.length; i++)
+      bytes[i] = bin.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: contentType }));
+  });
+  cache.set(url, pending);
+  pending.catch(() => {
+    if (cache.get(url) === pending)
+      cache.delete(url);
+  });
+  return pending;
+}
+function isFontRequest(p) {
+  const r = p;
+  return !!r && r.kind === "font-request" && typeof r.requestId === "string" && typeof r.url === "string" && /^https?:\/\//i.test(r.url);
+}
+function answerFontRequest(frame, req, ctx) {
+  fontBlobUrl(req.url, ctx).then((url) => frame.postMessage({ kind: "font-response", requestId: req.requestId, url }), (err) => frame.postMessage({ kind: "font-response", requestId: req.requestId, error: err instanceof Error ? err.message : String(err) }));
+}
+function fontLoaderShim() {
+  return `<script>(function(){
+var sb=window.spindleSandbox;
+if(!sb||typeof FontFace==='undefined'||!document.fonts)return;
+var select=(${selectFontEntries.toString()});
+var entries=[],seenCfg=new Set(),done={},waiting={},seq=0,timer=0,lastKey='';
+sb.onMessage(function(m){
+  if(!m||m.kind!=='font-response'||!waiting[m.requestId])return;
+  var cb=waiting[m.requestId];delete waiting[m.requestId];cb(m);
+});
+function blobFor(url){
+  return new Promise(function(res,rej){
+    var id='vf'+(++seq);
+    waiting[id]=function(m){m.url?res(m.url):rej(new Error(m.error||'font'));};
+    sb.postMessage({kind:'font-request',requestId:id,url:url});
+  });
+}
+function load(e){
+  if(done[e.url])return;done[e.url]=1;
+  blobFor(e.url).then(function(u){
+    var d={weight:e.weight||'400',style:e.style||'normal',display:e.display||'swap'};
+    if(e.range)d.unicodeRange=e.range;
+    var f=new FontFace(e.family,'url('+u+')',d);
+    document.fonts.add(f);
+    return f.load();
+  }).catch(function(err){console.warn('[vishrun] font failed',e.url,err&&err.message||err);});
+}
+function readConfig(){
+  var list=document.querySelectorAll('script[data-vishrun-fonts]');
+  for(var i=0;i<list.length;i++){
+    if(seenCfg.has(list[i]))continue;seenCfg.add(list[i]);
+    try{entries=entries.concat(JSON.parse(list[i].textContent||'[]'));}catch(e){}
+  }
+}
+function usages(){
+  var byEl=new Map(),w=document.createTreeWalker(document.body||document.documentElement,NodeFilter.SHOW_TEXT),n;
+  while((n=w.nextNode())){
+    var el=n.parentElement,t=n.nodeValue;
+    if(!el||!t||!t.trim()||/^(SCRIPT|STYLE)$/.test(el.tagName))continue;
+    byEl.set(el,(byEl.get(el)||'')+t);
+  }
+  var out=[];
+  byEl.forEach(function(text,el){
+    var cs=getComputedStyle(el);
+    out.push({families:cs.fontFamily.split(','),weight:parseFloat(cs.fontWeight)||400,style:cs.fontStyle,text:text});
+  });
+  return out;
+}
+function scan(){
+  timer=0;readConfig();
+  if(!entries.length)return;
+  var u=usages(),key=entries.length+JSON.stringify(u);
+  if(key===lastKey)return;
+  lastKey=key;
+  select(entries,u).forEach(load);
+}
+function later(){if(!timer)timer=setTimeout(scan,150);}
+function init(){
+  scan();
+  try{new MutationObserver(later).observe(document.documentElement,{childList:true,subtree:true,characterData:true});}catch(e){}
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init,{once:true});else init();
+})();</script>`;
 }
 
 // src/core/widget-environment.ts
@@ -1585,7 +1718,7 @@ function extractScriptBodies(html) {
   }
   return combined;
 }
-var cache = new WeakMap;
+var cache2 = new WeakMap;
 var stringCache = new Map;
 var STRING_CACHE_MAX = 256;
 function classifyWidgetEnvironment(html) {
@@ -2608,7 +2741,7 @@ function widgetNeedsIsolation(html) {
 }
 async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withExternalScripts = await transformHtmlForExternalScripts(withJsrGlobalLibraries(replaceMinHeightVh(html)), ctx);
-  const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
+  const withFonts = await transformHtmlForExternalStylesheets(withExternalScripts, ctx);
   const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
   const stripped = rewriteCssExternalUrls(stripExternalAudioSrc(stripExternalImageSrc(withoutCdnJQuery)));
   const head = buildHeadInjection(iframeCtx);
@@ -2643,7 +2776,7 @@ function buildHeadInjection(iframeCtx) {
     greetings: cardGreetings()
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return viewportVarShim() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return viewportVarShim() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontLoaderShim() + jquery + lodash + thHelpers + mvu;
 }
 function cardGreetings() {
   const card = getActiveCard();
@@ -2977,67 +3110,6 @@ function externalImageProxyHelper() {
 })();
 </script>`;
 }
-function fontFaceHelper() {
-  return `<script>
-(function(){
-  var loadedFontUrls = {};
-
-  function loadOneVishrunFont(entry) {
-    if (!window.spindleSandbox || typeof window.spindleSandbox.fetchFont !== 'function') return;
-    if (!entry || !entry.url || !entry.family) return;
-    if (typeof FontFace === 'undefined' || !document.fonts || typeof document.fonts.add !== 'function') return;
-    var key = entry.url;
-    if (loadedFontUrls[key]) return;
-    loadedFontUrls[key] = true;
-    window.spindleSandbox.fetchFont(entry.url).then(function(resource) {
-      if (!resource || !resource.url) {
-        loadedFontUrls[key] = false;
-        return;
-      }
-      try {
-        var face = new FontFace(entry.family, 'url(' + resource.url + ')', {
-          weight: entry.weight || '400',
-          style: entry.style || 'normal',
-          display: entry.display || 'swap'
-        });
-        return face.load().then(function() { document.fonts.add(face); });
-      } catch (e) {
-        loadedFontUrls[key] = false;
-        console.warn('[vishrun] FontFace construct failed for', entry.url, e);
-      }
-    }).catch(function(err) {
-      loadedFontUrls[key] = false;
-      console.warn('[vishrun] fetchFont failed for', entry.url, err);
-    });
-  }
-
-  function processVishrunFonts() {
-    var scripts = document.querySelectorAll('script[data-vishrun-fonts]');
-    for (var s = 0; s < scripts.length; s++) {
-      var entries;
-      try { entries = JSON.parse(scripts[s].textContent || '[]'); }
-      catch (e) { continue; }
-      if (!entries || typeof entries.length !== 'number') continue;
-      for (var i = 0; i < entries.length; i++) loadOneVishrunFont(entries[i]);
-    }
-  }
-
-  function init() {
-    processVishrunFonts();
-    try {
-      var mo = new MutationObserver(function() { processVishrunFonts(); });
-      mo.observe(document.documentElement || document, { childList: true, subtree: true });
-    } catch (e) {}
-  }
-
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init, { once: true });
-  } else {
-    init();
-  }
-})();
-</script>`;
-}
 function headIntoBody(html) {
   const open = /<head\b[^>]*>/i.exec(html);
   if (!open)
@@ -3078,6 +3150,8 @@ function routeChildMessage(frame, payload, ctx, iframeCtx) {
     handleTriggerSlash(p.payload, ctx);
   } else if (p.kind === "alert") {
     handleHostAlert(p.payload);
+  } else if (isFontRequest(payload)) {
+    answerFontRequest(frame, payload, ctx);
   } else if (isWidgetFetch(payload)) {
     dispatchWidgetFetch(frame, payload, ctx);
   } else if (isThRequest(payload)) {
@@ -3528,19 +3602,19 @@ function linearizeBubble(root) {
     text = text.slice(0, -1);
   return { text, offsetMap };
 }
-var cache2 = new WeakMap;
+var cache3 = new WeakMap;
 function getLinearizedBubble(root) {
   const tc = deepTextContent(root);
   const hash = quickHash(tc);
-  const cached = cache2.get(root);
+  const cached = cache3.get(root);
   if (cached && cached.hash === hash)
     return cached.result;
   const result = linearizeBubble(root);
-  cache2.set(root, { hash, result });
+  cache3.set(root, { hash, result });
   return result;
 }
 function invalidateLinearizedBubble(root) {
-  cache2.delete(root);
+  cache3.delete(root);
 }
 function quickHash(s) {
   let h = 2166136261;
