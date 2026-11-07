@@ -5879,6 +5879,42 @@ function referencesUnknownIds(metadata, blocks) {
   return Object.keys(groups).some((k) => !ids.has(k));
 }
 
+// src/core/st-entry-field.ts
+var displayIndex = (e) => e.extensions?.display_index;
+function resolveStUid(uid, entries, cardBook) {
+  const direct = entries.find((e) => e.id === uid);
+  if (direct)
+    return direct;
+  const src = cardBook.find((e) => String(e.id) === uid);
+  if (!src)
+    return null;
+  const sameComment = entries.filter((e) => (e.comment ?? "") === String(src.comment ?? ""));
+  if (sameComment.length === 1)
+    return sameComment[0];
+  const di = displayIndex(src);
+  return sameComment.find((e) => di !== undefined && displayIndex(e) === di) ?? null;
+}
+var keys = (v) => v.split(",").map((k) => k.trim()).filter(Boolean);
+var bool2 = (v) => ["true", "1", "on", "yes"].includes(v.trim().toLowerCase());
+function entryFieldPatch(field, value) {
+  switch (field) {
+    case "content":
+      return { content: value };
+    case "comment":
+      return { comment: value };
+    case "key":
+      return { key: keys(value) };
+    case "keysecondary":
+      return { keysecondary: keys(value) };
+    case "constant":
+      return { constant: bool2(value) };
+    case "disable":
+      return { disabled: bool2(value) };
+    default:
+      return null;
+  }
+}
+
 // src/backend/preset-scripts.ts
 var CONSENT_PATH = "preset-scripts-consent.json";
 var SWITCHES_PATH = "script-switches.json";
@@ -6207,6 +6243,22 @@ async function handle(op, args, userId) {
       for (const input of records(args.create))
         created.push((await wb().entries.create(bookId, input, userId)).id);
       return { entries: await bookEntries(bookId, userId), created };
+    }
+    case "wb_set_field": {
+      const bookId = await bookIdByName(String(args.file ?? ""), chatId, userId);
+      const patch = entryFieldPatch(String(args.field ?? "content"), String(args.value ?? ""));
+      if (!patch)
+        throw new Error(`setentryfield: field '${String(args.field)}' is not supported`);
+      const characterId = await chatCharacterId(chatId, userId);
+      const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+      const ext = card?.extensions;
+      const cardBook = records(ext?.character_book?.entries);
+      const entries = records(await bookEntries(bookId, userId));
+      const entry = resolveStUid(String(args.uid ?? ""), entries, cardBook);
+      if (!entry)
+        throw new Error(`setentryfield: entry ${String(args.uid)} not found`);
+      await wb().entries.update(entry.id, patch, userId);
+      return true;
     }
     case "regex_rows": {
       const characterId = await chatCharacterId(chatId, userId);

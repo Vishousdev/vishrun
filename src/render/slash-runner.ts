@@ -1,11 +1,42 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { handleClipboardWriteText } from './clipboard-shim';
+import { presetRpc } from '../preset-scripts/rpc';
+import { splitNamedArgs } from '../preset-scripts/dialogs';
+import { unescapeSlashArg } from '../core/st-entry-field';
+
+export type SlashRpc = (op: string, args: Record<string, unknown>) => Promise<unknown>;
+
+const SEVERITIES = new Set(['info', 'success', 'warning', 'error']);
+
+// ST commands Vishrun runs itself. Returns false for any other command.
+export async function runStSlashCommand(name: string, rest: string, chatId: string | null, rpc: SlashRpc): Promise<boolean> {
+  if (name === 'setentryfield') {
+    const { named, text } = splitNamedArgs(rest);
+    await rpc('wb_set_field', {
+      chatId,
+      file: unescapeSlashArg(named.file ?? ''),
+      uid: named.uid ?? '',
+      field: named.field ?? 'content',
+      value: unescapeSlashArg(text),
+    }).catch((e) => console.warn('[vishrun] /setentryfield:', e instanceof Error ? e.message : e));
+    return true;
+  }
+  if (name === 'echo') {
+    const { named, text } = splitNamedArgs(rest);
+    const kind = SEVERITIES.has(named.severity ?? '') ? named.severity : 'info';
+    void rpc('toast', { kind, message: unescapeSlashArg(text) }).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
+const RUNNABLE = new Set(['setentryfield', 'echo']);
 
 // Host side of the in-frame `triggerSlash` shim (JS-Slash-Runner API).
 // Composer and no-op commands are handled here; everything else keeps the
 // previous clipboard path, which already dispatches /setvar-style commands.
 
-const COMPOSER_SELECTOR = '[data-component="InputArea"] textarea';
+export const COMPOSER_SELECTOR = '[data-component="InputArea"] textarea';
 
 export function setComposerText(text: string, doc: Document = document): boolean {
   const ta = doc.querySelector<HTMLTextAreaElement>(COMPOSER_SELECTOR);
@@ -33,7 +64,7 @@ export function clickSend(doc: Document = document, delayMs = 60): Promise<boole
 
 // Splits an STscript pipeline on `|` that starts a new command.
 export function splitPipeline(command: string): string[] {
-  return command.split(/\|(?=\s*\/[A-Za-z])/).map((c) => c.trim()).filter(Boolean);
+  return command.split(/(?<!\\)\|(?=\s*\/[A-Za-z])/).map((c) => c.trim()).filter(Boolean);
 }
 
 export function parseSlash(command: string): { name: string; rest: string } | null {
@@ -48,6 +79,7 @@ export async function handleTriggerSlash(
     setComposer?: (text: string) => boolean;
     send?: () => Promise<boolean>;
     fallback?: typeof handleClipboardWriteText;
+    rpc?: SlashRpc;
   } = {},
 ): Promise<void> {
   const command = payload && typeof payload === 'object'
@@ -68,14 +100,17 @@ export async function handleTriggerSlash(
     return;
   }
 
+  if (steps.length > 0 && steps.every((s) => s && RUNNABLE.has(s.name))) {
+    const rpc = deps.rpc ?? ((op: string, args: Record<string, unknown>) => presetRpc(ctx, op, args));
+    const chatId = ctx.getActiveChat?.().chatId ?? null;
+    for (const s of steps) await runStSlashCommand(s!.name, s!.rest, chatId, rpc);
+    return;
+  }
+
   const parsed = parseSlash(command);
 
   if (parsed && (parsed.name === 'setinput' || parsed.name === 'input')) {
     if (!setComposer(parsed.rest)) console.warn('[vishrun] triggerSlash: composer not found');
-    return;
-  }
-  if (parsed && parsed.name === 'echo') {
-    console.info('[vishrun] /echo', parsed.rest);
     return;
   }
   await (deps.fallback ?? handleClipboardWriteText)({ text: command }, ctx);

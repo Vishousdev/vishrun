@@ -1,5 +1,6 @@
 import { api } from './common';
 import { referencesUnknownIds, type BlockLike } from '../preset-scripts/st-ids';
+import { entryFieldPatch, resolveStUid, type EntryLike } from '../core/st-entry-field';
 
 // Backend side of the script runtime (src/preset-scripts) for preset and
 // character scripts. The frontend has no preset, variable or storage API, so
@@ -390,6 +391,20 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       }
       for (const input of records(args.create)) created.push((await wb().entries.create(bookId, input, userId)).id);
       return { entries: await bookEntries(bookId, userId), created };
+    }
+    case 'wb_set_field': {
+      const bookId = await bookIdByName(String(args.file ?? ''), chatId, userId);
+      const patch = entryFieldPatch(String(args.field ?? 'content'), String(args.value ?? ''));
+      if (!patch) throw new Error(`setentryfield: field '${String(args.field)}' is not supported`);
+      const characterId = await chatCharacterId(chatId, userId);
+      const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+      const ext = (card as { extensions?: { character_book?: { entries?: unknown } } } | null)?.extensions;
+      const cardBook = records(ext?.character_book?.entries);
+      const entries = records(await bookEntries(bookId, userId)) as unknown as EntryLike[];
+      const entry = resolveStUid(String(args.uid ?? ''), entries, cardBook);
+      if (!entry) throw new Error(`setentryfield: entry ${String(args.uid)} not found`);
+      await wb().entries.update(entry.id, patch, userId);
+      return true;
     }
     case 'regex_rows': {
       const characterId = await chatCharacterId(chatId, userId);

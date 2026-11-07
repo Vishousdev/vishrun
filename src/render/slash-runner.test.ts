@@ -19,12 +19,26 @@ test('/setinput goes to the composer, not the fallback', async () => {
   expect(fellBack).toBe(false);
 });
 
-test('/echo is swallowed and unknown commands keep the clipboard path', async () => {
+test('/echo becomes a toast and unknown commands keep the clipboard path', async () => {
   const seen: unknown[] = [];
+  const calls: unknown[] = [];
   const fallback = async (p: unknown) => { seen.push(p); };
-  await handleTriggerSlash({ command: '/echo severity=success hi' }, ctx, { fallback });
-  await handleTriggerSlash({ command: '/setvar key=a 1' }, ctx, { fallback });
+  const rpc = async (op: string, args: Record<string, unknown>) => { calls.push([op, args]); return true; };
+  await handleTriggerSlash({ command: '/echo severity=success hi' }, ctx, { fallback, rpc });
+  await handleTriggerSlash({ command: '/setvar key=a 1' }, ctx, { fallback, rpc });
   expect(seen).toEqual([{ text: '/setvar key=a 1' }]);
+  expect(calls).toEqual([['toast', { kind: 'success', message: 'hi' }]]);
+});
+
+test('/setentryfield with escaped pipes and a toast runs step by step', async () => {
+  const calls: Array<[string, Record<string, unknown>]> = [];
+  const rpc = async (op: string, args: Record<string, unknown>) => { calls.push([op, args]); return true; };
+  const json = '{\n  "name": "A \\| B",\n  "x": "{y\\}"\n}';
+  const cmd = `/setentryfield file="My Book" uid=2 field=content ${json} | /echo severity=success Saved\!`;
+  await handleTriggerSlash({ command: cmd }, ctx, { rpc, fallback: async () => { throw new Error('fallback'); } });
+  expect(calls[0][0]).toBe('wb_set_field');
+  expect(calls[0][1]).toMatchObject({ file: 'My Book', uid: '2', field: 'content', value: '{\n  "name": "A | B",\n  "x": "{y}"\n}' });
+  expect(calls[1]).toEqual(['toast', { kind: 'success', message: 'Saved!' }]);
 });
 
 test('setComposerText writes into the host input textarea', () => {

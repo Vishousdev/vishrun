@@ -1,7 +1,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { presetRpc } from './rpc';
 import { inputDialog, popupDialog, splitNamedArgs } from './dialogs';
-import { clickSend, parseSlash, setComposerText, splitPipeline } from '../render/slash-runner';
+import { clickSend, parseSlash, runStSlashCommand, setComposerText, splitPipeline } from '../render/slash-runner';
 import { getCharacter, getChatMessages as hostChatMessages, updateMessageContent, type HostMessage } from '../lumiverse/host-api';
 import { stIdOf } from './st-ids';
 import { setMvuSchema } from './mvu-schema';
@@ -375,12 +375,12 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
           pipe = await popupDialog(text);
           break;
         }
-        case 'echo':
-          void presetRpc(ctx, 'toast', { kind: 'info', message: rest });
-          pipe = rest;
-          break;
         default:
-          console.warn('[vishrun] preset script: unsupported slash command', parsed.name);
+          if (!(await runStSlashCommand(parsed.name, rest, ctx.getActiveChat().chatId ?? null, (op, args) => presetRpc(ctx, op, args)))) {
+            console.warn('[vishrun] preset script: unsupported slash command', parsed.name);
+          } else if (parsed.name === 'echo') {
+            pipe = splitNamedArgs(rest).text;
+          }
       }
     }
     return pipe;
