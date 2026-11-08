@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { entryFieldPatch, resolveStUid, unescapeSlashArg } from './st-entry-field';
+import { entryFieldPatch, resolveStUid, stUidMap, unescapeSlashArg } from './st-entry-field';
 
 test('STscript escapes are undone', () => {
   expect(unescapeSlashArg('a \\| b')).toBe('a | b');
@@ -31,6 +31,15 @@ test('same comment is told apart by display index', () => {
     { id: 'y', comment: 'Dup', extensions: { display_index: 2 } },
   ];
   expect(resolveStUid('5', entries, [{ id: 5, comment: 'Dup', extensions: { display_index: 2 } }])?.id).toBe('y');
+});
+
+test('every traceable entry gets its card uid', () => {
+  const entries = [
+    { id: 'u-a', comment: 'User Information', extensions: { display_index: 8 } },
+    { id: 'u-new', comment: 'Added later' },
+  ];
+  const book = [{ id: 2, comment: 'User Information', extensions: { display_index: 8 } }, { id: 3, comment: 'Removed' }];
+  expect([...stUidMap(entries, book)]).toEqual([['u-a', 2]]);
 });
 
 test('field names map to host fields', () => {

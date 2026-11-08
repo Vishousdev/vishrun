@@ -5905,6 +5905,17 @@ function resolveStUid(uid, entries, cardBook) {
   const di = displayIndex(src);
   return sameComment.find((e) => di !== undefined && displayIndex(e) === di) ?? null;
 }
+function stUidMap(entries, cardBook) {
+  const out = new Map;
+  for (const src of cardBook) {
+    if (typeof src.id !== "number")
+      continue;
+    const hit = resolveStUid(String(src.id), entries, cardBook);
+    if (hit && !out.has(hit.id))
+      out.set(hit.id, src.id);
+  }
+  return out;
+}
 var keys = (v) => v.split(",").map((k) => k.trim()).filter(Boolean);
 var bool2 = (v) => ["true", "1", "on", "yes"].includes(v.trim().toLowerCase());
 function entryFieldPatch(field, value) {
@@ -6092,6 +6103,15 @@ async function bookIdByName(name, chatId, userId) {
     throw new Error(`Lorebook '${name}' not found`);
   return hit.id;
 }
+async function withStUids(entries, bookId, chatId, userId) {
+  if (!(await characterBookIds(chatId, userId)).includes(bookId))
+    return entries;
+  const characterId = await chatCharacterId(chatId, userId);
+  const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+  const ext = card?.extensions;
+  const map = stUidMap(records(entries), records(ext?.character_book?.entries));
+  return records(entries).map((e) => map.has(String(e.id)) ? { ...e, st_uid: map.get(String(e.id)) } : e);
+}
 async function bookEntries(bookId, userId) {
   const out = [];
   for (let offset = 0;; offset += 200) {
@@ -6237,8 +6257,10 @@ async function handle(op, args, userId) {
     }
     case "wb_all_names":
       return [...new Set((await allBooks(userId)).map((b) => b.name))];
-    case "wb_entries":
-      return bookEntries(await bookIdByName(String(args.name ?? ""), chatId, userId), userId);
+    case "wb_entries": {
+      const bookId = await bookIdByName(String(args.name ?? ""), chatId, userId);
+      return withStUids(await bookEntries(bookId, userId), bookId, chatId, userId);
+    }
     case "wb_apply": {
       const bookId = await bookIdByName(String(args.name ?? ""), chatId, userId);
       const own = new Set((await bookEntries(bookId, userId)).map((e) => e.id));
@@ -6253,7 +6275,7 @@ async function handle(op, args, userId) {
       }
       for (const input of records(args.create))
         created.push((await wb().entries.create(bookId, input, userId)).id);
-      return { entries: await bookEntries(bookId, userId), created };
+      return { entries: await withStUids(await bookEntries(bookId, userId), bookId, chatId, userId), created };
     }
     case "wb_set_field": {
       const bookId = await bookIdByName(String(args.file ?? ""), chatId, userId);

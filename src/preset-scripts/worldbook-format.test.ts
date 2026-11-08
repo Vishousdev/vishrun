@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
-  fromLorebookPatch, fromWorldbookEntry, planReplace, toLorebookEntry, toWorldbookEntry, type HostEntry,
+  fromLorebookPatch, fromWorldbookEntry, hostIdOf, planReplace, toLorebookEntry, toWorldbookEntry, type HostEntry,
 } from './worldbook-format';
 
 const entry = (over: Partial<HostEntry> = {}): HostEntry => ({
@@ -44,6 +44,25 @@ describe('worldbook format', () => {
     expect(plan.create).toHaveLength(1);
     expect(plan.create[0]).toMatchObject({ comment: '手机-格式', position: 4, depth: 4, order_value: 3333, constant: true });
     expect(plan.delete).toEqual(['e2']);
+  });
+});
+
+describe('ST uids', () => {
+  test('entries from the card book show their ST uid and map back', () => {
+    const cur = [entry({ id: 'a', st_uid: 6 }), entry({ id: 'b', st_uid: 7, disabled: true }), entry({ id: 'c' })];
+    const shown = cur.map(toWorldbookEntry) as Array<{ uid: unknown; enabled: boolean }>;
+    expect(shown.map((w) => w.uid)).toEqual([6, 7, 'c']);
+    // The card toggles by ST uid, as in SillyTavern.
+    const next = shown.map((w) => ({ ...w, enabled: w.uid === 7 || w.uid === 'c' }));
+    expect(planReplace(cur, next)).toEqual({
+      create: [], delete: [],
+      update: [{ id: 'a', patch: { disabled: true } }, { id: 'b', patch: { disabled: false } }],
+    });
+    expect(hostIdOf(6, cur)).toBe('a');
+    expect(hostIdOf('6', cur)).toBe('a');
+    expect(hostIdOf('c', cur)).toBe('c');
+    expect(hostIdOf(99, cur)).toBeNull();
+    expect((toLorebookEntry(cur[0], 0) as { uid: unknown }).uid).toBe(6);
   });
 });
 

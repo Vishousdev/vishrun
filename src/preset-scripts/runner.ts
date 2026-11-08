@@ -10,6 +10,8 @@ import { installStandIns } from './st-stand-ins';
 import { isMvuLoader, rewriteMvuZodImport } from './script-imports';
 import { clearMvuSchema } from './mvu-schema';
 import { fetchCdnBundle } from '../core/asset-injector';
+import { cardGreetings, greetingIndex } from '../core/greetings';
+import { getActiveCard } from '../state/active-card';
 import {
   buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshRegexes, refreshVars, refreshWorldbooks, TAVERN_EVENTS,
   type RuntimeState, type ScriptButton,
@@ -41,6 +43,12 @@ export interface CharacterScripts { id: string; name: string; consent: boolean |
 export interface ActiveScripts { preset: PresetScripts | null; character: CharacterScripts | null }
 
 let resyncHook: (() => void) | null = null;
+let scriptEventHook: ((event: string, args: unknown[]) => void) | null = null;
+
+// eventEmit from a widget reaches the running scripts, as in JS-Slash-Runner.
+export function emitScriptEvent(event: string, args: unknown[]): void {
+  scriptEventHook?.(event, args);
+}
 
 // Re-reads switches and restarts scripts, after a change on the settings page.
 export function resyncScripts(): void {
@@ -395,6 +403,18 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     forward('MESSAGE_EDITED', TAVERN_EVENTS.MESSAGE_UPDATED, false),
     forward('MESSAGE_DELETED', TAVERN_EVENTS.MESSAGE_DELETED, true),
     forward('MESSAGE_SWIPED', TAVERN_EVENTS.MESSAGE_SWIPED, true),
+    // SillyTavern swipes message 0 to change greetings; Lumiverse rewrites it.
+    ctx.events.on('MESSAGE_EDITED', (payload) => {
+      if (!running || (payload as { message?: { index_in_chat?: number } } | null)?.message?.index_in_chat !== 0) return;
+      const st = running.state;
+      const greetings = cardGreetings(getActiveCard());
+      if (greetings.length < 2) return;
+      const before = greetingIndex(st.messages[0]?.content, greetings);
+      void refreshMessages(st).then(() => {
+        const after = greetingIndex(st.messages[0]?.content, greetings);
+        if (after !== before && after !== -1) emit(st, TAVERN_EVENTS.MESSAGE_SWIPED, 0);
+      });
+    }),
     forward('GENERATION_ENDED', TAVERN_EVENTS.MESSAGE_RECEIVED, true),
     forward('GENERATION_STARTED', TAVERN_EVENTS.GENERATION_STARTED, false),
     forward('GENERATION_ENDED', TAVERN_EVENTS.GENERATION_ENDED, false),
@@ -421,9 +441,11 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     stop();
     sync();
   };
+  scriptEventHook = (event, args) => { if (running) emit(running.state, event, ...args); };
   sync();
   return () => {
     resyncHook = null;
+    scriptEventHook = null;
     for (const u of unsubs) u();
     stop();
   };

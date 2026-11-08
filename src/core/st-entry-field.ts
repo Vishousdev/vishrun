@@ -33,6 +33,18 @@ export function resolveStUid(uid: string, entries: EntryLike[], cardBook: CardBo
   return sameComment.find((e) => di !== undefined && displayIndex(e) === di) ?? null;
 }
 
+// Lumiverse entry id -> the card's ST uid, for entries still traceable to the
+// card's embedded book.
+export function stUidMap(entries: EntryLike[], cardBook: CardBookEntry[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const src of cardBook) {
+    if (typeof src.id !== 'number') continue;
+    const hit = resolveStUid(String(src.id), entries, cardBook);
+    if (hit && !out.has(hit.id)) out.set(hit.id, src.id);
+  }
+  return out;
+}
+
 const keys = (v: string) => v.split(',').map((k) => k.trim()).filter(Boolean);
 const bool = (v: string) => ['true', '1', 'on', 'yes'].includes(v.trim().toLowerCase());
 
