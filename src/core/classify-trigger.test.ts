@@ -19,6 +19,12 @@ test('lone non-HTML tags classify as strippedTag', () => {
   expect(classifyTrigger(/【開場白】/)).toBe('placeholder');
 });
 
+test('HTML comment triggers classify as strippedTag', () => {
+  expect(classifyTrigger(/<!--\s*title:[\s\S]*?-->[\s\S]*?<!--\s*desc:[\s\S]*?-->/i)).toBe('strippedTag');
+  expect(classifyTrigger(/<!-- status -->/)).toBe('strippedTag');
+  expect(classifyTrigger(/<div><!-- x --><\/div>/)).not.toBe('strippedTag');
+});
+
 test('paired tag with single capture classifies as pairedTag', () => {
   expect(classifyTrigger(/<status_top>([\s\S]*?)<\/status_top>/)).toBe('pairedTag');
 });

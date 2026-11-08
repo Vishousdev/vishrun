@@ -277,7 +277,11 @@ const HTML_TAGS = new Set((
 // message text instead of the DOM.
 const OPEN_TAG_RE = /^\s*<([A-Za-z][A-Za-z0-9-]*)((?:\s+[A-Za-z_:][\w.:-]*(?:\s*=\s*(?:"[\s\S]*?"|'[\s\S]*?'|[^\s"'=<>`]+))?)*)\s*\/?>\s*$/;
 
+// HTML comments are dropped before render too.
+const COMMENT_START_RE = /^\s*(?:\^\s*)?<!--/;
+
 export function isStrippedTag(re: RegExp): boolean {
+  if (COMMENT_START_RE.test(re.source.replace(/\\([^A-Za-z0-9])/g, '$1'))) return true;
   const src = re.source.replace(/\\s[*+?]/g, ' ').replace(/\\([^A-Za-z0-9])/g, '$1');
   if (src.includes('</')) return false;
   const m = OPEN_TAG_RE.exec(src);

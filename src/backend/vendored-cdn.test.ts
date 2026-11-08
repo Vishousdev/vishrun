@@ -14,6 +14,9 @@ test('card CDN URLs map to the bundled libraries', () => {
   expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.0/babel.min.js')).toBe('babel');
   expect(vendoredIdFor('https://unpkg.com/vue@3/dist/vue.global.js')).toBe('vue');
   expect(vendoredIdFor('https://cdnjs.cloudflare.com/ajax/libs/vue/3.4.21/vue.global.prod.min.js')).toBe('vue');
+  expect(vendoredIdFor('https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js')).toBe('vue-router');
+  expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/vue-router/dist/vue-router.global.prod.min.js')).toBe('vue-router');
+  expect(vendoredIdFor('https://cdnjs.cloudflare.com/ajax/libs/vue-router/4.5.0/vue-router.global.prod.min.js')).toBe('vue-router');
   expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/emoji-picker-element@^1/index.js')).toBe('emoji-picker-element');
   expect(vendoredIdFor('https://unpkg.com/emoji-picker-element@1.21.0/index.js')).toBe('emoji-picker-element');
 });
@@ -22,6 +25,7 @@ test('other versions and hosts are not served', () => {
   expect(vendoredIdFor('https://unpkg.com/react@16/umd/react.production.min.js')).toBeNull();
   expect(vendoredIdFor('https://unpkg.com/@arco-design/web-react@1/dist/arco.min.js')).toBeNull();
   expect(vendoredIdFor('https://unpkg.com/vue@2/dist/vue.js')).toBeNull();
+  expect(vendoredIdFor('https://unpkg.com/vue-router@3/dist/vue-router.js')).toBeNull();
   expect(vendoredIdFor('https://cdn.jsdelivr.net/npm/emoji-picker-element@2/index.js')).toBeNull();
   expect(vendoredIdFor('https://cdn.tailwindcss.com.evil.com/')).toBeNull();
 });

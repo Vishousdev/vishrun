@@ -12,6 +12,7 @@ import { getChatCharacterId, setHostContext } from './lumiverse/host-api';
 import { installPresetScripts } from './preset-scripts/runner';
 import { installHtmlCodeblocks } from './hooks/html-codeblocks';
 import { installSettingsPanel } from './settings/panel';
+import { installComposerAlias } from './render/st-composer-alias';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -47,6 +48,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const disposePresetScripts = installPresetScripts(ctx);
   const disposeHtmlCodeblocks = installHtmlCodeblocks(ctx);
   const disposeSettingsPanel = installSettingsPanel(ctx);
+  const disposeComposerAlias = installComposerAlias();
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -223,6 +225,7 @@ export function setup(ctx: SpindleFrontendContext) {
     disposePresetScripts();
     disposeHtmlCodeblocks();
     disposeSettingsPanel();
+    disposeComposerAlias();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

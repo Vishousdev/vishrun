@@ -16,6 +16,7 @@ stored with a `.txt` extension so they bundle as text.
 | zod-3.25.76-v4.min.js.txt | zod (`zod/v4` bundled as an IIFE setting `z`, for preset scripts) | 3.25.76 | MIT |
 | babel-standalone-7.26.10.min.js.txt | @babel/standalone (babel.min.js) | 7.26.10 | MIT |
 | vue-3.5.13.global.prod.js.txt | vue (dist/vue.global.prod.js) | 3.5.13 | MIT |
+| vue-router-4.6.4.global.prod.js.txt | vue-router (dist/vue-router.global.prod.js) | 4.6.4 | MIT |
 | emoji-picker-element-1.26.3.bundle.js.txt | emoji-picker-element + emoji-picker-element-data (en/emojibase) | 1.26.3 / 1.7.0 | Apache-2.0 |
 
 Tailwind: cdn.tailwindcss.com serves the v3 Play CDN, which is not published to

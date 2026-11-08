@@ -13,6 +13,8 @@ interface FetchExternalRequest {
   type: 'fetch_external';
   requestId: string;
   url: string;
+  /** Font files come back base64-encoded, checked by the host's font proxy. */
+  media?: 'font';
 }
 
 function isFetchExternalRequest(p: unknown): p is FetchExternalRequest {
@@ -38,6 +40,22 @@ export function installFetchExternalHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isFetchExternalRequest(payload)) return;
     const { requestId, url } = payload;
+    if (payload.media === 'font') {
+      api.cors(url, { responseType: 'arraybuffer', mediaType: 'font' } as unknown as RequestInitDTO).then(
+        (result) => {
+          const r = (result ?? {}) as { body?: unknown; headers?: Record<string, string> };
+          const contentType = String(r.headers?.['content-type'] ?? 'font/woff2').split(';')[0].trim();
+          api.sendToFrontend({ type: 'fetch_external_response', requestId, ok: true, body: String(r.body ?? ''), contentType }, userId);
+        },
+        (err: unknown) => {
+          api.sendToFrontend(
+            { type: 'fetch_external_response', requestId, ok: false, error: err instanceof Error ? err.message : String(err) },
+            userId,
+          );
+        },
+      );
+      return;
+    }
     const vendored = vendoredBodyFor(url);
     if (vendored !== null) {
       api.sendToFrontend({ type: 'fetch_external_response', requestId, ok: true, body: vendored }, userId);

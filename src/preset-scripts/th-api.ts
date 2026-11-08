@@ -1,16 +1,18 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { presetRpc } from './rpc';
 import { inputDialog, popupDialog, splitNamedArgs } from './dialogs';
-import { clickSend, parseSlash, setComposerText, splitPipeline } from '../render/slash-runner';
+import { clickSend, parseSlash, runStSlashCommand, setComposerText, splitPipeline } from '../render/slash-runner';
 import { getCharacter, getChatMessages as hostChatMessages, updateMessageContent, type HostMessage } from '../lumiverse/host-api';
 import { stIdOf } from './st-ids';
 import { setMvuSchema } from './mvu-schema';
 import {
-  fromLorebookPatch, fromWorldbookEntry, planReplace, toLorebookEntry, toWorldbookEntry,
+  fromLorebookPatch, fromWorldbookEntry, hostIdOf, planReplace, toLorebookEntry, toWorldbookEntry,
   type ApplyPlan, type HostEntry,
 } from './worldbook-format';
 import { planRegexReplace, toTavernRegex, type HostRegexRow } from './regex-format';
 import { resolveMacrosBatch } from '../core/macro-resolver';
+import { cardGreetings, greetingIndex } from '../core/greetings';
+import { getActiveCard } from '../state/active-card';
 
 // JS-Slash-Runner globals for preset and character scripts. Sync getters (getVariables,
 // getPreset, getLastMessageId) read caches that the runtime keeps fresh.
@@ -313,13 +315,22 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
   const getChatMessages = (range?: unknown, opt?: unknown) => {
     const [a, b] = resolveRange(range);
     const role = isPlainObject(opt) && typeof opt.role === 'string' ? opt.role : 'all';
+    const withSwipes = isPlainObject(opt) && (opt.include_swipes === true || opt.include_swipe === true);
+    const greetings = cardGreetings(getActiveCard());
     const out = [];
     for (let i = a; i <= b && i < state.messages.length; i++) {
       const m = state.messages[i];
       if (!m) continue;
       const r = m.is_user ? 'user' : m.role === 'system' ? 'system' : 'assistant';
       if (role !== 'all' && role !== r) continue;
-      out.push({ message_id: i, name: m.name ?? '', role: r, is_hidden: m.hidden === true, message: m.content, data: {}, extra: {} });
+      const row: Record<string, unknown> = { message_id: i, name: m.name ?? '', role: r, is_hidden: m.hidden === true, message: m.content, data: {}, extra: {} };
+      if (withSwipes) {
+        const greeting = i === 0 && !m.is_user && greetings.length > 1;
+        row.swipe_id = greeting ? greetingIndex(m.content, greetings) : 0;
+        row.swipes = greeting ? [...greetings] : [m.content];
+        row.swipes_data = (row.swipes as string[]).map(() => ({}));
+      }
+      out.push(row);
     }
     return clone(out);
   };
@@ -375,12 +386,12 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
           pipe = await popupDialog(text);
           break;
         }
-        case 'echo':
-          void presetRpc(ctx, 'toast', { kind: 'info', message: rest });
-          pipe = rest;
-          break;
         default:
-          console.warn('[vishrun] preset script: unsupported slash command', parsed.name);
+          if (!(await runStSlashCommand(parsed.name, rest, ctx.getActiveChat().chatId ?? null, (op, args) => presetRpc(ctx, op, args)))) {
+            console.warn('[vishrun] preset script: unsupported slash command', parsed.name);
+          } else if (parsed.name === 'echo') {
+            pipe = splitNamedArgs(rest).text;
+          }
       }
     }
     return pipe;
@@ -482,10 +493,10 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
     },
     getLorebookEntries: async (name: unknown) => clone((await entriesOf(name)).map(toLorebookEntry)),
     setLorebookEntries: async (name: unknown, entries: unknown) => {
-      const ids = new Set((await entriesOf(name)).map((e) => e.id));
+      const cur = await entriesOf(name);
       const update = list(entries)
-        .filter((e): e is Record<string, unknown> => isPlainObject(e) && ids.has(String(e.uid)))
-        .map((e) => ({ id: String(e.uid), patch: fromLorebookPatch(e) }));
+        .filter((e): e is Record<string, unknown> => isPlainObject(e) && hostIdOf(e.uid, cur) !== null)
+        .map((e) => ({ id: hostIdOf(e.uid, cur) as string, patch: fromLorebookPatch(e) }));
       const r = await applyTo(name, { update });
       return clone(r.entries.map(toLorebookEntry));
     },
@@ -494,8 +505,8 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
       return clone({ entries: r.entries.map(toLorebookEntry), new_uids: r.created });
     },
     deleteLorebookEntries: async (name: unknown, uids: unknown) => {
-      const want = new Set(list(uids).map(String));
-      const gone = (await entriesOf(name)).filter((e) => want.has(e.id)).map((e) => e.id);
+      const cur = await entriesOf(name);
+      const gone = list(uids).map((u) => hostIdOf(u, cur)).filter((id): id is string => id !== null);
       const r = await applyTo(name, { delete: gone });
       return clone({ entries: r.entries.map(toLorebookEntry), delete_occurred: gone.length > 0 });
     },

@@ -8,6 +8,7 @@ function makeCtx(overrides: Partial<MessageContentProcessorCtxDTO> & { content: 
     chatId: 'chat-1',
     userId: 'user-1',
     origin: 'create',
+    isUser: false,
     ...overrides,
   };
 }

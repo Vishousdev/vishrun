@@ -1,201 +1,178 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { fetchViaBackend } from './asset-injector';
 
-// Cards declare Google Fonts two ways: `<link href="...googleapis...">` and
-// `@import url('...googleapis...')` inside a <style>. Sandbox CSP blocks both
-// (style-src 'unsafe-inline' only). We pre-fetch the googleapis CSS via the
-// backend cors_proxy, parse each @font-face into a JSON entry, and emit an
-// inert <script type="application/vishrun-font-config" data-vishrun-fonts>.
-// The sandbox-side resolver reads the JSON, calls spindleSandbox.fetchFont(url)
-// per entry, and registers a FontFace against document.fonts. Browser never
-// sees a remote @font-face. The @import path also strips the import from the
-// <style> so the cssproxy doesn't try to fetch it as an image.
+// External stylesheets in widgets (`<link rel="stylesheet">`, `@import`): the
+// frame CSP allows inline styles only, so the backend fetches the CSS, nested
+// imports and relative URLs are resolved, plain rules are inlined, and each
+// @font-face becomes an entry the frame loads through the font proxy when its
+// text needs it.
 
 export interface VishrunFontEntry {
   family: string;
+  url: string;
   weight?: string;
   style?: string;
   display?: string;
-  url: string;
+  range?: string;
 }
 
-const FONT_LINK_RE =
-  /<link\b[^>]*\bhref\s*=\s*["'](https?:\/\/fonts\.googleapis\.com\/[^"']+)["'][^>]*>/gi;
+export interface FetchedSheet {
+  css: string;
+  fonts: VishrunFontEntry[];
+}
 
-const FONT_STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
-const FONT_IMPORT_RE =
-  /@import\s+url\(\s*(['"]?)(https?:\/\/fonts\.googleapis\.com\/[^'")\s]+)\1\s*\)\s*;?/gi;
+const MAX_DEPTH = 3;
+const LINK_RE = /<link\b[^>]*>/gi;
+const STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+const IMPORT_RE = /@import\s+(?:url\(\s*(['"]?)([^'")]+)\1\s*\)|(['"])([^'"]+)\3)[^;]*;?/gi;
+const FONT_FACE_RE = /@font-face\s*\{([^}]*)\}/gi;
+const CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
 
-const FONT_FACE_BLOCK_RE = /@font-face\s*\{([^}]+)\}/gi;
-const FONT_FACE_URL_RE = /src\s*:[^;]*url\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)/i;
-const FONT_FACE_FAMILY_RE = /font-family\s*:\s*['"]?([^;'"]+?)['"]?\s*;/i;
-const FONT_FACE_WEIGHT_RE = /font-weight\s*:\s*([^;]+?)\s*;/i;
-const FONT_FACE_STYLE_RE = /font-style\s*:\s*([^;]+?)\s*;/i;
-const FONT_FACE_DISPLAY_RE = /font-display\s*:\s*([^;]+?)\s*;/i;
+const attr = (tag: string, name: string) =>
+  new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i').exec(tag)?.slice(1).find((v) => v !== undefined);
 
-const fontEntriesCache = new Map<string, Promise<VishrunFontEntry[]>>();
+const decodeEntities = (s: string) =>
+  s.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
-export function parseFontFaceRules(css: string): VishrunFontEntry[] {
-  if (css.indexOf('@font-face') === -1) return [];
+function absolute(url: string, base: string): string | null {
+  if (/^(?:data|blob):/i.test(url)) return url;
+  try {
+    const u = new URL(url, base);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+const descriptor = (body: string, name: string) =>
+  new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`, 'i').exec(body)?.[1].trim();
+
+// woff2 first, then any other format the browser accepts.
+function fontSource(src: string, base: string): string | null {
+  const urls: Array<{ url: string; woff2: boolean }> = [];
+  for (const part of src.split(/,(?![^()]*\))/)) {
+    const m = /url\(\s*(['"]?)([^'")]+)\1\s*\)/i.exec(part);
+    if (!m) continue;
+    const url = absolute(m[2].trim(), base);
+    if (url) urls.push({ url, woff2: /woff2/i.test(part) });
+  }
+  return (urls.find((u) => u.woff2) ?? urls[0])?.url ?? null;
+}
+
+export function parseFontFaces(css: string, base: string): VishrunFontEntry[] {
   const out: VishrunFontEntry[] = [];
-  FONT_FACE_BLOCK_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = FONT_FACE_BLOCK_RE.exec(css)) !== null) {
+  for (const m of css.matchAll(FONT_FACE_RE)) {
     const body = m[1];
-    const urlMatch = body.match(FONT_FACE_URL_RE);
-    const familyMatch = body.match(FONT_FACE_FAMILY_RE);
-    if (!urlMatch || !familyMatch) continue;
-    const entry: VishrunFontEntry = {
-      family: familyMatch[1].trim(),
-      url: urlMatch[1],
-    };
-    const w = body.match(FONT_FACE_WEIGHT_RE);
-    const s = body.match(FONT_FACE_STYLE_RE);
-    const d = body.match(FONT_FACE_DISPLAY_RE);
-    if (w) entry.weight = w[1].trim();
-    if (s) entry.style = s[1].trim();
-    if (d) entry.display = d[1].trim();
+    const family = descriptor(body, 'font-family')?.replace(/^['"]|['"]$/g, '').trim();
+    const src = descriptor(body, 'src');
+    const url = src ? fontSource(src, base) : null;
+    if (!family || !url || !/^https?:/i.test(url)) continue;
+    const entry: VishrunFontEntry = { family, url };
+    const weight = descriptor(body, 'font-weight');
+    const style = descriptor(body, 'font-style');
+    const display = descriptor(body, 'font-display');
+    const range = descriptor(body, 'unicode-range');
+    if (weight) entry.weight = weight;
+    if (style) entry.style = style;
+    if (display) entry.display = display;
+    if (range) entry.range = range;
     out.push(entry);
   }
   return out;
 }
 
-export function extractGoogleFontsLinks(html: string): Array<{ fullTag: string; url: string }> {
-  if (html.indexOf('fonts.googleapis.com') === -1) return [];
-  const out: Array<{ fullTag: string; url: string }> = [];
-  const seen = new Set<string>();
-  FONT_LINK_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = FONT_LINK_RE.exec(html)) !== null) {
-    const fullTag = m[0];
-    const url = decodeHtmlEntities(m[1]);
-    if (!seen.has(fullTag)) {
-      seen.add(fullTag);
-      out.push({ fullTag, url });
-    }
-  }
-  return out;
+// Plain rules with absolute url()s, so later steps can proxy their images.
+function plainRules(css: string, base: string): string {
+  return css
+    .replace(FONT_FACE_RE, '')
+    .replace(IMPORT_RE, '')
+    .replace(CSS_URL_RE, (all, q: string, u: string) => {
+      const abs = absolute(u.trim(), base);
+      return abs ? `url(${q}${abs}${q})` : all;
+    })
+    .replace(/<\/style/gi, '<\\/style');
 }
 
-export interface FontImportMatch {
-  fullStyleBlock: string;
-  imports: Array<{ raw: string; url: string }>;
-}
+type TextFetch = (url: string) => Promise<string>;
 
-export function extractGoogleFontsImports(html: string): FontImportMatch[] {
-  if (html.indexOf('fonts.googleapis.com') === -1) return [];
-  if (html.indexOf('@import') === -1) return [];
-  const out: FontImportMatch[] = [];
-  const seenBlocks = new Set<string>();
-  FONT_STYLE_BLOCK_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = FONT_STYLE_BLOCK_RE.exec(html)) !== null) {
-    const fullStyleBlock = m[0];
-    const cssContent = m[1];
-    if (cssContent.indexOf('@import') === -1) continue;
-    if (cssContent.indexOf('fonts.googleapis.com') === -1) continue;
-    if (seenBlocks.has(fullStyleBlock)) continue;
-    seenBlocks.add(fullStyleBlock);
-    const imports: Array<{ raw: string; url: string }> = [];
-    FONT_IMPORT_RE.lastIndex = 0;
-    let im: RegExpExecArray | null;
-    while ((im = FONT_IMPORT_RE.exec(cssContent)) !== null) {
-      imports.push({ raw: im[0], url: im[2] });
-    }
-    if (imports.length > 0) out.push({ fullStyleBlock, imports });
-  }
-  return out;
-}
+const sheetCache = new Map<string, Promise<FetchedSheet>>();
 
-// Cards serialize URLs in HTML attributes with `&amp;`. CSS inside <style> is
-// not HTML-decoded, so @import URLs come through with raw `&` already.
-function decodeHtmlEntities(s: string): string {
-  return s
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'");
-}
-
-function getFontEntries(url: string, ctx: SpindleFrontendContext): Promise<VishrunFontEntry[]> {
-  const cached = fontEntriesCache.get(url);
+export function fetchSheet(url: string, fetchText: TextFetch, depth = 0): Promise<FetchedSheet> {
+  const cached = sheetCache.get(url);
   if (cached) return cached;
-  const pending = (async () => {
-    const raw = await fetchViaBackend(url, ctx);
-    return parseFontFaceRules(raw);
+  const pending = (async (): Promise<FetchedSheet> => {
+    const css = await fetchText(url);
+    const children = depth < MAX_DEPTH
+      ? [...css.matchAll(IMPORT_RE)].map((m) => absolute((m[2] ?? m[4]).trim(), url)).filter((u): u is string => !!u)
+      : [];
+    // Fetched together, kept in import order.
+    const parts = await Promise.all(children.map((c) => fetchSheet(c, fetchText, depth + 1).catch(() => ({ css: '', fonts: [] }))));
+    return {
+      css: parts.map((p) => p.css).join('\n') + plainRules(css, url),
+      fonts: parts.flatMap((p) => p.fonts).concat(parseFontFaces(css, url)),
+    };
   })();
-  fontEntriesCache.set(url, pending);
+  sheetCache.set(url, pending);
   pending.catch(() => {
-    if (fontEntriesCache.get(url) === pending) fontEntriesCache.delete(url);
+    if (sheetCache.get(url) === pending) sheetCache.delete(url);
   });
   return pending;
 }
 
-// `</` inside the JSON payload could close the wrapper <script> early.
-function htmlSafeJsonStringify(value: unknown): string {
-  return JSON.stringify(value).replace(/</g, '\\u003c');
-}
+const htmlSafeJson = (v: unknown) => JSON.stringify(v).replace(/</g, '\\u003c');
 
-function buildFontConfigScript(entries: VishrunFontEntry[]): string {
-  return `<script type="application/vishrun-font-config" data-vishrun-fonts>${htmlSafeJsonStringify(entries)}</script>`;
-}
+const fontScript = (fonts: VishrunFontEntry[]) =>
+  fonts.length ? `<script type="application/vishrun-font-config" data-vishrun-fonts>${htmlSafeJson(fonts)}</script>` : '';
 
-export async function transformHtmlForGoogleFonts(
-  html: string,
-  ctx: SpindleFrontendContext,
-): Promise<string> {
-  const links = extractGoogleFontsLinks(html);
-  const importBlocks = extractGoogleFontsImports(html);
-  if (links.length === 0 && importBlocks.length === 0) return html;
+const inlined = (sheet: FetchedSheet) =>
+  fontScript(sheet.fonts) + (sheet.css.trim() ? `<style>${sheet.css}</style>` : '');
 
-  const allUrls = new Set<string>();
-  for (const l of links) allUrls.add(l.url);
-  for (const ib of importBlocks) for (const im of ib.imports) allUrls.add(im.url);
+// Widgets have no base URL, so only absolute http(s) sheets can be fetched.
+const external = (u: string) => (/^https?:\/\//i.test(u) ? u : null);
 
-  const entriesByUrl = new Map<string, VishrunFontEntry[]>();
-  const failed = new Set<string>();
-  await Promise.all(
-    Array.from(allUrls).map(async (u) => {
-      try {
-        entriesByUrl.set(u, await getFontEntries(u, ctx));
-      } catch (err) {
-        failed.add(u);
-        console.warn(
-          '[vishrun] Google Fonts fetch failed:',
-          u,
-          err instanceof Error ? err.message : String(err),
-        );
-      }
-    }),
-  );
+const isStylesheetLink = (tag: string) => /\bstylesheet\b/i.test(attr(tag, 'rel') ?? '');
+
+export async function transformHtmlForStylesheets(html: string, fetchText: TextFetch): Promise<string> {
+  if (!/<link\b|@import/i.test(html)) return html;
+  const load = (url: string) =>
+    fetchSheet(url, fetchText).catch((err) => {
+      console.warn('[vishrun] stylesheet fetch failed:', url, err instanceof Error ? err.message : String(err));
+      return null;
+    });
 
   let out = html;
-
-  for (const l of links) {
-    if (failed.has(l.url)) continue;
-    const entries = entriesByUrl.get(l.url) ?? [];
-    const replacement = entries.length === 0 ? '' : buildFontConfigScript(entries);
-    out = out.split(l.fullTag).join(replacement);
+  for (const tag of new Set(html.match(LINK_RE) ?? [])) {
+    if (!isStylesheetLink(tag)) continue;
+    const href = attr(tag, 'href');
+    const url = href ? external(decodeEntities(href.trim())) : null;
+    if (!url) continue;
+    const sheet = await load(url);
+    if (sheet) out = out.split(tag).join(inlined(sheet));
   }
 
-  for (const ib of importBlocks) {
-    let stripped = ib.fullStyleBlock;
-    const scripts: string[] = [];
-    for (const imp of ib.imports) {
-      if (failed.has(imp.url)) continue;
-      stripped = stripped.split(imp.raw).join('');
-      const entries = entriesByUrl.get(imp.url) ?? [];
-      if (entries.length > 0) scripts.push(buildFontConfigScript(entries));
+  const blocks = [...out.matchAll(STYLE_BLOCK_RE)].filter((m) => m[1].includes('@import'));
+  for (const block of new Set(blocks.map((m) => m[0]))) {
+    let changed = block;
+    const fonts: string[] = [];
+    for (const m of block.matchAll(IMPORT_RE)) {
+      const url = external((m[2] ?? m[4]).trim());
+      if (!url) continue;
+      const sheet = await load(url);
+      if (!sheet) continue;
+      // Rules replace the import in place; fonts go before the block.
+      changed = changed.split(m[0]).join(sheet.css);
+      fonts.push(fontScript(sheet.fonts));
     }
-    if (stripped === ib.fullStyleBlock && scripts.length === 0) continue;
-    out = out.split(ib.fullStyleBlock).join(scripts.join('') + stripped);
+    if (changed !== block) out = out.split(block).join(fonts.join('') + changed);
   }
-
   return out;
+}
+
+export function transformHtmlForExternalStylesheets(html: string, ctx: SpindleFrontendContext): Promise<string> {
+  return transformHtmlForStylesheets(html, (url) => fetchViaBackend(url, ctx));
 }
 
 // Test-only.
 export function __resetFontCacheForTests(): void {
-  fontEntriesCache.clear();
+  sheetCache.clear();
 }

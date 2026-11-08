@@ -1,5 +1,6 @@
 import { api } from './common';
 import { referencesUnknownIds, type BlockLike } from '../preset-scripts/st-ids';
+import { entryFieldPatch, resolveStUid, stUidMap, type EntryLike } from '../core/st-entry-field';
 
 // Backend side of the script runtime (src/preset-scripts) for preset and
 // character scripts. The frontend has no preset, variable or storage API, so
@@ -223,6 +224,17 @@ async function bookIdByName(name: string, chatId: string | null, userId: string)
   return hit.id;
 }
 
+// Cards refer to entries by ST uid; Lumiverse's import gave them new ids. For
+// the chat character's own books, tag entries with the uid from the card.
+async function withStUids(entries: unknown[], bookId: string, chatId: string | null, userId: string): Promise<unknown[]> {
+  if (!(await characterBookIds(chatId, userId)).includes(bookId)) return entries;
+  const characterId = await chatCharacterId(chatId, userId);
+  const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+  const ext = (card as { extensions?: { character_book?: { entries?: unknown } } } | null)?.extensions;
+  const map = stUidMap(records(entries) as unknown as EntryLike[], records(ext?.character_book?.entries));
+  return records(entries).map((e) => (map.has(String(e.id)) ? { ...e, st_uid: map.get(String(e.id)) } : e));
+}
+
 async function bookEntries(bookId: string, userId: string): Promise<unknown[]> {
   const out: unknown[] = [];
   for (let offset = 0; ; offset += 200) {
@@ -375,8 +387,10 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
     }
     case 'wb_all_names':
       return [...new Set((await allBooks(userId)).map((b) => b.name))];
-    case 'wb_entries':
-      return bookEntries(await bookIdByName(String(args.name ?? ''), chatId, userId), userId);
+    case 'wb_entries': {
+      const bookId = await bookIdByName(String(args.name ?? ''), chatId, userId);
+      return withStUids(await bookEntries(bookId, userId), bookId, chatId, userId);
+    }
     case 'wb_apply': {
       const bookId = await bookIdByName(String(args.name ?? ''), chatId, userId);
       // Only entries of this book, whatever ids the script passes.
@@ -389,7 +403,21 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
         if (own.has(u.id) && u.patch && typeof u.patch === 'object') await wb().entries.update(String(u.id), u.patch as Record<string, unknown>, userId);
       }
       for (const input of records(args.create)) created.push((await wb().entries.create(bookId, input, userId)).id);
-      return { entries: await bookEntries(bookId, userId), created };
+      return { entries: await withStUids(await bookEntries(bookId, userId), bookId, chatId, userId), created };
+    }
+    case 'wb_set_field': {
+      const bookId = await bookIdByName(String(args.file ?? ''), chatId, userId);
+      const patch = entryFieldPatch(String(args.field ?? 'content'), String(args.value ?? ''));
+      if (!patch) throw new Error(`setentryfield: field '${String(args.field)}' is not supported`);
+      const characterId = await chatCharacterId(chatId, userId);
+      const card = characterId ? await api.characters.get(characterId, userId).catch(() => null) : null;
+      const ext = (card as { extensions?: { character_book?: { entries?: unknown } } } | null)?.extensions;
+      const cardBook = records(ext?.character_book?.entries);
+      const entries = records(await bookEntries(bookId, userId)) as unknown as EntryLike[];
+      const entry = resolveStUid(String(args.uid ?? ''), entries, cardBook);
+      if (!entry) throw new Error(`setentryfield: entry ${String(args.uid)} not found`);
+      await wb().entries.update(entry.id, patch, userId);
+      return true;
     }
     case 'regex_rows': {
       const characterId = await chatCharacterId(chatId, userId);

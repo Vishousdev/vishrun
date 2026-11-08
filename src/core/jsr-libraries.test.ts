@@ -14,3 +14,12 @@ test('jsr libraries: left alone when Vue is loaded or not used', () => {
   expect(withJsrGlobalLibraries(loaded)).toBe(loaded);
   expect(withJsrGlobalLibraries('<div class="vue-card">a</div>')).toBe('<div class="vue-card">a</div>');
 });
+
+test('jsr libraries: widgets using global VueRouter get Vue and VueRouter', () => {
+  const out = withJsrGlobalLibraries('<script>VueRouter.createRouter({})</script>');
+  expect(out.indexOf('vue.global.prod.js')).toBeLessThan(out.indexOf('vue-router.global.prod.js'));
+  expect(vendoredIdFor('https://unpkg.com/vue-router@4/dist/vue-router.global.prod.js')).toBe('vue-router');
+  const loaded = '<script src="https://unpkg.com/vue@3/dist/vue.global.js"></script><script src="https://unpkg.com/vue-router@4/dist/vue-router.global.js"></script><script>VueRouter.createRouter({})</script>';
+  expect(withJsrGlobalLibraries(loaded)).toBe(loaded);
+  expect(withJsrGlobalLibraries('<script>Vue.createApp({})</script>')).not.toContain('vue-router');
+});

@@ -1,11 +1,14 @@
 // Lumiverse lorebook entries <-> JS-Slash-Runner's two entry formats: the
 // worldbook API (getWorldbook, replaceWorldbook...) and the older lorebook API
 // (getLorebookEntries, setLorebookEntries...). Mirrors JSR's own converters.
-// Lumiverse keeps SillyTavern's position numbers, so those map directly. The
-// Lumiverse entry id stands in for JSR's numeric uid.
+// Lumiverse keeps SillyTavern's position numbers, so those map directly. An
+// entry's uid is its ST uid when the card's embedded book still has it, else
+// the Lumiverse entry id.
 
 export interface HostEntry {
   id: string;
+  /** Original ST uid, set by the backend for entries from the card's book. */
+  st_uid?: number;
   key: string[];
   keysecondary: string[];
   content: string;
@@ -36,7 +39,15 @@ export interface HostEntry {
   vectorized: boolean;
 }
 
-export type EntryInput = Partial<Omit<HostEntry, 'id'>>;
+export type EntryInput = Partial<Omit<HostEntry, 'id' | 'st_uid'>>;
+
+export const uidOf = (e: HostEntry): string | number => e.st_uid ?? e.id;
+
+// Host id for a uid a script passes back (ST uid or host id).
+export function hostIdOf(uid: unknown, entries: HostEntry[]): string | null {
+  const s = String(uid);
+  return entries.find((e) => e.id === s || (e.st_uid !== undefined && String(e.st_uid) === s))?.id ?? null;
+}
 
 type Obj = Record<string, unknown>;
 
@@ -66,7 +77,7 @@ const roleOf = (r: unknown): string => (typeof r === 'string' && ROLES.includes(
 
 export function toWorldbookEntry(e: HostEntry): Obj {
   return {
-    uid: e.id,
+    uid: uidOf(e),
     name: e.comment,
     enabled: !e.disabled,
     strategy: {
@@ -167,12 +178,12 @@ export function planReplace(current: HostEntry[], next: unknown[]): ApplyPlan {
   const kept = new Set<string>();
   const plan: ApplyPlan = { create: [], update: [], delete: [] };
   for (const raw of next) {
-    const uid = isObj(raw) && raw.uid !== undefined ? String(raw.uid) : '';
-    const cur = byId.get(uid);
-    if (cur && !kept.has(uid)) {
-      kept.add(uid);
+    const id = isObj(raw) && raw.uid !== undefined ? hostIdOf(raw.uid, current) : null;
+    const cur = id ? byId.get(id) : undefined;
+    if (cur && !kept.has(cur.id)) {
+      kept.add(cur.id);
       const patch = diff(cur, fromWorldbookEntry(raw));
-      if (Object.keys(patch).length > 0) plan.update.push({ id: uid, patch });
+      if (Object.keys(patch).length > 0) plan.update.push({ id: cur.id, patch });
     } else {
       plan.create.push(fromWorldbookEntry(raw));
     }
@@ -188,7 +199,7 @@ export function toLorebookEntry(e: HostEntry, index: number): Obj {
   const keys = [...e.key];
   const filters = [...e.keysecondary];
   return {
-    uid: e.id,
+    uid: uidOf(e),
     display_index: index,
     comment: e.comment,
     enabled: !e.disabled,
