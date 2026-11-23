@@ -24,9 +24,6 @@ function isResolveMacrosResponse(p: unknown, requestId: string): p is ResolveMac
 
 let requestCounter = 0;
 function nextRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
   return `vishrun-rm-${Date.now()}-${++requestCounter}`;
 }
 
