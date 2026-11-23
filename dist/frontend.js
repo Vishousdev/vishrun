@@ -678,9 +678,6 @@ function isDispatchSlashResponse(p, requestId) {
 }
 var requestCounter = 0;
 function nextRequestId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
   return `vishrun-ds-${Date.now()}-${++requestCounter}`;
 }
 var DISPATCH_TIMEOUT_MS = 5000;
@@ -1202,9 +1199,6 @@ function isFetchExternalResponse(p, requestId) {
 }
 var requestCounter2 = 0;
 function nextRequestId2() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
   return `vishrun-fx-${Date.now()}-${++requestCounter2}`;
 }
 function fetchViaBackend(url, ctx, timeoutMs = 30000) {
@@ -2576,9 +2570,6 @@ function isResolveMacrosResponse(p, requestId) {
 }
 var requestCounter3 = 0;
 function nextRequestId3() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
   return `vishrun-rm-${Date.now()}-${++requestCounter3}`;
 }
 var RESOLVE_TIMEOUT_MS = 5000;
@@ -3821,9 +3812,6 @@ function isThRequest(p) {
 }
 var backendRequestCounter = 0;
 function nextBackendRequestId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
   return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
 function dispatchThRequest(frame, request, context, ctx) {

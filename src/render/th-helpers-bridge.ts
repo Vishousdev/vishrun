@@ -40,9 +40,6 @@ export function isThRequest(p: unknown): p is ThRequestFromIframe {
 
 let backendRequestCounter = 0;
 function nextBackendRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
   return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
 

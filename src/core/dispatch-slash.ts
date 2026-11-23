@@ -34,9 +34,6 @@ function isDispatchSlashResponse(p: unknown, requestId: string): p is DispatchSl
 
 let requestCounter = 0;
 function nextRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
   return `vishrun-ds-${Date.now()}-${++requestCounter}`;
 }
 
