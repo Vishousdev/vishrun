@@ -13,3 +13,11 @@ export function greetingIndex(content: unknown, greetings: string[]): number {
   const shown = norm(content);
   return greetings.findIndex((g) => norm(g) === shown);
 }
+
+// SillyTavern swipes of a message: message 0 holds the card greetings, with
+// the one shown as swipe_id. Other messages have their own text only.
+export function greetingSwipes(index: number, isUser: boolean, content: string, greetings: string[]): { swipe_id: number; swipes: string[] } {
+  return index === 0 && !isUser && greetings.length > 1
+    ? { swipe_id: greetingIndex(content, greetings), swipes: [...greetings] }
+    : { swipe_id: 0, swipes: [content] };
+}

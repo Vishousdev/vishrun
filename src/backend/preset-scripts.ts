@@ -1,6 +1,7 @@
 import { api } from './common';
 import { referencesUnknownIds, type BlockLike } from '../preset-scripts/st-ids';
 import { entryFieldPatch, resolveStUid, stUidMap, type EntryLike } from '../core/st-entry-field';
+import { setExtensionPrompt } from './st-prompt';
 
 // Backend side of the script runtime (src/preset-scripts) for preset and
 // character scripts. The frontend has no preset, variable or storage API, so
@@ -181,6 +182,25 @@ async function writeVars(scope: VarScope, chatId: string | null, next: Record<st
     if (scope === 'global') await api.variables.global.delete(k, userId);
     else if (chatId) await api.variables.chat.delete(chatId, k);
   }
+}
+
+const ST_META_KEY = 'vishrun_st_metadata';
+
+interface ChatsWithCas { compareAndSetMetadata?(chatId: string, input: { expected_metadata: Record<string, unknown>; metadata: Record<string, unknown> }, userId?: string): Promise<unknown> }
+
+// Writes one metadata key without clobbering concurrent writers when the host
+// supports compare-and-set.
+async function writeStMeta(chatId: string, meta: Record<string, unknown>, userId: string): Promise<void> {
+  const cas = (api.chats as unknown as ChatsWithCas).compareAndSetMetadata;
+  for (let i = 0; i < 3; i++) {
+    const chat = await api.chats.get(chatId, userId);
+    if (!chat) return;
+    const prev = (chat.metadata ?? {}) as Record<string, unknown>;
+    const next = { ...prev, [ST_META_KEY]: meta };
+    if (!cas) { await api.chats.update(chatId, { metadata: next }, userId); return; }
+    if (await cas.call(api.chats, chatId, { expected_metadata: prev, metadata: next }, userId)) return;
+  }
+  throw new Error('chat metadata changed during write');
 }
 
 // ── lorebooks for scripts (JSR worldbook/lorebook API) ──────────────────────
@@ -439,6 +459,71 @@ async function handle(op: string, args: Record<string, unknown>, userId: string)
       for (const input of records(args.create)) {
         await rx().create({ ...input, scope, ...(characterId ? { scope_id: characterId } : {}) }, userId);
       }
+      return true;
+    }
+    // SillyTavern chat_metadata, kept under one key of the chat's metadata.
+    case 'st_meta_get': {
+      if (!chatId) return {};
+      const chat = await api.chats.get(chatId, userId);
+      const meta = (chat?.metadata as Record<string, unknown> | undefined)?.[ST_META_KEY];
+      return meta && typeof meta === 'object' ? meta : {};
+    }
+    case 'st_meta_set': {
+      if (!chatId) return false;
+      await writeStMeta(chatId, (args.meta ?? {}) as Record<string, unknown>, userId);
+      return true;
+    }
+    // name and characterId come from the frontend; the host checks the character.
+    case 'msg_append': {
+      if (!chatId) return [];
+      const items = Array.isArray(args.messages) ? args.messages as Record<string, unknown>[] : [];
+      const ids: string[] = [];
+      for (const m of items) {
+        const role = m.role === 'user' || m.role === 'system' ? m.role : 'assistant';
+        const message = {
+          role, content: String(m.content ?? ''),
+          ...(typeof m.name === 'string' && m.name ? { name: m.name } : {}),
+          ...(role === 'assistant' && typeof m.characterId === 'string' ? { characterId: m.characterId } : {}),
+        };
+        const { id } = await api.chat.appendMessage(chatId, message as Parameters<typeof api.chat.appendMessage>[1]);
+        ids.push(id);
+      }
+      const hide = ids.filter((_, i) => items[i]?.hidden === true);
+      if (hide.length) await api.chat.setMessagesHidden(chatId, hide, true);
+      return ids;
+    }
+    // SillyTavern message `extra`, kept in this extension's message metadata.
+    case 'msg_extra': {
+      if (!chatId) return false;
+      const items = Array.isArray(args.items) ? args.items as { id?: unknown; extra?: unknown }[] : [];
+      for (const it of items) {
+        if (typeof it.id !== 'string') continue;
+        const patch = { ownMetadata: { st_extra: it.extra ?? {} } };
+        await api.chat.updateMessage(chatId, it.id, patch as Parameters<typeof api.chat.updateMessage>[2]);
+      }
+      return true;
+    }
+    case 'msg_delete': {
+      if (!chatId) return false;
+      const ids = Array.isArray(args.messageIds) ? args.messageIds.filter((x): x is string => typeof x === 'string') : [];
+      for (const id of ids) await api.chat.deleteMessage(chatId, id);
+      return true;
+    }
+    // A one-off generation with the user's active connection (ST generateRaw,
+    // ChatCompletionService.processRequest).
+    case 'generate': {
+      const messages = Array.isArray(args.messages) ? args.messages as { role: 'system' | 'user' | 'assistant'; content: string }[] : [];
+      const maxTokens = Number(args.max_tokens);
+      const r = await api.generate.quiet({
+        type: 'quiet', messages, userId, ...(maxTokens > 0 ? { parameters: { max_tokens: maxTokens } } : {}),
+      }) as { content?: string; reasoning?: string } | null;
+      return { content: r?.content ?? '', reasoning: r?.reasoning ?? '' };
+    }
+    case 'ext_prompt': {
+      if (!chatId) return false;
+      setExtensionPrompt(chatId, String(args.key ?? ''), {
+        value: String(args.value ?? ''), position: Number(args.position ?? 1), depth: Number(args.depth ?? 0), role: Number(args.role ?? 0),
+      });
       return true;
     }
     case 'toast': {

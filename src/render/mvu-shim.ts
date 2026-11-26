@@ -9,6 +9,7 @@
 // snapshot, which is how the Status Bar gets updated values.
 
 import type { MvuData } from '../backend/mvu-parser';
+import { inlineJson } from './inline-json';
 export type { MvuData };
 
 export interface MvuConstants {
@@ -125,7 +126,7 @@ export function createMvuHelpers(consts: MvuConstants): MvuHandle {
 // as a constant so getAllVariables returns synchronously per the JSR
 // contract Queen Bee Status Bar depends on.
 export function mvuShim(consts: MvuConstants): string {
-  const constsJson = JSON.stringify({ variablesSnapshot: consts.variablesSnapshot });
+  const constsJson = inlineJson({ variablesSnapshot: consts.variablesSnapshot });
   const eventsJson = JSON.stringify(MVU_EVENTS);
   return `<script>(function(){
 var MVUC = ${constsJson};

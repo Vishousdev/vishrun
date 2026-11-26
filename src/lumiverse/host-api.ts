@@ -11,6 +11,8 @@ export interface HostMessage {
   role?: 'system' | 'user' | 'assistant';
   name?: string;
   hidden?: boolean;
+  /** SillyTavern message `extra` set by scripts. */
+  stExtra?: Record<string, unknown>;
 }
 
 interface HostCtx {

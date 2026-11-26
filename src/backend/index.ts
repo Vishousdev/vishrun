@@ -8,6 +8,7 @@ import { installRegexTakeoverHandler } from './regex-takeover';
 import { installHostReadHandler } from './host-read';
 import { installMvuMacros } from './mvu-macros';
 import { installPresetScriptsHandler } from './preset-scripts';
+import { installStPrompt } from './st-prompt';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -30,6 +31,7 @@ installRegexTakeoverHandler();
 installHostReadHandler();
 installMvuMacros();
 installPresetScriptsHandler();
+installStPrompt();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).
