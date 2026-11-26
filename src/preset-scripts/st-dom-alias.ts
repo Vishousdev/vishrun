@@ -39,6 +39,12 @@ export function applyStAlias(doc: Document = document): Element[] {
     list.id = 'chat';
     list.setAttribute(MARK, '');
   }
+  // ST's #sheld is the column around the chat: here, above the scrolling list.
+  const column = list?.parentElement?.parentElement;
+  if (column && !column.id && !doc.getElementById('sheld')) {
+    column.id = 'sheld';
+    column.setAttribute(MARK, '');
+  }
   for (const row of rows) {
     if (!row.classList.contains('mes')) row.classList.add('mes');
     const idx = row.getAttribute('data-message-index') ?? '';
@@ -62,8 +68,7 @@ export function applyStAlias(doc: Document = document): Element[] {
 }
 
 export function clearStAlias(doc: Document = document): void {
-  const list = doc.querySelector(`#chat[${MARK}]`);
-  if (list) { list.removeAttribute('id'); list.removeAttribute(MARK); }
+  for (const el of doc.querySelectorAll(`[${MARK}]`)) { el.removeAttribute('id'); el.removeAttribute(MARK); }
   for (const row of doc.querySelectorAll(`${ROW_SELECTOR}.mes`)) {
     row.classList.remove('mes');
     row.removeAttribute('mesid');
@@ -96,6 +101,7 @@ export function watchStAlias(doc: Document = document, onRows?: (rows: Element[]
   scheduled = true;
   run();
   return () => {
+    scheduled = false;
     clearTimeout(timer);
     observer.disconnect();
     clearStAlias(doc);

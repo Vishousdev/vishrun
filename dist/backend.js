@@ -5760,7 +5760,16 @@ async function hostRead(op, chatId, userId) {
   const messages = await api.chat.getMessages(chatId);
   return messages.map((m) => {
     const mm = m;
-    return { id: mm.id, content: mm.content, is_user: mm.is_user, role: mm.role, name: mm.name, hidden: mm.extra?.hidden === true };
+    const stExtra = mm.metadata?.vishrun?.st_extra;
+    return {
+      id: mm.id,
+      content: mm.content,
+      is_user: mm.is_user,
+      role: mm.role,
+      name: mm.name,
+      hidden: mm.extra?.hidden === true,
+      ...stExtra && typeof stExtra === "object" ? { stExtra } : {}
+    };
   });
 }
 function installHostReadHandler() {
@@ -5937,6 +5946,184 @@ function entryFieldPatch(field, value) {
   }
 }
 
+// src/core/st-lorebook.ts
+var MATCH_SOURCES = {
+  match_character_depth_prompt: "depthPrompt",
+  match_character_description: "description",
+  match_character_personality: "personality",
+  match_scenario: "scenario",
+  match_creator_notes: "creatorNotes",
+  match_persona_description: "persona"
+};
+var SLASH = /^\/([\s\S]+)\/([dgimsuvy]*)$/;
+function slashRegex(key) {
+  const m = SLASH.exec(key);
+  if (!m)
+    return null;
+  try {
+    return new RegExp(m[1], m[2].replace("g", ""));
+  } catch {
+    return null;
+  }
+}
+var matchFlags = (e) => Object.keys(MATCH_SOURCES).filter((k) => e.extensions?.[k] === true);
+function needsSt(e) {
+  if (e.disabled || e.constant)
+    return false;
+  return [...e.key, ...e.keysecondary].some((k) => SLASH.test(k)) || matchFlags(e).length > 0 || e.use_regex === true && e.match_whole_words;
+}
+function keyMatches(key, text, e) {
+  const k = key.trim();
+  if (!k)
+    return false;
+  const re = slashRegex(k);
+  if (re)
+    return re.test(text);
+  const hay = e.case_sensitive ? text : text.toLowerCase();
+  const needle = e.case_sensitive ? k : k.toLowerCase();
+  if (e.match_whole_words && !/\s/.test(needle)) {
+    const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|\\W)(${esc})(?:$|\\W)`).test(hay);
+  }
+  return hay.includes(needle);
+}
+function stActive(e, text) {
+  if (!e.key.some((k) => keyMatches(k, text, e)))
+    return false;
+  const sec = e.keysecondary.filter((k) => k.trim());
+  if (!e.selective || sec.length === 0)
+    return true;
+  const hits = sec.filter((k) => keyMatches(k, text, e)).length;
+  switch (e.selective_logic) {
+    case 1:
+      return hits < sec.length;
+    case 2:
+      return hits === 0;
+    case 3:
+      return hits === sec.length;
+    default:
+      return hits > 0;
+  }
+}
+function stDecisions(entries, messages, sources, globalDepth) {
+  const forced = [], disabled = [];
+  for (const e of entries) {
+    if (!needsSt(e))
+      continue;
+    const depth = e.scan_depth ?? globalDepth;
+    const chat = depth === null ? messages : depth > 0 ? messages.slice(-depth) : [];
+    const extra = matchFlags(e).map((k) => sources[MATCH_SOURCES[k]] ?? "").filter(Boolean);
+    const text = [...chat].reverse().concat(extra).join(`
+`);
+    (stActive(e, text) ? forced : disabled).push(e.id);
+  }
+  return { forced, disabled };
+}
+
+// src/backend/st-prompt.ts
+var cards = new Map;
+async function cardOf(characterId, userId) {
+  const hit = cards.get(characterId);
+  if (hit && Date.now() - hit.at < 30000)
+    return hit.card;
+  const card = await api.characters.get(characterId, userId).catch(() => null);
+  cards.set(characterId, { at: Date.now(), card });
+  return card;
+}
+function depthPromptOf(card) {
+  const d = card?.extensions?.depth_prompt;
+  if (typeof d?.prompt !== "string" || !d.prompt.trim())
+    return null;
+  const depth = Number.isInteger(d.depth) && d.depth >= 0 ? d.depth : 4;
+  const role = d.role === "user" || d.role === "assistant" ? d.role : "system";
+  return { prompt: d.prompt, depth, role };
+}
+async function noteText(dp, chatId, characterId, userId) {
+  if (!dp)
+    return "";
+  const vars = await api.variables.chat.list(chatId).catch(() => ({}));
+  const text = dp.prompt.replace(/\{\{getvar::([^}]+)\}\}/g, (m, k) => vars[k.trim()] ?? m);
+  try {
+    return (await api.macros.resolve(text, { chatId, characterId, userId, commit: false })).text.trim();
+  } catch {
+    return text;
+  }
+}
+async function characterOf(chatId, characterId, userId) {
+  if (characterId)
+    return characterId;
+  const chat = await api.chats.get(chatId, userId).catch(() => null);
+  return chat?.character_id ?? null;
+}
+var extPrompts = new Map;
+function setExtensionPrompt(chatId, key, p) {
+  let chat = extPrompts.get(chatId);
+  if (!chat)
+    extPrompts.set(chatId, chat = new Map);
+  if (p.value.trim() && p.position >= 0)
+    chat.set(key, p);
+  else
+    chat.delete(key);
+}
+var EXT_ROLES = ["system", "user", "assistant"];
+function insertAtDepth(messages, note, depth) {
+  const history = messages.map((m, i) => m.__isChatHistory ? i : -1).filter((i) => i >= 0);
+  if (history.length === 0)
+    return { messages, index: -1 };
+  const index = depth === 0 ? history[history.length - 1] + 1 : history[Math.max(0, history.length - depth)];
+  return { messages: [...messages.slice(0, index), note, ...messages.slice(index)], index };
+}
+function installStPrompt() {
+  try {
+    api.registerInterceptor(async (messages, ctx) => {
+      const inserts = [];
+      const characterId = await characterOf(ctx.chatId, ctx.characterId, ctx.userId);
+      const dp = characterId ? depthPromptOf(await cardOf(characterId, ctx.userId)) : null;
+      const text = characterId ? await noteText(dp, ctx.chatId, characterId, ctx.userId) : "";
+      if (dp && text)
+        inserts.push({ note: { role: dp.role, content: text }, depth: dp.depth, name: "Character's Note" });
+      for (const [key, p] of extPrompts.get(ctx.chatId) ?? []) {
+        inserts.push({ note: { role: EXT_ROLES[p.role] ?? "system", content: p.value }, depth: p.position === 1 ? p.depth : Infinity, name: key });
+      }
+      let out = messages;
+      const breakdown = [];
+      for (const ins of inserts) {
+        const r = insertAtDepth(out, ins.note, ins.depth);
+        if (r.index < 0)
+          continue;
+        for (const b of breakdown)
+          if (b.messageIndex >= r.index)
+            b.messageIndex++;
+        breakdown.push({ messageIndex: r.index, name: ins.name });
+        out = r.messages;
+      }
+      return breakdown.length ? { messages: out, breakdown } : messages;
+    });
+  } catch (e) {
+    console.warn("[vishrun] Character's Note needs the interceptor permission", e);
+  }
+  try {
+    api.registerWorldInfoInterceptor(async (ctx) => {
+      const touched = ctx.entries.filter(needsSt);
+      if (touched.length === 0 || !ctx.characterId)
+        return;
+      const card = await cardOf(ctx.characterId, ctx.userId);
+      const persona = touched.some((e) => e.extensions?.match_persona_description === true) ? (await api.personas.getActive(ctx.userId).catch(() => null))?.description ?? "" : "";
+      const sources = {
+        depthPrompt: await noteText(depthPromptOf(card), ctx.chatId, ctx.characterId, ctx.userId),
+        description: card?.description,
+        personality: card?.personality,
+        scenario: card?.scenario,
+        creatorNotes: card?.creator_notes,
+        persona
+      };
+      return stDecisions(touched, ctx.messages.map((m) => m.content), sources, ctx.activationSettings.globalScanDepth);
+    });
+  } catch (e) {
+    console.warn("[vishrun] ST lorebook matching needs the generation permission", e);
+  }
+}
+
 // src/backend/preset-scripts.ts
 var CONSENT_PATH = "preset-scripts-consent.json";
 var SWITCHES_PATH = "script-switches.json";
@@ -6025,7 +6212,7 @@ function parseValue(v) {
     return v;
   }
 }
-async function cardOf(characterId, userId) {
+async function cardOf2(characterId, userId) {
   const c = await api.characters.get(characterId, userId).catch(() => null);
   return c ?? null;
 }
@@ -6042,7 +6229,7 @@ async function readCharacterVars(characterId, userId) {
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
       return parsed;
   } catch {}
-  const card = await cardOf(characterId, userId);
+  const card = await cardOf2(characterId, userId);
   const vars = card?.extensions?.tavern_helper?.variables;
   return vars && typeof vars === "object" && !Array.isArray(vars) ? vars : {};
 }
@@ -6077,6 +6264,24 @@ async function writeVars(scope, chatId, next, userId, characterId = null) {
     else if (chatId)
       await api.variables.chat.delete(chatId, k);
   }
+}
+var ST_META_KEY = "vishrun_st_metadata";
+async function writeStMeta(chatId, meta, userId) {
+  const cas = api.chats.compareAndSetMetadata;
+  for (let i = 0;i < 3; i++) {
+    const chat = await api.chats.get(chatId, userId);
+    if (!chat)
+      return;
+    const prev = chat.metadata ?? {};
+    const next = { ...prev, [ST_META_KEY]: meta };
+    if (!cas) {
+      await api.chats.update(chatId, { metadata: next }, userId);
+      return;
+    }
+    if (await cas.call(api.chats, chatId, { expected_metadata: prev, metadata: next }, userId))
+      return;
+  }
+  throw new Error("chat metadata changed during write");
 }
 var wb = () => api.world_books;
 async function characterBookIds(chatId, userId) {
@@ -6166,7 +6371,7 @@ async function handle(op, args, userId) {
         };
       }
       const characterId = await chatCharacterId(chatId, userId);
-      const card = characterId ? await cardOf(characterId, userId) : null;
+      const card = characterId ? await cardOf2(characterId, userId) : null;
       const character = card ? {
         id: card.id,
         name: card.name,
@@ -6316,6 +6521,82 @@ async function handle(op, args, userId) {
       }
       return true;
     }
+    case "st_meta_get": {
+      if (!chatId)
+        return {};
+      const chat = await api.chats.get(chatId, userId);
+      const meta = chat?.metadata?.[ST_META_KEY];
+      return meta && typeof meta === "object" ? meta : {};
+    }
+    case "st_meta_set": {
+      if (!chatId)
+        return false;
+      await writeStMeta(chatId, args.meta ?? {}, userId);
+      return true;
+    }
+    case "msg_append": {
+      if (!chatId)
+        return [];
+      const items = Array.isArray(args.messages) ? args.messages : [];
+      const ids = [];
+      for (const m of items) {
+        const role = m.role === "user" || m.role === "system" ? m.role : "assistant";
+        const message = {
+          role,
+          content: String(m.content ?? ""),
+          ...typeof m.name === "string" && m.name ? { name: m.name } : {},
+          ...role === "assistant" && typeof m.characterId === "string" ? { characterId: m.characterId } : {}
+        };
+        const { id } = await api.chat.appendMessage(chatId, message);
+        ids.push(id);
+      }
+      const hide = ids.filter((_, i) => items[i]?.hidden === true);
+      if (hide.length)
+        await api.chat.setMessagesHidden(chatId, hide, true);
+      return ids;
+    }
+    case "msg_extra": {
+      if (!chatId)
+        return false;
+      const items = Array.isArray(args.items) ? args.items : [];
+      for (const it of items) {
+        if (typeof it.id !== "string")
+          continue;
+        const patch = { ownMetadata: { st_extra: it.extra ?? {} } };
+        await api.chat.updateMessage(chatId, it.id, patch);
+      }
+      return true;
+    }
+    case "msg_delete": {
+      if (!chatId)
+        return false;
+      const ids = Array.isArray(args.messageIds) ? args.messageIds.filter((x) => typeof x === "string") : [];
+      for (const id of ids)
+        await api.chat.deleteMessage(chatId, id);
+      return true;
+    }
+    case "generate": {
+      const messages = Array.isArray(args.messages) ? args.messages : [];
+      const maxTokens = Number(args.max_tokens);
+      const r = await api.generate.quiet({
+        type: "quiet",
+        messages,
+        userId,
+        ...maxTokens > 0 ? { parameters: { max_tokens: maxTokens } } : {}
+      });
+      return { content: r?.content ?? "", reasoning: r?.reasoning ?? "" };
+    }
+    case "ext_prompt": {
+      if (!chatId)
+        return false;
+      setExtensionPrompt(chatId, String(args.key ?? ""), {
+        value: String(args.value ?? ""),
+        position: Number(args.position ?? 1),
+        depth: Number(args.depth ?? 0),
+        role: Number(args.role ?? 0)
+      });
+      return true;
+    }
     case "toast": {
       const kind = ["success", "warning", "error", "info"].includes(String(args.kind)) ? String(args.kind) : "info";
       api.toast[kind](String(args.message ?? ""), typeof args.title === "string" ? { title: args.title } : undefined);
@@ -6353,6 +6634,7 @@ installRegexTakeoverHandler();
 installHostReadHandler();
 installMvuMacros();
 installPresetScriptsHandler();
+installStPrompt();
 function setup() {}
 export {
   setup

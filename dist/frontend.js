@@ -797,14 +797,14 @@ function handleHostAlert(payload, deps = {}) {
 // src/preset-scripts/rpc.ts
 var TIMEOUT_MS2 = 1e4;
 var counter2 = 0;
-function presetRpc(ctx, op, args = {}) {
+function presetRpc(ctx, op, args = {}, timeoutMs = TIMEOUT_MS2) {
   const requestId = `vishrun-ps-${Date.now()}-${++counter2}`;
   return new Promise((resolve, reject) => {
     let unsub = null;
     const timer = setTimeout(() => {
       unsub?.();
       reject(new Error(`[vishrun] preset ${op} timed out`));
-    }, TIMEOUT_MS2);
+    }, timeoutMs);
     unsub = ctx.onBackendMessage((payload) => {
       const p = payload;
       if (!p || p.type !== "vr_preset_response" || p.requestId !== requestId)
@@ -878,6 +878,66 @@ function popupDialog(text, doc = document) {
       resolve("");
     };
   });
+}
+function htmlPopup(content, buttons, input = null, doc = document) {
+  return new Promise((resolve) => {
+    const { root, box, close } = overlay(doc);
+    const body = doc.createElement("div");
+    if (content instanceof Node)
+      body.appendChild(content);
+    else
+      body.innerHTML = String(content ?? "");
+    box.appendChild(body);
+    let ta = null;
+    if (input !== null) {
+      ta = doc.createElement("textarea");
+      ta.rows = 4;
+      ta.value = input;
+      ta.style.cssText = "width:100%;box-sizing:border-box;margin:10px 0 0;background:rgba(0,0,0,.3);color:inherit;border:1px solid rgba(255,255,255,.2);border-radius:8px;padding:8px";
+      box.appendChild(ta);
+    }
+    const row = doc.createElement("div");
+    row.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;margin-top:12px";
+    const done = (result) => {
+      close();
+      resolve({ result, value: ta?.value ?? "" });
+    };
+    buttons.forEach((b, i) => {
+      const el = button(doc, b.text, i === buttons.length - 1);
+      el.onclick = () => {
+        try {
+          b.action?.();
+        } catch (e) {
+          console.warn("[vishrun] popup button", e);
+        }
+        done(b.result);
+      };
+      row.appendChild(el);
+    });
+    box.appendChild(row);
+    root.addEventListener("click", (e) => {
+      if (e.target === root)
+        done(null);
+    });
+  });
+}
+var POPUP_TYPE = { TEXT: 1, CONFIRM: 2, INPUT: 3, DISPLAY: 4, CROP: 5 };
+var POPUP_RESULT = { AFFIRMATIVE: 1, NEGATIVE: 0, CANCELLED: null };
+async function callGenericPopup(content, type, inputValue = "", options = {}) {
+  const o = options ?? {};
+  const asks = type === POPUP_TYPE.CONFIRM || type === POPUP_TYPE.INPUT;
+  const label = (v, fallback) => v === false ? null : typeof v === "string" ? v : fallback;
+  const ok = label(o.okButton, type === POPUP_TYPE.DISPLAY ? null : "OK");
+  const cancel = label(o.cancelButton, asks ? "Cancel" : null);
+  const buttons = (Array.isArray(o.customButtons) ? o.customButtons : []).map((b) => typeof b === "string" ? { text: b, result: b } : { text: String(b?.text ?? ""), result: b?.result, action: typeof b?.action === "function" ? b.action : undefined });
+  if (cancel)
+    buttons.push({ text: cancel, result: POPUP_RESULT.NEGATIVE });
+  if (ok)
+    buttons.push({ text: ok, result: POPUP_RESULT.AFFIRMATIVE });
+  const r = await htmlPopup(content, buttons, type === POPUP_TYPE.INPUT ? String(inputValue ?? "") : null);
+  if (type !== POPUP_TYPE.INPUT)
+    return r.result;
+  return r.result === POPUP_RESULT.AFFIRMATIVE ? r.value : r.result === POPUP_RESULT.NEGATIVE ? false : r.result;
 }
 function splitNamedArgs(rest) {
   const named = {};
@@ -1870,6 +1930,11 @@ function applyStAlias(doc = document) {
     list.id = "chat";
     list.setAttribute(MARK, "");
   }
+  const column = list?.parentElement?.parentElement;
+  if (column && !column.id && !doc.getElementById("sheld")) {
+    column.id = "sheld";
+    column.setAttribute(MARK, "");
+  }
   for (const row of rows) {
     if (!row.classList.contains("mes"))
       row.classList.add("mes");
@@ -1895,10 +1960,9 @@ function applyStAlias(doc = document) {
   return rows;
 }
 function clearStAlias(doc = document) {
-  const list = doc.querySelector(`#chat[${MARK}]`);
-  if (list) {
-    list.removeAttribute("id");
-    list.removeAttribute(MARK);
+  for (const el of doc.querySelectorAll(`[${MARK}]`)) {
+    el.removeAttribute("id");
+    el.removeAttribute(MARK);
   }
   for (const row of doc.querySelectorAll(`${ROW_SELECTOR}.mes`)) {
     row.classList.remove("mes");
@@ -1933,6 +1997,7 @@ function watchStAlias(doc = document, onRows) {
   scheduled = true;
   run();
   return () => {
+    scheduled = false;
     clearTimeout(timer);
     observer.disconnect();
     clearStAlias(doc);
@@ -2165,6 +2230,9 @@ function cardGreetings(card) {
 function greetingIndex(content, greetings) {
   const shown = norm(content);
   return greetings.findIndex((g) => norm(g) === shown);
+}
+function greetingSwipes(index, isUser, content, greetings) {
+  return index === 0 && !isUser && greetings.length > 1 ? { swipe_id: greetingIndex(content, greetings), swipes: [...greetings] } : { swipe_id: 0, swipes: [content] };
 }
 
 // src/preset-scripts/worldbook-format.ts
@@ -2646,10 +2714,18 @@ var TAVERN_EVENTS = {
   CHARACTER_MESSAGE_RENDERED: "character_message_rendered",
   USER_MESSAGE_RENDERED: "user_message_rendered",
   GENERATION_STARTED: "generation_started",
+  GENERATION_AFTER_COMMANDS: "GENERATION_AFTER_COMMANDS",
   GENERATION_ENDED: "generation_ended",
   GENERATION_STOPPED: "generation_stopped",
-  STREAM_TOKEN_RECEIVED: "stream_token_received"
+  STREAM_TOKEN_RECEIVED: "stream_token_received",
+  WORLD_INFO_ACTIVATED: "world_info_activated"
 };
+function toastrFor(ctx) {
+  const toast = (kind) => (message, title) => {
+    presetRpc(ctx, "toast", { kind, message: String(message ?? ""), title: typeof title === "string" ? title : undefined }).catch(() => {});
+  };
+  return { success: toast("success"), info: toast("info"), warning: toast("warning"), error: toast("error"), clear: () => {}, remove: () => {} };
+}
 function emit(state, event, ...args) {
   const set = state.listeners.get(event);
   if (!set)
@@ -2661,6 +2737,33 @@ function emit(state, event, ...args) {
       console.warn("[vishrun] preset script listener", e);
     }
   }
+}
+function addListener(state, event, fn, once = false) {
+  let set = state.listeners.get(event);
+  if (!set)
+    state.listeners.set(event, set = new Set);
+  const wrapped = once ? (...a) => {
+    set.delete(wrapped);
+    return fn(...a);
+  } : fn;
+  set.add(wrapped);
+  const stop = () => {
+    set.delete(wrapped);
+  };
+  return Object.assign(stop, { stop });
+}
+function writeVars(state, scope, vars) {
+  state.vars[scope] = vars;
+  return presetRpc(state.ctx, "vars_replace", { scope, chatId: state.ctx.getActiveChat().chatId, characterId: state.characterId, vars }).catch((e) => console.warn("[vishrun] script vars write", e));
+}
+async function deleteMessages(state, indexes) {
+  const chatId = state.ctx.getActiveChat().chatId;
+  if (!chatId)
+    return;
+  const messageIds = indexes.map((i) => state.messages[i]?.id).filter((id) => typeof id === "string");
+  if (messageIds.length)
+    await presetRpc(state.ctx, "msg_delete", { chatId, messageIds });
+  await refreshMessages(state);
 }
 async function refreshPreset(state) {
   const chatId = state.ctx.getActiveChat().chatId;
@@ -2677,7 +2780,7 @@ async function refreshVars(state) {
   state.vars = { global, chat, character };
 }
 async function refreshCharacter(state) {
-  const id = state.ctx.getActiveChat().characterId;
+  const id = state.ctx.getActiveChat().characterId || state.characterId;
   state.character = id ? await getCharacter(id).catch(() => null) : null;
 }
 async function refreshWorldbooks(state) {
@@ -2762,9 +2865,7 @@ function buildThApi(state, script, win) {
       return;
     if (type === "character" && !state.characterId)
       return;
-    state.vars[type] = copy;
-    const chatId = ctx.getActiveChat().chatId;
-    presetRpc(ctx, "vars_replace", { scope: type, chatId, characterId: state.characterId, vars: copy }).catch((e) => console.warn("[vishrun] preset script vars write", e));
+    writeVars(state, type, copy);
   };
   const loadedName = () => state.presetName;
   const isActiveName = (name) => name === undefined || name === "in_use" || name === state.presetName;
@@ -2886,9 +2987,7 @@ function buildThApi(state, script, win) {
         continue;
       const row = { message_id: i, name: m.name ?? "", role: r, is_hidden: m.hidden === true, message: m.content, data: {}, extra: {} };
       if (withSwipes) {
-        const greeting = i === 0 && !m.is_user && greetings.length > 1;
-        row.swipe_id = greeting ? greetingIndex(m.content, greetings) : 0;
-        row.swipes = greeting ? [...greetings] : [m.content];
+        Object.assign(row, greetingSwipes(i, m.is_user, m.content, greetings));
         row.swipes_data = row.swipes.map(() => ({}));
       }
       out.push(row);
@@ -2953,23 +3052,7 @@ function buildThApi(state, script, win) {
     }
     return pipe;
   };
-  const toast = (kind) => (message, title) => {
-    presetRpc(ctx, "toast", { kind, message: String(message ?? ""), title: typeof title === "string" ? title : undefined }).catch(() => {});
-  };
-  const on = (event, fn, once = false) => {
-    let set = state.listeners.get(event);
-    if (!set)
-      state.listeners.set(event, set = new Set);
-    const wrapped = once ? (...a) => {
-      set.delete(wrapped);
-      return fn(...a);
-    } : fn;
-    set.add(wrapped);
-    const stop = () => {
-      set.delete(wrapped);
-    };
-    return Object.assign(stop, { stop });
-  };
+  const on = (event, fn, once = false) => addListener(state, event, fn, once);
   const buttonEvent = (name) => `vishrun_button:${script.id}:${String(name)}`;
   const normButtons = (list) => Array.isArray(list) ? list.map((b) => typeof b === "string" ? { name: b, visible: true } : { name: String(b?.name ?? ""), visible: b?.visible !== false }).filter((b) => b.name) : [];
   const buttonsArg = (a, b) => normButtons(Array.isArray(a) ? a : b);
@@ -3084,6 +3167,21 @@ function buildThApi(state, script, win) {
         await presetRpc(ctx, "set_hidden", { chatId, messageIds: show, hidden: false });
       await refreshMessages(state);
     },
+    createChatMessages: async (msgs) => {
+      const chatId = ctx.getActiveChat().chatId;
+      if (!chatId)
+        return;
+      const char = state.character;
+      const messages = list(msgs).filter(isPlainObject).map((m) => {
+        const role = m.role === "user" || m.role === "system" ? m.role : "assistant";
+        const name = typeof m.name === "string" ? m.name : role === "user" ? state.userName : role === "assistant" ? char?.name : undefined;
+        return { role, content: String(m.message ?? ""), name, characterId: role === "assistant" ? char?.id : undefined, hidden: m.is_hidden === true };
+      });
+      if (messages.length)
+        await presetRpc(ctx, "msg_append", { chatId, messages });
+      await refreshMessages(state);
+    },
+    deleteChatMessages: (ids) => deleteMessages(state, list(ids).map((i) => Number(i) < 0 ? state.messages.length + Number(i) : Number(i))),
     getLastMessageId: lastMessageId,
     retrieveDisplayedMessage: (id) => {
       const $ = win.$;
@@ -3133,14 +3231,186 @@ function buildThApi(state, script, win) {
     },
     substitudeMacros: (text) => localMacros(String(text ?? "")).replace(/\{\{char\}\}/gi, typeof state.character?.name === "string" ? state.character.name : "{{char}}"),
     getTavernHelperVersion: () => "4.0.0",
-    toastr: {
-      success: toast("success"),
-      info: toast("info"),
-      warning: toast("warning"),
-      error: toast("error"),
-      clear: () => {},
-      remove: () => {}
+    toastr: toastrFor(ctx)
+  };
+  api.SillyTavern = state.st;
+  api.TavernHelper = { ...api };
+  api.__vishrunMvuZod = { registerMvuSchema: setMvuSchema };
+  return api;
+}
+
+// src/preset-scripts/st-context.ts
+function toStChat(messages, greetings) {
+  return messages.map((m, i) => ({
+    name: m.name ?? "",
+    is_user: m.is_user,
+    is_system: m.role === "system" || m.hidden === true,
+    mes: m.content,
+    ...greetingSwipes(i, m.is_user, m.content, greetings),
+    extra: m.stExtra ? JSON.parse(JSON.stringify(m.stExtra)) : {}
+  }));
+}
+var CARD_FIELDS = [
+  "name",
+  "description",
+  "personality",
+  "scenario",
+  "first_mes",
+  "mes_example",
+  "creator_notes",
+  "system_prompt",
+  "post_history_instructions",
+  "alternate_greetings",
+  "tags",
+  "creator"
+];
+function toStCharacter(c) {
+  const data = { extensions: c.extensions ?? {} };
+  for (const k of CARD_FIELDS)
+    data[k] = c[k] ?? (k === "alternate_greetings" || k === "tags" ? [] : "");
+  return {
+    name: c.name ?? "",
+    avatar: c.avatar ?? c.image_id ?? c.id,
+    description: data.description,
+    personality: data.personality,
+    scenario: data.scenario,
+    first_mes: data.first_mes,
+    mes_example: data.mes_example,
+    creatorcomment: data.creator_notes,
+    tags: data.tags,
+    data
+  };
+}
+function makeMeta(state, stored) {
+  const meta = { ...stored };
+  Object.defineProperty(meta, "variables", {
+    enumerable: false,
+    configurable: true,
+    get: () => state.vars.chat,
+    set: (v) => {
+      if (v && typeof v === "object")
+        state.vars.chat = v;
     }
+  });
+  return meta;
+}
+async function refreshStMeta(state) {
+  const { chatId, characterId } = state.ctx.getActiveChat();
+  const [stored, names] = await Promise.all([
+    chatId ? presetRpc(state.ctx, "st_meta_get", { chatId }) : Promise.resolve({}),
+    chatId ? resolveMacrosBatch(state.ctx, chatId, characterId ?? null, ["{{user}}"]).catch(() => [""]) : Promise.resolve([""])
+  ]);
+  state.stMeta = makeMeta(state, stored ?? {});
+  state.userName = names[0] && names[0] !== "{{user}}" ? names[0] : "";
+}
+var GENERATE_MS = 180000;
+var textOf = (c) => Array.isArray(c) ? c.map((x) => x && typeof x === "object" ? String(x.text ?? "") : "").join("") : String(c ?? "");
+var toMessages = (list) => (Array.isArray(list) ? list : []).map((m) => ({
+  role: m?.role === "user" || m?.role === "assistant" ? m.role : "system",
+  content: textOf(m?.content)
+}));
+var debounce = (fn, ms) => {
+  let t = null;
+  return () => {
+    if (t)
+      clearTimeout(t);
+    t = setTimeout(() => {
+      t = null;
+      fn();
+    }, ms);
+  };
+};
+function createSillyTavern(state) {
+  const ctx = state.ctx;
+  const chatId = () => ctx.getActiveChat().chatId;
+  let chatFor = null;
+  let cardFor = null;
+  let chat = [];
+  let base = [];
+  const snap = (m) => ({ swipe_id: m.swipe_id, mes: m.mes, is_system: m.is_system, extra: JSON.stringify(m.extra ?? {}) });
+  const stChat = () => {
+    const card = getActiveCard();
+    if (chatFor !== state.messages || cardFor !== card) {
+      chatFor = state.messages;
+      cardFor = card;
+      chat = toStChat(state.messages, cardGreetings(card));
+      base = chat.map(snap);
+    }
+    return chat;
+  };
+  let charFor = null;
+  let characters = [];
+  const stCharacters = () => {
+    if (charFor !== state.character) {
+      charFor = state.character;
+      characters = state.character ? [toStCharacter(state.character)] : [];
+    }
+    return characters;
+  };
+  const saveChat = async () => {
+    const id = chatId();
+    const list = stChat();
+    if (!id)
+      return;
+    const hide = [], show = [], extras = [];
+    for (let i = 0;i < list.length; i++) {
+      const m = list[i], b = base[i], host = state.messages[i];
+      if (!m || !b || !host)
+        continue;
+      let text = null;
+      if (m.swipe_id !== b.swipe_id && typeof m.swipes[m.swipe_id] === "string")
+        text = m.swipes[m.swipe_id];
+      else if (m.mes !== b.mes)
+        text = m.mes;
+      if (text !== null && text !== host.content)
+        await updateMessageContent(id, host.id, text);
+      if (m.is_system !== b.is_system && host.role !== "system")
+        (m.is_system ? hide : show).push(host.id);
+      const extra = JSON.stringify(m.extra ?? {});
+      if (extra !== b.extra)
+        extras.push({ id: host.id, extra: JSON.parse(extra) });
+      base[i] = snap(m);
+    }
+    if (hide.length)
+      await presetRpc(ctx, "set_hidden", { chatId: id, messageIds: hide, hidden: true });
+    if (show.length)
+      await presetRpc(ctx, "set_hidden", { chatId: id, messageIds: show, hidden: false });
+    if (extras.length)
+      await presetRpc(ctx, "msg_extra", { chatId: id, items: extras });
+    await refreshMessages(state);
+  };
+  const saveMetadata = async () => {
+    const id = chatId();
+    if (!id)
+      return;
+    const meta = JSON.parse(JSON.stringify(state.stMeta));
+    await Promise.all([
+      presetRpc(ctx, "st_meta_set", { chatId: id, meta }),
+      writeVars(state, "chat", JSON.parse(JSON.stringify(state.vars.chat)))
+    ]);
+  };
+  const varScope = (scope) => {
+    const isNum = (v) => v === undefined || v === "" || Number.isFinite(Number(v));
+    const set = (name, value) => {
+      writeVars(state, scope, { ...state.vars[scope], [name]: value });
+      return value;
+    };
+    return {
+      get: (name) => state.vars[scope][name] ?? "",
+      set,
+      has: (name) => (name in state.vars[scope]),
+      del: (name) => {
+        const next = { ...state.vars[scope] };
+        delete next[name];
+        writeVars(state, scope, next);
+      },
+      add: (name, value) => {
+        const cur = state.vars[scope][name];
+        return set(name, isNum(cur) && isNum(value) ? Number(cur ?? 0) + Number(value) : String(cur ?? "") + String(value));
+      },
+      inc: (name) => set(name, (Number(state.vars[scope][name]) || 0) + 1),
+      dec: (name) => set(name, (Number(state.vars[scope][name]) || 0) - 1)
+    };
   };
   const activeModel = () => {
     try {
@@ -3151,26 +3421,85 @@ function buildThApi(state, script, win) {
       return "";
     }
   };
-  const stContext = () => ({
-    chatId: ctx.getActiveChat().chatId,
-    characterId: undefined,
-    characters: [],
-    chat: [],
-    chatCompletionSettings: undefined,
-    mainApi: undefined,
-    getPresetManager: () => {
+  const generate = (messages, maxTokens) => presetRpc(ctx, "generate", { messages, max_tokens: maxTokens }, GENERATE_MS);
+  const generateRaw = async (a, ...rest) => {
+    const o = a && typeof a === "object" && !Array.isArray(a) ? a : { prompt: a, systemPrompt: rest[3] };
+    const messages = Array.isArray(o.prompt) ? toMessages(o.prompt) : [{ role: "user", content: String(o.prompt ?? "") }];
+    if (typeof o.systemPrompt === "string" && o.systemPrompt)
+      messages.unshift({ role: "system", content: o.systemPrompt });
+    return (await generate(messages, o.responseLength)).content;
+  };
+  const sentPrompts = new Map;
+  const setExtensionPrompt = (key, value, position = 1, depth = 0, _scan, role = 0) => {
+    const id = chatId();
+    if (!id)
       return;
+    const args = { chatId: id, key: String(key), value: String(value ?? ""), position: Number(position), depth: Number(depth), role: Number(role) };
+    const sig = JSON.stringify(args);
+    if (sentPrompts.get(args.key) === sig)
+      return;
+    sentPrompts.set(args.key, sig);
+    presetRpc(ctx, "ext_prompt", args).catch((e) => console.warn("[vishrun] setExtensionPrompt", e));
+  };
+  const charName = () => typeof state.character?.name === "string" ? state.character.name : "";
+  const st = {
+    getCurrentChatId: () => chatId(),
+    get chatId() {
+      return chatId();
     },
-    saveSettingsDebounced: () => {},
-    eventSource: { on: (e, fn) => on(e, fn), emit: async () => {} },
-    event_types: { ...TAVERN_EVENTS }
-  });
-  api.SillyTavern = {
-    getContext: stContext,
-    characters: [],
-    characterId: undefined,
+    get chat() {
+      return stChat();
+    },
+    get characters() {
+      return stCharacters();
+    },
+    get characterId() {
+      return state.character ? 0 : undefined;
+    },
+    get this_chid() {
+      return state.character ? 0 : undefined;
+    },
+    groupId: null,
+    get name1() {
+      return state.userName;
+    },
+    get name2() {
+      return charName();
+    },
+    get chatMetadata() {
+      return state.stMeta;
+    },
+    saveMetadata,
+    saveMetadataDebounced: debounce(() => saveMetadata().catch((e) => console.warn("[vishrun] saveMetadata", e)), 300),
+    saveChat,
+    saveChatConditional: saveChat,
+    saveChatDebounced: debounce(() => saveChat().catch((e) => console.warn("[vishrun] saveChat", e)), 300),
+    reloadCurrentChat: () => refreshMessages(state),
+    addOneMessage: () => {},
+    updateMessageBlock: () => {},
+    deleteMessage: (i) => deleteMessages(state, [Number(i)]),
+    deleteLastMessage: () => deleteMessages(state, [state.messages.length - 1]),
+    variables: { local: varScope("chat"), global: varScope("global") },
+    callGenericPopup,
+    POPUP_TYPE,
+    POPUP_RESULT,
+    substituteParams: (text) => String(text ?? "").replace(/\{\{char\}\}/gi, charName() || "{{char}}").replace(/\{\{user\}\}/gi, state.userName || "{{user}}"),
+    eventSource: {
+      on: (e, fn) => addListener(state, e, fn),
+      once: (e, fn) => addListener(state, e, fn, true),
+      removeListener: (e, fn) => {
+        state.listeners.get(e)?.delete(fn);
+      },
+      emit: async (e, ...args) => emit(state, e, ...args)
+    },
+    event_types: { ...TAVERN_EVENTS },
     chatCompletionSettings: undefined,
-    mainApi: undefined,
+    mainApi: "openai",
+    generateRaw,
+    setExtensionPrompt,
+    ChatCompletionService: {
+      processRequest: async (req) => generate(toMessages(req?.messages), req?.max_tokens)
+    },
     getPresetManager: () => {
       return;
     },
@@ -3178,9 +3507,8 @@ function buildThApi(state, script, win) {
     isMobile: () => /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent),
     saveSettingsDebounced: () => {}
   };
-  api.TavernHelper = { ...api };
-  api.__vishrunMvuZod = { registerMvuSchema: setMvuSchema };
-  return api;
+  st.getContext = () => st;
+  return st;
 }
 
 // src/preset-scripts/runner.ts
@@ -3227,6 +3555,17 @@ var FRAME_ATTR = "data-vishrun-preset-script";
 function jqueryForParent(source) {
   return `(function(){var p=window.parent;var had$=Object.prototype.hasOwnProperty.call(p,'$'),old$=p.$;` + `var hadJ=Object.prototype.hasOwnProperty.call(p,'jQuery'),oldJ=p.jQuery;` + `(function(window){${source}
 }).call(p,p);` + `var jq=p.jQuery;` + `if(had$)p.$=old$;else delete p.$;if(hadJ)p.jQuery=oldJ;else delete p.jQuery;` + `window.$=window.jQuery=jq;})();`;
+}
+function pageGlobals(globals) {
+  const w = window;
+  const set = Object.keys(globals).filter((k) => !(k in w));
+  for (const k of set)
+    w[k] = globals[k];
+  return () => {
+    for (const k of set)
+      if (w[k] === globals[k])
+        delete w[k];
+  };
 }
 function addScript(doc, code, module = false) {
   const el = doc.createElement("script");
@@ -3291,6 +3630,7 @@ function installPresetScripts(ctx) {
     for (const a of running.actions.values())
       a.destroy();
     running.stopAlias();
+    running.stopGlobal();
     running.state.listeners.clear();
     clearMvuSchema();
     running = null;
@@ -3311,6 +3651,9 @@ function installPresetScripts(ctx) {
       worldbooks: { primary: null, additional: [], all: [] },
       regexes: { character: [], global: [] },
       listeners: new Map,
+      stMeta: {},
+      userName: "",
+      st: null,
       getButtons: (id) => buttons.get(id) ?? [],
       setButtons: (scriptId, list) => {
         buttons.set(scriptId, list);
@@ -3333,6 +3676,7 @@ function installPresetScripts(ctx) {
     };
     for (const s of scripts)
       state.setButtons(s.id, s.buttons);
+    state.st = createSillyTavern(state);
     return { state, actions };
   };
   const linkStIds = async (info, state) => {
@@ -3392,7 +3736,7 @@ function installPresetScripts(ctx) {
         await refreshPreset(st).catch(() => {});
       }
       if (chatChanged) {
-        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st)]).catch(() => {});
+        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st), refreshStMeta(st)]).catch(() => {});
         emit(st, TAVERN_EVENTS.CHAT_CHANGED, chatId);
       }
       return;
@@ -3430,7 +3774,7 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
     const runKey = allowed.map(sourceKey).join("|");
     const scripts = allowed.flatMap(runnable);
     const { state, actions } = makeState(info, scripts);
-    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state)]).catch((e) => {
+    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state), refreshStMeta(state)]).catch((e) => {
       console.warn("[vishrun] scripts: initial load", e);
     });
     const presetSource = allowed.find((s) => s.kind === "preset");
@@ -3464,7 +3808,7 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
         }
       });
     };
-    running = { key: runKey, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
+    running = { key: runKey, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {}, stopGlobal: pageGlobals({ SillyTavern: state.st, toastr: toastrFor(ctx) }) };
     if (info.preset) {
       running.stopStandIns = installStandIns(state.preset?.prefill ?? "", (value) => {
         if (!state.presetId)
@@ -3536,9 +3880,27 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
       });
     }),
     forward("GENERATION_ENDED", TAVERN_EVENTS.MESSAGE_RECEIVED, true),
-    forward("GENERATION_STARTED", TAVERN_EVENTS.GENERATION_STARTED, false),
+    ctx.events.on("GENERATION_STARTED", (payload) => {
+      if (!running)
+        return;
+      const type = String(payload?.generationType ?? "normal");
+      emit(running.state, TAVERN_EVENTS.GENERATION_STARTED, type, {}, false);
+      emit(running.state, TAVERN_EVENTS.GENERATION_AFTER_COMMANDS, type, {}, false);
+    }),
     forward("GENERATION_ENDED", TAVERN_EVENTS.GENERATION_ENDED, false),
-    forward("GENERATION_STOPPED", TAVERN_EVENTS.GENERATION_STOPPED, true)
+    forward("GENERATION_STOPPED", TAVERN_EVENTS.GENERATION_STOPPED, true),
+    ctx.events.on("WORLD_INFO_ACTIVATED", (payload) => {
+      const p = payload;
+      if (!running || !p || p.chatId !== ctx.getActiveChat().chatId)
+        return;
+      emit(running.state, TAVERN_EVENTS.WORLD_INFO_ACTIVATED, (p.entries ?? []).map((e) => ({
+        uid: e.id,
+        comment: e.comment ?? "",
+        key: e.keys ?? [],
+        world: e.bookName ?? "",
+        constant: e.activationType === "constant"
+      })));
+    })
   ];
   function watchActiveConnection() {
     const s = ctx.state;
@@ -3657,9 +4019,14 @@ function shouldInjectMvuShim(env) {
   return env === "tavern-mvu";
 }
 
+// src/render/inline-json.ts
+function inlineJson(value) {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
 // src/render/th-helpers-shim.ts
 function thHelpersShim(consts) {
-  const constsJson = JSON.stringify({
+  const constsJson = inlineJson({
     currentMessageIndex: consts.currentMessageIndex,
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
@@ -4000,7 +4367,7 @@ var MVU_EVENTS = Object.freeze({
   BEFORE_MESSAGE_UPDATE: "mag_before_message_update"
 });
 function mvuShim(consts) {
-  const constsJson = JSON.stringify({ variablesSnapshot: consts.variablesSnapshot });
+  const constsJson = inlineJson({ variablesSnapshot: consts.variablesSnapshot });
   const eventsJson = JSON.stringify(MVU_EVENTS);
   return `<script>(function(){
 var MVUC = ${constsJson};

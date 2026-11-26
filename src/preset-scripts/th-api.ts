@@ -11,7 +11,7 @@ import {
 } from './worldbook-format';
 import { planRegexReplace, toTavernRegex, type HostRegexRow } from './regex-format';
 import { resolveMacrosBatch } from '../core/macro-resolver';
-import { cardGreetings, greetingIndex } from '../core/greetings';
+import { cardGreetings, greetingSwipes } from '../core/greetings';
 import { getActiveCard } from '../state/active-card';
 
 // JS-Slash-Runner globals for preset and character scripts. Sync getters (getVariables,
@@ -38,9 +38,11 @@ export const TAVERN_EVENTS: Record<string, string> = {
   CHARACTER_MESSAGE_RENDERED: 'character_message_rendered',
   USER_MESSAGE_RENDERED: 'user_message_rendered',
   GENERATION_STARTED: 'generation_started',
+  GENERATION_AFTER_COMMANDS: 'GENERATION_AFTER_COMMANDS',
   GENERATION_ENDED: 'generation_ended',
   GENERATION_STOPPED: 'generation_stopped',
   STREAM_TOKEN_RECEIVED: 'stream_token_received',
+  WORLD_INFO_ACTIVATED: 'world_info_activated',
 };
 
 export interface PresetBlock {
@@ -60,7 +62,7 @@ export interface PresetSnapshot {
   blocks: PresetBlock[];
 }
 
-type Listener = (...args: unknown[]) => unknown;
+export type Listener = (...args: unknown[]) => unknown;
 
 export interface ScriptButton { name: string; visible: boolean }
 
@@ -83,8 +85,23 @@ export interface RuntimeState {
   /** Regex rows of the chat's character and the global ones, for JSR's sync getter. */
   regexes: { character: HostRegexRow[]; global: HostRegexRow[] };
   listeners: Map<string, Set<Listener>>;
+  /** SillyTavern chat_metadata of the chat (see st-context). */
+  stMeta: Record<string, unknown>;
+  /** Persona name ({{user}}). */
+  userName: string;
+  /** The SillyTavern global, shared by the scripts and the page. */
+  st: Record<string, unknown> | null;
   setButtons(scriptId: string, buttons: ScriptButton[]): void;
   getButtons(scriptId: string): ScriptButton[];
+}
+
+// SillyTavern's toastr, shown as Lumiverse toasts.
+export function toastrFor(ctx: SpindleFrontendContext): Record<string, unknown> {
+  const toast = (kind: string) => (message: unknown, title?: unknown) => {
+    void presetRpc(ctx, 'toast', { kind, message: String(message ?? ''), title: typeof title === 'string' ? title : undefined })
+      .catch(() => {});
+  };
+  return { success: toast('success'), info: toast('info'), warning: toast('warning'), error: toast('error'), clear: () => {}, remove: () => {} };
 }
 
 export function emit(state: RuntimeState, event: string, ...args: unknown[]): void {
@@ -95,6 +112,31 @@ export function emit(state: RuntimeState, event: string, ...args: unknown[]): vo
       console.warn('[vishrun] preset script listener', e);
     }
   }
+}
+
+export function addListener(state: RuntimeState, event: string, fn: Listener, once = false) {
+  let set = state.listeners.get(event);
+  if (!set) state.listeners.set(event, (set = new Set()));
+  const wrapped: Listener = once ? (...a) => { set!.delete(wrapped); return fn(...a); } : fn;
+  set.add(wrapped);
+  const stop = () => { set!.delete(wrapped); };
+  return Object.assign(stop, { stop });
+}
+
+// Replaces a variable scope here and in the host.
+export function writeVars(state: RuntimeState, scope: 'global' | 'chat' | 'character', vars: Record<string, unknown>): Promise<unknown> {
+  state.vars[scope] = vars;
+  return presetRpc(state.ctx, 'vars_replace', { scope, chatId: state.ctx.getActiveChat().chatId, characterId: state.characterId, vars })
+    .catch((e) => console.warn('[vishrun] script vars write', e));
+}
+
+// Deletes messages by chat index, then reloads the list.
+export async function deleteMessages(state: RuntimeState, indexes: number[]): Promise<void> {
+  const chatId = state.ctx.getActiveChat().chatId;
+  if (!chatId) return;
+  const messageIds = indexes.map((i) => state.messages[i]?.id).filter((id): id is string => typeof id === 'string');
+  if (messageIds.length) await presetRpc(state.ctx, 'msg_delete', { chatId, messageIds });
+  await refreshMessages(state);
 }
 
 export async function refreshPreset(state: RuntimeState): Promise<void> {
@@ -114,7 +156,8 @@ export async function refreshVars(state: RuntimeState): Promise<void> {
 }
 
 export async function refreshCharacter(state: RuntimeState): Promise<void> {
-  const id = state.ctx.getActiveChat().characterId;
+  // The store's active character can be unset when a chat is opened by URL.
+  const id = state.ctx.getActiveChat().characterId || state.characterId;
   state.character = id ? ((await getCharacter(id).catch(() => null)) as Record<string, unknown> | null) : null;
 }
 
@@ -201,10 +244,7 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
     }
     if (type !== 'global' && type !== 'chat' && type !== 'character') return;
     if (type === 'character' && !state.characterId) return;
-    state.vars[type] = copy;
-    const chatId = ctx.getActiveChat().chatId;
-    void presetRpc(ctx, 'vars_replace', { scope: type, chatId, characterId: state.characterId, vars: copy })
-      .catch((e) => console.warn('[vishrun] preset script vars write', e));
+    void writeVars(state, type, copy);
   };
 
   const loadedName = () => state.presetName;
@@ -325,9 +365,7 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
       if (role !== 'all' && role !== r) continue;
       const row: Record<string, unknown> = { message_id: i, name: m.name ?? '', role: r, is_hidden: m.hidden === true, message: m.content, data: {}, extra: {} };
       if (withSwipes) {
-        const greeting = i === 0 && !m.is_user && greetings.length > 1;
-        row.swipe_id = greeting ? greetingIndex(m.content, greetings) : 0;
-        row.swipes = greeting ? [...greetings] : [m.content];
+        Object.assign(row, greetingSwipes(i, m.is_user, m.content, greetings));
         row.swipes_data = (row.swipes as string[]).map(() => ({}));
       }
       out.push(row);
@@ -397,19 +435,7 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
     return pipe;
   };
 
-  const toast = (kind: string) => (message: unknown, title?: unknown) => {
-    void presetRpc(ctx, 'toast', { kind, message: String(message ?? ''), title: typeof title === 'string' ? title : undefined })
-      .catch(() => {});
-  };
-
-  const on = (event: string, fn: Listener, once = false) => {
-    let set = state.listeners.get(event);
-    if (!set) state.listeners.set(event, (set = new Set()));
-    const wrapped: Listener = once ? (...a) => { set!.delete(wrapped); return fn(...a); } : fn;
-    set.add(wrapped);
-    const stop = () => { set!.delete(wrapped); };
-    return Object.assign(stop, { stop });
-  };
+  const on = (event: string, fn: Listener, once = false) => addListener(state, event, fn, once);
 
   const buttonEvent = (name: unknown) => `vishrun_button:${script.id}:${String(name)}`;
 
@@ -527,6 +553,21 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
       if (show.length) await presetRpc(ctx, 'set_hidden', { chatId, messageIds: show, hidden: false });
       await refreshMessages(state);
     },
+    // insert_at is not supported by the host: messages are always appended.
+    createChatMessages: async (msgs: unknown) => {
+      const chatId = ctx.getActiveChat().chatId;
+      if (!chatId) return;
+      const char = state.character as { id?: string; name?: string } | null;
+      const messages = list(msgs).filter(isPlainObject).map((m) => {
+        const role = m.role === 'user' || m.role === 'system' ? m.role : 'assistant';
+        const name = typeof m.name === 'string' ? m.name : role === 'user' ? state.userName : role === 'assistant' ? char?.name : undefined;
+        return { role, content: String(m.message ?? ''), name, characterId: role === 'assistant' ? char?.id : undefined, hidden: m.is_hidden === true };
+      });
+      if (messages.length) await presetRpc(ctx, 'msg_append', { chatId, messages });
+      await refreshMessages(state);
+    },
+    deleteChatMessages: (ids: unknown) =>
+      deleteMessages(state, list(ids).map((i) => (Number(i) < 0 ? state.messages.length + Number(i) : Number(i)))),
     getLastMessageId: lastMessageId,
     retrieveDisplayedMessage: (id: unknown) => {
       const $ = (win as unknown as { $: (s: string) => unknown }).$;
@@ -571,51 +612,10 @@ export function buildThApi(state: RuntimeState, script: RuntimeScript, win: Wind
     substitudeMacros: (text: unknown) => localMacros(String(text ?? ''))
       .replace(/\{\{char\}\}/gi, typeof state.character?.name === 'string' ? state.character.name : '{{char}}'),
     getTavernHelperVersion: () => '4.0.0',
-    toastr: {
-      success: toast('success'),
-      info: toast('info'),
-      warning: toast('warning'),
-      error: toast('error'),
-      clear: () => {},
-      remove: () => {},
-    },
+    toastr: toastrFor(ctx),
   };
 
-  // Model of the active connection, for scripts that pick modes by model.
-  const activeModel = (): string => {
-    try {
-      const s = (ctx as unknown as { state?: { get(id: string): unknown } }).state;
-      const a = s?.get('connections.active') as { model?: unknown } | undefined;
-      return typeof a?.model === 'string' ? a.model : '';
-    } catch {
-      return '';
-    }
-  };
-
-  const stContext = () => ({
-    chatId: ctx.getActiveChat().chatId,
-    characterId: undefined,
-    characters: [],
-    chat: [],
-    chatCompletionSettings: undefined,
-    mainApi: undefined,
-    getPresetManager: () => undefined,
-    saveSettingsDebounced: () => {},
-    eventSource: { on: (e: string, fn: Listener) => on(e, fn), emit: async () => {} },
-    event_types: { ...TAVERN_EVENTS },
-  });
-
-  api.SillyTavern = {
-    getContext: stContext,
-    characters: [],
-    characterId: undefined,
-    chatCompletionSettings: undefined,
-    mainApi: undefined,
-    getPresetManager: () => undefined,
-    getChatCompletionModel: activeModel,
-    isMobile: () => /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent),
-    saveSettingsDebounced: () => {},
-  };
+  api.SillyTavern = state.st;
   api.TavernHelper = { ...api };
   api.__vishrunMvuZod = { registerMvuSchema: setMvuSchema };
   return api;

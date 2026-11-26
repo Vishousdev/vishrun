@@ -12,8 +12,9 @@ import { clearMvuSchema } from './mvu-schema';
 import { fetchCdnBundle } from '../core/asset-injector';
 import { cardGreetings, greetingIndex } from '../core/greetings';
 import { getActiveCard } from '../state/active-card';
+import { createSillyTavern, refreshStMeta } from './st-context';
 import {
-  buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshRegexes, refreshVars, refreshWorldbooks, TAVERN_EVENTS,
+  buildThApi, emit, refreshCharacter, refreshMessages, refreshPreset, refreshRegexes, refreshVars, refreshWorldbooks, TAVERN_EVENTS, toastrFor,
   type RuntimeState, type ScriptButton,
 } from './th-api';
 
@@ -109,6 +110,7 @@ interface Running {
   stopAlias: () => void;
   stopNodes: () => void;
   stopStandIns: () => void;
+  stopGlobal: () => void;
 }
 
 const FRAME_ATTR = 'data-vishrun-preset-script';
@@ -123,6 +125,15 @@ function jqueryForParent(source: string): string {
     `var jq=p.jQuery;` +
     `if(had$)p.$=old$;else delete p.$;if(hadJ)p.jQuery=oldJ;else delete p.jQuery;` +
     `window.$=window.jQuery=jq;})();`;
+}
+
+// SillyTavern's page globals, read by widgets and scripts through
+// window.parent. Names the page already has are left alone.
+function pageGlobals(globals: Record<string, unknown>): () => void {
+  const w = window as unknown as Record<string, unknown>;
+  const set = Object.keys(globals).filter((k) => !(k in w));
+  for (const k of set) w[k] = globals[k];
+  return () => { for (const k of set) if (w[k] === globals[k]) delete w[k]; };
 }
 
 function addScript(doc: Document, code: string, module = false): void {
@@ -182,6 +193,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
     running.stopStandIns();
     for (const a of running.actions.values()) a.destroy();
     running.stopAlias();
+    running.stopGlobal();
     running.state.listeners.clear();
     clearMvuSchema();
     running = null;
@@ -203,6 +215,9 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       worldbooks: { primary: null, additional: [], all: [] },
       regexes: { character: [], global: [] },
       listeners: new Map(),
+      stMeta: {},
+      userName: '',
+      st: null,
       getButtons: (id) => buttons.get(id) ?? [],
       setButtons: (scriptId, list) => {
         buttons.set(scriptId, list);
@@ -220,6 +235,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       },
     };
     for (const s of scripts) state.setButtons(s.id, s.buttons);
+    state.st = createSillyTavern(state);
     return { state, actions };
   };
 
@@ -282,7 +298,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         await refreshPreset(st).catch(() => {});
       }
       if (chatChanged) {
-        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st)]).catch(() => {});
+        await Promise.all([refreshVars(st), refreshMessages(st), refreshPreset(st), refreshCharacter(st), refreshWorldbooks(st), refreshRegexes(st), refreshStMeta(st)]).catch(() => {});
         emit(st, TAVERN_EVENTS.CHAT_CHANGED, chatId);
       }
       return;
@@ -315,7 +331,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
 
     const scripts = allowed.flatMap(runnable);
     const { state, actions } = makeState(info, scripts);
-    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state)]).catch((e) => {
+    await Promise.all([refreshPreset(state), refreshVars(state), refreshMessages(state), refreshCharacter(state), refreshWorldbooks(state), refreshRegexes(state), refreshStMeta(state)]).catch((e) => {
       console.warn('[vishrun] scripts: initial load', e);
     });
     const presetSource = allowed.find((s) => s.kind === 'preset');
@@ -347,7 +363,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
         }
       });
     };
-    running = { key: runKey, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {} };
+    running = { key: runKey, state, frames, actions, stopAlias: () => {}, stopNodes: trackPageNodes(), stopStandIns: () => {}, stopGlobal: pageGlobals({ SillyTavern: state.st, toastr: toastrFor(ctx) }) };
     if (info.preset) {
       running.stopStandIns = installStandIns(state.preset?.prefill ?? '', (value) => {
         if (!state.presetId) return;
@@ -416,9 +432,23 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       });
     }),
     forward('GENERATION_ENDED', TAVERN_EVENTS.MESSAGE_RECEIVED, true),
-    forward('GENERATION_STARTED', TAVERN_EVENTS.GENERATION_STARTED, false),
+    // ST passes (type, options, dryRun), then fires GENERATION_AFTER_COMMANDS the same way.
+    ctx.events.on('GENERATION_STARTED', (payload) => {
+      if (!running) return;
+      const type = String((payload as { generationType?: unknown } | null)?.generationType ?? 'normal');
+      emit(running.state, TAVERN_EVENTS.GENERATION_STARTED, type, {}, false);
+      emit(running.state, TAVERN_EVENTS.GENERATION_AFTER_COMMANDS, type, {}, false);
+    }),
     forward('GENERATION_ENDED', TAVERN_EVENTS.GENERATION_ENDED, false),
     forward('GENERATION_STOPPED', TAVERN_EVENTS.GENERATION_STOPPED, true),
+    // ST passes the activated entries; map Lumiverse's to its field names.
+    ctx.events.on('WORLD_INFO_ACTIVATED', (payload) => {
+      const p = payload as { chatId?: string; entries?: { id: string; comment?: string; keys?: string[]; bookName?: string; activationType?: string }[] } | null;
+      if (!running || !p || p.chatId !== ctx.getActiveChat().chatId) return;
+      emit(running.state, TAVERN_EVENTS.WORLD_INFO_ACTIVATED, (p.entries ?? []).map((e) => ({
+        uid: e.id, comment: e.comment ?? '', key: e.keys ?? [], world: e.bookName ?? '', constant: e.activationType === 'constant',
+      })));
+    }),
   ];
 
   // SillyTavern fires these when the model or connection profile changes.
