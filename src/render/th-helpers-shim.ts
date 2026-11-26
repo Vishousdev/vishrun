@@ -1,4 +1,5 @@
 import type { SnapshotMessage } from '../backend/th-helpers';
+import { inlineJson } from './inline-json';
 
 // TS twin of the ES5 shim string in thHelpersShim() below. The twin is
 // testable with happy-dom; the string runs in the sandbox iframe.
@@ -145,7 +146,7 @@ export function createThHelpers(
 // setChatMessage goes through the postMessage bridge to backend
 // (host-side dispatcher posts 'th-response' back keyed by requestId).
 export function thHelpersShim(consts: ThHelpersConstants): string {
-  const constsJson = JSON.stringify({
+  const constsJson = inlineJson({
     currentMessageIndex: consts.currentMessageIndex,
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
