@@ -11,8 +11,8 @@ import {
   destroyWidgetIframe,
   hasRegisteredWidgetsFor,
   setWidgetSource,
-  widgetNeedsIsolation,
 } from './widget-iframe';
+import { inlineBlock } from './inline-block';
 import { getCapturesForMessage, syncStrippedTagCaptures } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
@@ -107,9 +107,8 @@ export function getEditingMessageIdsForTest(): ReadonlySet<string> {
  *      Read the captures map populated by tag-interceptor.ts. For each
  *      capture not already rendered as a widget in this message, append
  *      one to the message's [data-component="MessageContent"] node.
- *      Widgets are always iframes here for safety — paired-tag widgets
- *      tend to carry behavior (Vavesta Court Ledger has <script>) and
- *      keeping them isolated from the host CSS is conservative.
+ *      Script-free widgets render inline with scoped styles, as in
+ *      SillyTavern; anything that can run code gets a frame (inline-block.ts).
  *
  * Idempotency: both pipelines skip work where a [data-vishrun-widget] is
  * already in place. Re-running on the same DOM is a no-op.
@@ -820,9 +819,6 @@ async function renderPairedTagCaptures(
     const fromMap = resolvedMap.get(expanded);
     const fromCache = fromMap ?? resolutionCache.get(expanded);
     const finalHtml = fromCache ?? expanded;
-    // Paired-tag widgets always go through the iframe path (some cards
-    // ship <script>). await: buildWidgetIframe may fetch the Tailwind
-    // bundle on first use (cached thereafter).
     if (finalHtml.trim() === '') {
       // Strip-only scripts (e.g. hiding <UpdateVariable>): the host interceptor
       // already removed the tag; keep an inert marker for idempotency only.
@@ -840,8 +836,8 @@ async function renderPairedTagCaptures(
     }
     const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
     const rawPos = anchor ? null : await rawPositionOf(messageId, cap.fullMatch, ctx);
-    const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
-    iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
+    const widget = await buildWidget(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
+    widget.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
     // capture's widget, or a React rebuild may have detached `target`. In
     // either case drop the just-built iframe (releasing its host record) and
@@ -853,10 +849,10 @@ async function renderPairedTagCaptures(
           reason: !target.isConnected ? 'target-disconnected-post-await' : 'sibling-mounted-during-await',
         }));
       }
-      destroyWidgetIframe(iframe);
+      if (widget.tagName === 'IFRAME') destroyWidgetIframe(widget as HTMLIFrameElement);
       continue;
     }
-    if (!anchor || !placeAtAnchor(target, anchor, iframe)) placeByRawOrder(target, iframe, rawPos, allScripts, captures);
+    if (!anchor || !placeAtAnchor(target, anchor, widget)) placeByRawOrder(target, widget, rawPos, allScripts, captures);
     added++;
   }
 
@@ -1045,9 +1041,8 @@ async function buildWidget(
   messageId: string,
   ctx: SpindleFrontendContext,
 ): Promise<HTMLElement> {
-  if (widgetNeedsIsolation(html)) {
-    return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
-  }
+  const content = inlineBlock(html);
+  if (!content) return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
   const wrapper = ctx.dom.createElement('div', {
     'data-vishrun-widget': scriptName,
     'data-vishrun-script-id': scriptId,
@@ -1056,7 +1051,7 @@ async function buildWidget(
   // Without this, no-isolation widgets (innerHTML+div path) render flush
   // against adjacent message text and feel cramped — Step 6 user feedback.
   wrapper.style.margin = '12px 0';
-  wrapper.innerHTML = html;
+  wrapper.appendChild(content);
   return wrapper;
 }
 

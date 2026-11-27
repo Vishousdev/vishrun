@@ -1,5 +1,6 @@
 import { api, varsLog } from './common';
 import { applySetvarOp, type VarsApi } from './setvar-ops';
+import { stMacros } from './st-macros';
 import type { SetvarKind } from './parsers/setvar';
 
 // Frontend → backend: resolve a batch of `{{macro}}` widget templates via the
@@ -39,7 +40,7 @@ function isResolveMacrosRequest(p: unknown): p is ResolveMacrosRequest {
 // (illegal in HTML anyway) to keep that guarantee.
 const VALID_MACRO_NAMES = [
   'getvar', 'setvar', 'addvar', 'incvar', 'decvar',
-  'getchatvar', 'setchatvar',
+  'getchatvar', 'setchatvar', 'addchatvar', 'incchatvar', 'decchatvar',
   'getgvar', 'setgvar', 'getglobalvar', 'setglobalvar',
   'user', 'char', 'group',
   'newline', 'input', 'random',
@@ -116,14 +117,10 @@ async function runApplyAndStripSetvars(
 ): Promise<string> {
   // Read current bags once per scope so we can skip idempotent writes.
   // Failure → null map → all writes proceed (safe fallback).
-  let localBag: Record<string, string> | null = null;
+  // setvar and setchatvar both write the chat variables.
+  const isChat = (kind: string) => kind === 'setvar' || kind === 'setchatvar';
   let chatBag: Record<string, string> | null = null;
-  const needLocal = matches.some((m) => m.kind === 'setvar' && NAME_RE.test(m.name));
-  const needChat = matches.some((m) => m.kind === 'setchatvar' && NAME_RE.test(m.name));
-  if (needLocal) {
-    try { localBag = await vars.local.list(chatId); } catch { localBag = null; }
-  }
-  if (needChat) {
+  if (matches.some((m) => isChat(m.kind) && NAME_RE.test(m.name))) {
     try { chatBag = await vars.chat.list(chatId); } catch { chatBag = null; }
   }
 
@@ -131,7 +128,7 @@ async function runApplyAndStripSetvars(
   for (let i = 0; i < matches.length; i++) {
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name)) continue;
-    const currentBag = kind === 'setvar' ? localBag : kind === 'setchatvar' ? chatBag : null;
+    const currentBag = isChat(kind) ? chatBag : null;
     if (currentBag && currentBag[name] === value) {
       stripFlags[i] = true;
       continue;
@@ -169,7 +166,7 @@ export function installMacroResolveHandler(): void {
           // chat (and within this same template) reads the freshly set value
           // when the engine resolves. addvar/etc. and disabled gvars pass
           // through to the engine no-op via commit:false.
-          const stripped = await applyAndStripSetvars(original, chatId, userId);
+          const stripped = await applyAndStripSetvars(await stMacros(original, userId), chatId, userId);
           const { masked, masks } = maskInvalidMacros(stripped);
           // userId — required for operator-scoped extensions (which is how Vishrun
           // installs); the host injects it as onFrontendMessage's 2nd arg.

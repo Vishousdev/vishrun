@@ -185,6 +185,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
   let again = false;
   let lastChatId = ctx.getActiveChat().chatId;
   const declined = new Set<string>();
+  let greetingSwiped: (() => void) | null = null;
 
   const stop = () => {
     if (!running) return;
@@ -360,6 +361,7 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
           if (!msg) continue;
           seen.set(row, rowKey(row, msg.content.length));
           emit(state, msg.is_user ? TAVERN_EVENTS.USER_MESSAGE_RENDERED : TAVERN_EVENTS.CHARACTER_MESSAGE_RENDERED, idx);
+          if (idx === 0) greetingSwiped?.();
         }
       });
     };
@@ -428,7 +430,12 @@ export function installPresetScripts(ctx: SpindleFrontendContext): () => void {
       const before = greetingIndex(st.messages[0]?.content, greetings);
       void refreshMessages(st).then(() => {
         const after = greetingIndex(st.messages[0]?.content, greetings);
-        if (after !== before && after !== -1) emit(st, TAVERN_EVENTS.MESSAGE_SWIPED, 0);
+        if (after === before || after === -1) return;
+        // ST fires this once the new greeting is drawn: wait for row 0 to be
+        // drawn again, or 1s when it is off screen.
+        const fire = () => { clearTimeout(timer); greetingSwiped = null; emit(st, TAVERN_EVENTS.MESSAGE_SWIPED, 0); };
+        const timer = setTimeout(fire, 1000);
+        greetingSwiped = fire;
       });
     }),
     forward('GENERATION_ENDED', TAVERN_EVENTS.MESSAGE_RECEIVED, true),

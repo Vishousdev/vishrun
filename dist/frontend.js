@@ -3620,6 +3620,7 @@ function installPresetScripts(ctx) {
   let again = false;
   let lastChatId = ctx.getActiveChat().chatId;
   const declined = new Set;
+  let greetingSwiped = null;
   const stop = () => {
     if (!running)
       return;
@@ -3805,6 +3806,8 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
             continue;
           seen.set(row, rowKey(row, msg.content.length));
           emit(state, msg.is_user ? TAVERN_EVENTS.USER_MESSAGE_RENDERED : TAVERN_EVENTS.CHARACTER_MESSAGE_RENDERED, idx);
+          if (idx === 0)
+            greetingSwiped?.();
         }
       });
     };
@@ -3875,8 +3878,15 @@ They can change ${src.kind === "preset" ? "this preset" : "this chat"} and the p
       const before = greetingIndex(st.messages[0]?.content, greetings);
       refreshMessages(st).then(() => {
         const after = greetingIndex(st.messages[0]?.content, greetings);
-        if (after !== before && after !== -1)
+        if (after === before || after === -1)
+          return;
+        const fire = () => {
+          clearTimeout(timer);
+          greetingSwiped = null;
           emit(st, TAVERN_EVENTS.MESSAGE_SWIPED, 0);
+        };
+        const timer = setTimeout(fire, 1000);
+        greetingSwiped = fire;
       });
     }),
     forward("GENERATION_ENDED", TAVERN_EVENTS.MESSAGE_RECEIVED, true),
@@ -4814,15 +4824,6 @@ function destroyWidgetIframe(iframe, reason = "unspecified") {
   }
   iframe.remove();
 }
-function containsScriptTag(html) {
-  return /<script\b[^>]*>/i.test(html);
-}
-function containsInlineEventHandler(html) {
-  return /\bon(?:click|load|mouseover|mouseout|mousedown|mouseup|mousemove|change|input|submit|focus|blur|keydown|keyup|keypress|error|abort|cancel|toggle|wheel|contextmenu)\s*=/i.test(html);
-}
-function widgetNeedsIsolation(html) {
-  return containsScriptTag(html) || containsInlineEventHandler(html);
-}
 async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withExternalScripts = await transformHtmlForExternalScripts(withJsrGlobalLibraries(replaceMinHeightVh(html)), ctx);
   const withFonts = await transformHtmlForExternalStylesheets(withExternalScripts, ctx);
@@ -5326,6 +5327,37 @@ async function handleSetChatMessages(iframe, payload, ctx) {
       continue;
     }
   }
+}
+
+// src/render/inline-block.ts
+var FRAMED_TAGS = "script,iframe,frame,object,embed,meta,base,link,form,math,noscript,portal";
+var DOCUMENT_RE = /<(?:!doctype|html|head|body)\b/i;
+var HTML_FENCE_RE2 = /```(?:html)?[ \t]*\r?\n\s*</i;
+var UNSAFE_URL_RE = /^(?:javascript|vbscript|data:text\/html)/i;
+var SCOPE = '@scope ([data-component="MessageContent"], [data-vishrun-widget])';
+function inlineBlock(html) {
+  if (typeof CSSScopeRule === "undefined")
+    return null;
+  if (DOCUMENT_RE.test(html) || HTML_FENCE_RE2.test(html))
+    return null;
+  const t = document.createElement("template");
+  t.innerHTML = html;
+  const els = t.content.querySelectorAll("*");
+  for (const el of els) {
+    if (el.matches(FRAMED_TAGS))
+      return null;
+    for (const a of el.attributes) {
+      if (a.name.startsWith("on") || a.name === "srcdoc")
+        return null;
+      if (UNSAFE_URL_RE.test(a.value.replace(/[\s\u0000-\u001f]/g, "")))
+        return null;
+    }
+  }
+  for (const s of t.content.querySelectorAll("style"))
+    s.textContent = `${SCOPE} {
+${s.textContent}
+}`;
+  return t.content;
 }
 
 // src/hooks/tag-interceptor.ts
@@ -6286,8 +6318,8 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
     }
     const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
     const rawPos = anchor ? null : await rawPositionOf(messageId, cap.fullMatch, ctx);
-    const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
-    iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
+    const widget = await buildWidget(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
+    widget.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     if (!target.isConnected || deepQuerySelector(target, sel)) {
       if (VSH_VISHRUN_DIAG) {
         console.log("[vishrun:render] placeholder-skipped", JSON.stringify({
@@ -6296,11 +6328,12 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolve
           reason: !target.isConnected ? "target-disconnected-post-await" : "sibling-mounted-during-await"
         }));
       }
-      destroyWidgetIframe(iframe);
+      if (widget.tagName === "IFRAME")
+        destroyWidgetIframe(widget);
       continue;
     }
-    if (!anchor || !placeAtAnchor(target, anchor, iframe))
-      placeByRawOrder(target, iframe, rawPos, allScripts, captures);
+    if (!anchor || !placeAtAnchor(target, anchor, widget))
+      placeByRawOrder(target, widget, rawPos, allScripts, captures);
     added++;
   }
   return added;
@@ -6467,15 +6500,15 @@ function findContentRoot(messageNode) {
   return inner ?? messageNode;
 }
 async function buildWidget(html, scriptName, scriptId, messageId, ctx) {
-  if (widgetNeedsIsolation(html)) {
+  const content = inlineBlock(html);
+  if (!content)
     return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
-  }
   const wrapper = ctx.dom.createElement("div", {
     "data-vishrun-widget": scriptName,
     "data-vishrun-script-id": scriptId
   });
   wrapper.style.margin = "12px 0";
-  wrapper.innerHTML = html;
+  wrapper.appendChild(content);
   return wrapper;
 }
 function collectTextNodes(root) {
