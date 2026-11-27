@@ -780,16 +780,26 @@ function installWidgetFetchHandler() {
 
 // src/backend/setvar-ops.ts
 async function applySetvarOp(op, chatId, userId, vars = api.variables) {
-  if (op.kind === "setvar") {
-    await vars.local.set(chatId, op.name, op.value);
-    return true;
-  }
-  if (op.kind === "setchatvar") {
+  if (op.kind === "setvar" || op.kind === "setchatvar") {
     await vars.chat.set(chatId, op.name, op.value);
     return true;
   }
   varsLog.debug(`skipping ${op.kind} (upstream get/set path split):`, { name: op.name, userId });
   return false;
+}
+
+// src/backend/st-macros.ts
+var LOCAL_RE = /\{\{(get|set|add|inc|dec)var::/gi;
+var GLOBAL_RE = /\{\{(?:getglobalvar|getgvar)::([^}]+)\}\}/gi;
+function toChatVarMacros(template) {
+  return template.replace(LOCAL_RE, (_m, op) => `{{${op.toLowerCase()}chatvar::`);
+}
+async function stMacros(template, userId, listGlobals = (u) => api.variables.global.list(u)) {
+  const text = toChatVarMacros(template);
+  if (!/\{\{(?:getglobalvar|getgvar)::/i.test(text))
+    return text;
+  const globals = await listGlobals(userId).catch(() => ({}));
+  return text.replace(GLOBAL_RE, (m, k) => globals[k.trim()] ?? m);
 }
 
 // src/backend/macro-resolve.ts
@@ -807,6 +817,9 @@ var VALID_MACRO_NAMES = [
   "decvar",
   "getchatvar",
   "setchatvar",
+  "addchatvar",
+  "incchatvar",
+  "decchatvar",
   "getgvar",
   "setgvar",
   "getglobalvar",
@@ -858,18 +871,9 @@ async function applyAndStripSetvars(template, chatId, userId, vars = api.variabl
   return work;
 }
 async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) {
-  let localBag = null;
+  const isChat = (kind) => kind === "setvar" || kind === "setchatvar";
   let chatBag = null;
-  const needLocal = matches.some((m) => m.kind === "setvar" && NAME_RE.test(m.name));
-  const needChat = matches.some((m) => m.kind === "setchatvar" && NAME_RE.test(m.name));
-  if (needLocal) {
-    try {
-      localBag = await vars.local.list(chatId);
-    } catch {
-      localBag = null;
-    }
-  }
-  if (needChat) {
+  if (matches.some((m) => isChat(m.kind) && NAME_RE.test(m.name))) {
     try {
       chatBag = await vars.chat.list(chatId);
     } catch {
@@ -881,7 +885,7 @@ async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) 
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name))
       continue;
-    const currentBag = kind === "setvar" ? localBag : kind === "setchatvar" ? chatBag : null;
+    const currentBag = isChat(kind) ? chatBag : null;
     if (currentBag && currentBag[name] === value) {
       stripFlags[i] = true;
       continue;
@@ -916,7 +920,7 @@ function installMacroResolveHandler() {
       for (let i = 0;i < templates.length; i++) {
         const original = templates[i];
         try {
-          const stripped = await applyAndStripSetvars(original, chatId, userId);
+          const stripped = await applyAndStripSetvars(await stMacros(original, userId), chatId, userId);
           const { masked, masks } = maskInvalidMacros(stripped);
           const { text, diagnostics } = await api.macros.resolve(masked, {
             chatId,
@@ -6041,8 +6045,7 @@ function depthPromptOf(card) {
 async function noteText(dp, chatId, characterId, userId) {
   if (!dp)
     return "";
-  const vars = await api.variables.chat.list(chatId).catch(() => ({}));
-  const text = dp.prompt.replace(/\{\{getvar::([^}]+)\}\}/g, (m, k) => vars[k.trim()] ?? m);
+  const text = await stMacros(dp.prompt, userId);
   try {
     return (await api.macros.resolve(text, { chatId, characterId, userId, commit: false })).text.trim();
   } catch {

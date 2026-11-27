@@ -30,7 +30,7 @@ test('single /setvar', async () => {
   const { vars, varCalls, appendMessage, appendCalls } = makeFakes();
   const result = await dispatchSlashText('/setvar key=yen 5000', CHAT, USER, { vars, appendMessage });
   expect(result).toEqual({ handled: true, kind: 'setvar_chain' });
-  expect(varCalls).toEqual([{ scope: 'local', args: [CHAT, 'yen', '5000'] }]);
+  expect(varCalls).toEqual([{ scope: 'chat', args: [CHAT, 'yen', '5000'] }]);
   expect(appendCalls).toEqual([]);
 });
 
@@ -39,8 +39,8 @@ test('chained /setvar pairs in document order', async () => {
   const result = await dispatchSlashText('/setvar key=yen 5000 | /setvar key=grade "Grade 2"', CHAT, USER, { vars, appendMessage });
   expect(result).toEqual({ handled: true, kind: 'setvar_chain' });
   expect(varCalls).toEqual([
-    { scope: 'local', args: [CHAT, 'yen', '5000'] },
-    { scope: 'local', args: [CHAT, 'grade', 'Grade 2'] },
+    { scope: 'chat', args: [CHAT, 'yen', '5000'] },
+    { scope: 'chat', args: [CHAT, 'grade', 'Grade 2'] },
   ]);
 });
 
@@ -58,7 +58,7 @@ test('/sys alone produces empty system message', async () => {
   expect(appendCalls).toEqual([{ chatId: CHAT, role: 'system', content: '' }]);
 });
 
-test('mix /setvar + /setgvar applies local, skips gvar, handled true', async () => {
+test('mix /setvar + /setgvar applies chat, skips gvar, handled true', async () => {
   // varsLog.debug fires in the gvar skip branch; swallow so test output stays clean.
   const restoreDebug = console.debug;
   console.debug = mock(() => {});
@@ -66,7 +66,7 @@ test('mix /setvar + /setgvar applies local, skips gvar, handled true', async () 
     const { vars, varCalls, appendMessage } = makeFakes();
     const result = await dispatchSlashText('/setvar key=yen 5000 | /setgvar key=level 99', CHAT, USER, { vars, appendMessage });
     expect(result).toEqual({ handled: true, kind: 'setvar_chain' });
-    expect(varCalls).toEqual([{ scope: 'local', args: [CHAT, 'yen', '5000'] }]);
+    expect(varCalls).toEqual([{ scope: 'chat', args: [CHAT, 'yen', '5000'] }]);
   } finally {
     console.debug = restoreDebug;
   }

@@ -1,5 +1,6 @@
 import type { LlmMessageDTO } from 'lumiverse-spindle-types';
 import { api } from './common';
+import { stMacros } from './st-macros';
 import { needsSt, stDecisions, type StEntry } from '../core/st-lorebook';
 
 // SillyTavern prompt behaviour Lumiverse lacks: the card's Character's Note
@@ -31,13 +32,10 @@ export function depthPromptOf(card: CardLike | null): DepthPrompt | null {
   return { prompt: d.prompt, depth, role };
 }
 
-// ST's {{getvar}} reads the chat variables scripts write; Lumiverse's reads
-// another scope, so fill those first. userId is required: Vishrun installs
-// operator-scoped.
+// userId is required: Vishrun installs operator-scoped.
 async function noteText(dp: DepthPrompt | null, chatId: string, characterId: string, userId?: string): Promise<string> {
   if (!dp) return '';
-  const vars = await api.variables.chat.list(chatId).catch(() => ({} as Record<string, string>));
-  const text = dp.prompt.replace(/\{\{getvar::([^}]+)\}\}/g, (m, k: string) => vars[k.trim()] ?? m);
+  const text = await stMacros(dp.prompt, userId);
   try { return (await api.macros.resolve(text, { chatId, characterId, userId, commit: false })).text.trim(); } catch { return text; }
 }
 

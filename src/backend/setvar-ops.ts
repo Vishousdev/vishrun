@@ -28,11 +28,8 @@ export async function applySetvarOp(
   userId: string,
   vars: VarsApi = api.variables,
 ): Promise<boolean> {
-  if (op.kind === 'setvar') {
-    await vars.local.set(chatId, op.name, op.value);
-    return true;
-  }
-  if (op.kind === 'setchatvar') {
+  // ST's setvar writes the chat variables, like setchatvar.
+  if (op.kind === 'setvar' || op.kind === 'setchatvar') {
     await vars.chat.set(chatId, op.name, op.value);
     return true;
   }
