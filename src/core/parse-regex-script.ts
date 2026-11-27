@@ -47,8 +47,8 @@ export function stripCodeFence(s: string): string {
  * to `new RegExp` makes the slashes part of the pattern and the regex
  * never matches anything.
  *
- * The inner pattern is parsed tolerantly: escape sequences (`\.`, `\/`,
- * `\\`) are preserved as-is; the closing `/` is the first unescaped slash.
+ * As in SillyTavern, the pattern runs to the last `/`, so an unescaped `/`
+ * inside it (`</tag>`) is kept; escape sequences are preserved as-is.
  * Flags are validated against the JS-supported set; anything else falls
  * through to "not a literal" so we don't silently misinterpret a pattern
  * that happens to start with `/`.
@@ -57,7 +57,7 @@ export function stripCodeFence(s: string): string {
  * literal (caller treats the whole input as the pattern).
  */
 export function parseRegexLiteral(s: string): { pattern: string; flags: string } {
-  const m = s.match(/^\s*\/((?:\\.|[^/\\])*)\/([gimsuy]*)\s*$/);
+  const m = s.match(/^\s*\/([\s\S]+)\/([gimsuy]*)\s*$/);
   if (!m || !m[1]) return { pattern: s, flags: '' };
   return { pattern: m[1], flags: m[2] };
 }
