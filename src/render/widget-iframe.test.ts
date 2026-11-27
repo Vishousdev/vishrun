@@ -1,7 +1,7 @@
 import { test, expect } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { resolveCurrentMessageIndex } from './widget-iframe';
+import { resolveCurrentMessageIndex, rewriteCssExternalUrls } from './widget-iframe';
 import type { SnapshotMessage } from '../backend/th-helpers';
 
 function makeSnap(ids: string[]): SnapshotMessage[] {
@@ -103,4 +103,10 @@ test('headIntoBody moves card head content to the start of body, like JS-Slash-R
     .toBe('<html><head></head><body><style>a{}</style><p>x</p></body></html>');
   expect(headIntoBody('<div>no document</div>')).toBe('<div>no document</div>');
   expect(headIntoBody('<html><head></head><body>y</body></html>')).toBe('<html><head></head><body>y</body></html>');
+});
+
+test('css url rewrite: static URLs become proxy sentinels, script template URLs are left for runtime', () => {
+  expect(rewriteCssExternalUrls("a{background:url('https://x.test/a.png')}")).toContain('data:application/x-vishrun-cssproxy;base64,');
+  const js = "el.style.backgroundImage = `url('https://x.test/${info.avatar}')`;";
+  expect(rewriteCssExternalUrls(js)).toBe(js);
 });

@@ -175,3 +175,9 @@ test('compileScripts: self-closing findRe matches expanded content', () => {
   expect(m).not.toBeNull();
   expect(m![0]).toBe('<StatusPlaceHolderImpl></StatusPlaceHolderImpl>');
 });
+
+test('parseRegexLiteral: unescaped slash inside the pattern (closing tag), like ST', () => {
+  const r = parseRegexLiteral('/<tag>\\s*(.*?)\\s*</tag>/gs');
+  expect(r).toEqual({ pattern: '<tag>\\s*(.*?)\\s*</tag>', flags: 'gs' });
+  expect(new RegExp(r.pattern, r.flags).exec('<tag> hi </tag>')?.[1]).toBe('hi');
+});

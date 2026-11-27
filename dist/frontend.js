@@ -516,7 +516,7 @@ function stripCodeFence(s) {
   return m ? m[1] : s;
 }
 function parseRegexLiteral(s) {
-  const m = s.match(/^\s*\/((?:\\.|[^/\\])*)\/([gimsuy]*)\s*$/);
+  const m = s.match(/^\s*\/([\s\S]+)\/([gimsuy]*)\s*$/);
   if (!m || !m[1])
     return { pattern: s, flags: "" };
   return { pattern: m[1], flags: m[2] };
@@ -4844,7 +4844,9 @@ var VISHRUN_CSS_SENTINEL_PREFIX = "data:application/x-vishrun-cssproxy;base64,";
 function rewriteCssExternalUrls(html) {
   if (html.indexOf("url(") === -1)
     return html;
-  return html.replace(/url\(\s*(['"]?)(https?:\/\/[^'")\s]+)\1\s*\)/gi, (_match, _quote, url) => {
+  return html.replace(/url\(\s*(['"]?)(https?:\/\/[^'")\s]+)\1\s*\)/gi, (match, _quote, url) => {
+    if (url.includes("${"))
+      return match;
     const encoded = btoa(url);
     return `url("${VISHRUN_CSS_SENTINEL_PREFIX}${encoded}")`;
   });
