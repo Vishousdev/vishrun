@@ -1,6 +1,7 @@
 import type { CharacterDTO, ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
 import { api } from './common';
 import { cardGreetings, greetingIndex } from '../core/greetings';
+import { cachedCard } from './card-cache';
 import { computeVariablesSnapshot, emptyMvuData, type MvuData } from './mvu-parser';
 import { initvarFromEntries, type InitvarEntry } from './mvu-initvar';
 
@@ -139,7 +140,7 @@ async function fetchChatCharacter(
     if (chatDto && typeof chatDto.character_id === 'string') charId = chatDto.character_id;
   }
   if (!charId) return null;
-  return (await characters.get(charId, userId)) ?? null;
+  return cachedCard(charId, userId, characters);
 }
 
 function greetingsOf(card: CharacterDTO | null): string[] {
