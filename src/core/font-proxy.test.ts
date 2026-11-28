@@ -1,5 +1,5 @@
 import { test, expect, beforeEach } from 'bun:test';
-import { __resetFontCacheForTests, parseFontFaces, transformHtmlForStylesheets } from './font-proxy';
+import { __resetFontCacheForTests, moveFontFaces, parseFontFaces, transformHtmlForStylesheets } from './font-proxy';
 
 beforeEach(() => __resetFontCacheForTests());
 
@@ -99,4 +99,19 @@ test('fetched CSS cannot close the style block or the font script', async () => 
   expect([...doc.querySelectorAll('script')].map((s) => s.getAttribute('type'))).toEqual(['application/vishrun-font-config']);
   expect(doc.querySelectorAll('style')).toHaveLength(1);
   expect(JSON.parse(doc.querySelector('script')!.textContent!)[0].family).toBe('</script>');
+});
+
+test('remote @font-face in a widget <style> moves to the font loader', () => {
+  const html = `<style>@font-face { font-family: 'Ye'; src: url('https://cdn.example/ye.ttf') format('truetype'); }\n.t{font-family:'Ye'}</style><p class="t">a</p>`;
+  const out = moveFontFaces(html);
+  expect(out).toContain('data-vishrun-fonts>[{"family":"Ye","url":"https://cdn.example/ye.ttf"}]</script>');
+  expect(out).not.toContain('@font-face');
+  expect(out).toContain(".t{font-family:'Ye'}");
+});
+
+test('data: fonts and <style> inside scripts are left alone', () => {
+  const data = `<style>@font-face { font-family: 'D'; src: url(data:font/woff2;base64,AA); }</style>`;
+  expect(moveFontFaces(data)).toBe(data);
+  const tpl = `<script>el.innerHTML = '<style>@font-face{font-family:X;src:url(https://a/x.ttf)}</style>';</script>`;
+  expect(moveFontFaces(tpl)).toBe(tpl);
 });

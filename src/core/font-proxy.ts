@@ -132,7 +132,25 @@ const external = (u: string) => (/^https?:\/\//i.test(u) ? u : null);
 
 const isStylesheetLink = (tag: string) => /\bstylesheet\b/i.test(attr(tag, 'rel') ?? '');
 
-export async function transformHtmlForStylesheets(html: string, fetchText: TextFetch): Promise<string> {
+// @font-face rules with remote files in a widget's own <style> blocks: the
+// sandbox image proxy refuses fonts, so they go through the font proxy too.
+// Blocks inside <script> are template text and stay as they are.
+const SCRIPT_RE = /<script\b[\s\S]*?<\/script>/gi;
+const remoteFonts = (css: string) => parseFontFaces(css, 'about:blank');
+
+export function moveFontFaces(html: string): string {
+  if (!/@font-face/i.test(html)) return html;
+  const scripts = [...html.matchAll(SCRIPT_RE)].map((m) => [m.index!, m.index! + m[0].length]);
+  return html.replace(STYLE_BLOCK_RE, (block: string, _css: string, at: number) => {
+    if (scripts.some(([a, b]) => at > a && at < b)) return block;
+    const fonts = remoteFonts(block);
+    if (!fonts.length) return block;
+    return fontScript(fonts) + block.replace(FONT_FACE_RE, (rule) => (remoteFonts(rule).length ? '' : rule));
+  });
+}
+
+export async function transformHtmlForStylesheets(source: string, fetchText: TextFetch): Promise<string> {
+  const html = moveFontFaces(source);
   if (!/<link\b|@import/i.test(html)) return html;
   const load = (url: string) =>
     fetchSheet(url, fetchText).catch((err) => {
