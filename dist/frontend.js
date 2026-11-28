@@ -6987,6 +6987,7 @@ function requestRegexTakeover(ctx, characterId, scripts) {
 var ROW = "[data-message-id]";
 var CODEBLOCK = '[class*="_codeBlock_"]';
 var WRAP_ATTR = "data-vishrun-codeblock";
+var WRAP_TAG = "vishrun-codeblock";
 var SOURCE_ATTR = "data-vishrun-codeblock-source";
 function isFrontendCode(text) {
   return /html>|<head>|<body/i.test(text);
@@ -7031,7 +7032,8 @@ function installHtmlCodeblocks(ctx) {
         destroyWidgetIframe(iframe, "codeblock-stale");
         return;
       }
-      const wrap = document.createElement("div");
+      const wrap = document.createElement(WRAP_TAG);
+      wrap.style.display = "block";
       wrap.setAttribute(WRAP_ATTR, "");
       wrap.appendChild(iframe);
       block.before(wrap);
@@ -7046,8 +7048,8 @@ function installHtmlCodeblocks(ctx) {
   };
   const scan = () => {
     timer = null;
-    for (const [block] of frames)
-      if (!block.isConnected)
+    for (const [block, { wrap }] of frames)
+      if (!block.isConnected || !wrap.isConnected)
         restore(block);
     for (const wrap of document.querySelectorAll(`[${WRAP_ATTR}]`)) {
       const next = wrap.nextElementSibling;
