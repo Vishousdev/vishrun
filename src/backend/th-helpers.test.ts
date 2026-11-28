@@ -175,10 +175,11 @@ test('handleGetMessagesSnapshot still serves derived swipes when the persist wri
 });
 
 test('handleGetMessagesSnapshot does not clobber already-populated initial swipes', async () => {
-  const chatApi = makeChatApi(makeMessages([{ content: 'g1', swipes: ['g0', 'g1', 'g2'], swipeId: 1 }]));
+  const chatApi = makeChatApi(makeMessages([{ content: 'regen A', swipes: ['g0', 'regen A', 'regen B'], swipeId: 1 }]));
   const charApi = makeCharApi({ first_mes: 'g0', alternate_greetings: ['g1', 'g2', 'g3', 'g4'] });
   const snap = await handleGetMessagesSnapshot('chat-1', 'user-1', chatApi.chat, charApi.chats, charApi.characters);
-  expect(snap[0].swipes).toEqual(['g0', 'g1', 'g2']);
+  expect(snap[0].swipes).toEqual(['g0', 'regen A', 'regen B']);
+  expect(chatApi.updates.length).toBe(0);
 });
 
 test('handleGetMessagesSnapshot leaves non-initial messages unchanged when deriving greetings', async () => {
@@ -428,4 +429,13 @@ test('handleGetVariablesSnapshot replays Queen Bee greeting 0 to full stat_data 
       '科尔': 0, '尼科': 0, '杰克斯': 0, '伊利亚': 0, '迪恩': 0,
     },
   });
+});
+
+test('handleGetMessagesSnapshot re-derives a stored set of card greetings in SillyTavern numbering', async () => {
+  const chatApi = makeChatApi(makeMessages([{ content: 'A', swipes: ['A', 'Home', 'A'] }]));
+  const charApi = makeCharApi({ first_mes: '', alternate_greetings: ['Home', 'A'] });
+  const snap = await handleGetMessagesSnapshot('chat-1', 'user-1', chatApi.chat, charApi.chats, charApi.characters);
+  expect(snap[0].swipes).toEqual(['Home', 'A']);
+  expect(snap[0].swipe_id).toBe(1);
+  expect(chatApi.updates[0].patch).toMatchObject({ swipes: ['Home', 'A'], swipe_id: 1 });
 });
