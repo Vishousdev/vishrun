@@ -1,5 +1,7 @@
 import type { CharacterDTO, ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
 import { api } from './common';
+import { cardGreetings, greetingIndex } from '../core/greetings';
+import { cachedCard } from './card-cache';
 import { computeVariablesSnapshot, emptyMvuData, type MvuData } from './mvu-parser';
 import { initvarFromEntries, type InitvarEntry } from './mvu-initvar';
 
@@ -138,24 +140,14 @@ async function fetchChatCharacter(
     if (chatDto && typeof chatDto.character_id === 'string') charId = chatDto.character_id;
   }
   if (!charId) return null;
-  return (await characters.get(charId, userId)) ?? null;
+  return cachedCard(charId, userId, characters);
 }
 
 function greetingsOf(card: CharacterDTO | null): string[] {
   if (!card) return [];
   const first = typeof card.first_mes === 'string' ? card.first_mes : '';
   const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
-  return [first, ...alt];
-}
-
-async function fetchCharacterGreetings(
-  messages: ChatMessageDTO[],
-  chatId: string,
-  userId: string,
-  chats: ChatsApi,
-  characters: CharactersApi,
-): Promise<string[]> {
-  return greetingsOf(await fetchChatCharacter(messages, chatId, userId, chats, characters));
+  return cardGreetings({ firstMes: first, alternateGreetings: alt });
 }
 
 type WorldBooksApi = { entries: { list(id: string, o?: { limit?: number; offset?: number; userId?: string }): Promise<{ data: InitvarEntry[]; total: number }> } };
@@ -198,28 +190,34 @@ export async function handleGetMessagesSnapshot(
 ): Promise<SnapshotMessage[]> {
   const messages = await chat.getMessages(chatId);
   const snapshot = messages.map((m) => shapeSnapshotMessage(m as ChatMessageDTO));
-  // Initial greeting message: when the chat has not stored real swipe
-  // alternatives yet (fresh chat), expose the full greeting set as swipes so
-  // greeting-selection widgets can index into it, AND persist that array to
-  // the DB so a later setChatMessage(swipe_id) validates against the same
-  // length. A chat that already holds multiple swipes keeps them (no clobber).
-  if (snapshot.length > 0 && snapshot[0].role !== 'user' && snapshot[0].swipes.length <= 1) {
+  // Initial greeting message: expose the card greetings as swipes, numbered
+  // as in SillyTavern, so greeting-selection widgets can index into them, and
+  // persist that array so a later setChatMessage(swipe_id) validates against
+  // it. Stored swipes are replaced only when they are all card greetings (an
+  // earlier derivation); real alternatives are kept.
+  const first = snapshot[0];
+  if (first && first.role !== 'user') {
     try {
-      const greetings = await fetchCharacterGreetings(messages as ChatMessageDTO[], chatId, userId, chats, characters);
-      if (greetings.length > 1) {
-        // Keep the active slot equal to the currently displayed content so the
-        // persist does not rewrite the visible greeting (macros, prior edits).
-        const activeIdx = snapshot[0].swipe_id >= 0 && snapshot[0].swipe_id < greetings.length ? snapshot[0].swipe_id : 0;
+      const card = await fetchChatCharacter(messages as ChatMessageDTO[], chatId, userId, chats, characters);
+      const greetings = greetingsOf(card);
+      const known = card ? [card.first_mes ?? '', ...(card.alternate_greetings ?? [])] : [];
+      const derived = first.swipes.length <= 1 || first.swipes.every((s) => greetingIndex(s, known) >= 0);
+      if (greetings.length > 1 && derived) {
+        // Keep the active slot equal to the displayed content (prior edits).
+        const shown = greetingIndex(first.message, greetings);
+        const activeIdx = shown >= 0 ? shown
+          : first.swipe_id >= 0 && first.swipe_id < greetings.length ? first.swipe_id : 0;
         const aligned = greetings.slice();
-        aligned[activeIdx] = snapshot[0].message;
-        snapshot[0].swipes = aligned;
-        try {
-          // chat.updateMessage is not operator-scoped (owner derived from chatId,
-          // like getMessages); auto-pads swipe_dates. Idempotent: the next read
-          // sees length > 1 and skips. On failure the read still serves derived.
-          await chat.updateMessage(chatId, (messages[0] as ChatMessageDTO).id, { swipes: aligned, swipe_id: activeIdx });
-        } catch (persistErr) {
-          log.warn('initial-message swipes persist failed (read serves derived):', persistErr instanceof Error ? persistErr.message : String(persistErr));
+        aligned[activeIdx] = first.message;
+        const changed = activeIdx !== first.swipe_id || aligned.length !== first.swipes.length
+          || aligned.some((g, i) => g !== first.swipes[i]);
+        first.swipes = aligned;
+        first.swipe_id = activeIdx;
+        // updateMessage is not operator-scoped (owner derived from chatId).
+        // On failure the read still serves the derived set.
+        if (changed) {
+          await chat.updateMessage(chatId, (messages[0] as ChatMessageDTO).id, { swipes: aligned, swipe_id: activeIdx })
+            .catch((e: unknown) => log.warn('initial-message swipes persist failed (read serves derived):', e instanceof Error ? e.message : String(e)));
         }
       }
     } catch (err) {

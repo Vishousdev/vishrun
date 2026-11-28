@@ -1,6 +1,7 @@
 import type { LlmMessageDTO } from 'lumiverse-spindle-types';
 import { api } from './common';
 import { stMacros } from './st-macros';
+import { cachedCard } from './card-cache';
 import { needsSt, stDecisions, type StEntry } from '../core/st-lorebook';
 
 // SillyTavern prompt behaviour Lumiverse lacks: the card's Character's Note
@@ -14,15 +15,7 @@ interface CardLike {
   extensions?: { depth_prompt?: unknown };
 }
 
-// Cards can be several MB; read once per 30s instead of every generation.
-const cards = new Map<string, { at: number; card: CardLike | null }>();
-async function cardOf(characterId: string, userId?: string): Promise<CardLike | null> {
-  const hit = cards.get(characterId);
-  if (hit && Date.now() - hit.at < 30_000) return hit.card;
-  const card = (await api.characters.get(characterId, userId).catch(() => null)) as CardLike | null;
-  cards.set(characterId, { at: Date.now(), card });
-  return card;
-}
+const cardOf = (characterId: string, userId?: string) => cachedCard(characterId, userId) as Promise<CardLike | null>;
 
 export function depthPromptOf(card: CardLike | null): DepthPrompt | null {
   const d = card?.extensions?.depth_prompt as { prompt?: unknown; depth?: unknown; role?: unknown } | undefined;

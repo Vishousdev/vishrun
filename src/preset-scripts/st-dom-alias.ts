@@ -6,6 +6,8 @@
 
 const ROW_SELECTOR = '[data-message-id][data-message-index]';
 const TEXT_SELECTORS = ['[class*="_prose_"]', '[class*="_content_"]'];
+// ST's .mes_block holds a message's name and text: here, the bubble.
+const BLOCK_SELECTOR = '[class*="_bubble_"]';
 const MARK = 'data-vishrun-st-alias';
 const PRE_MARK = 'data-vishrun-st-pre';
 /** Bumped on a row whenever its text is re-rendered with new fenced blocks. */
@@ -57,6 +59,9 @@ export function applyStAlias(doc: Document = document): Element[] {
       if (text) break;
     }
     for (const el of row.querySelectorAll('.mes_text')) if (el !== text) el.classList.remove('mes_text');
+    const block = text?.closest(BLOCK_SELECTOR) ?? null;
+    for (const el of row.querySelectorAll('.mes_block')) if (el !== block) el.classList.remove('mes_block');
+    if (block && !block.classList.contains('mes_block')) block.classList.add('mes_block');
     if (text) {
       if (!text.classList.contains('mes_text')) text.classList.add('mes_text');
       // Lumiverse applies display regexes after the first render, so new
@@ -74,7 +79,7 @@ export function clearStAlias(doc: Document = document): void {
     row.removeAttribute('mesid');
     row.removeAttribute(RENDER_MARK);
   }
-  for (const el of doc.querySelectorAll('.mes_text')) el.classList.remove('mes_text');
+  for (const el of doc.querySelectorAll('.mes_text, .mes_block')) el.classList.remove('mes_text', 'mes_block');
   for (const pre of doc.querySelectorAll(`pre[${PRE_MARK}]`)) pre.replaceWith(...pre.childNodes);
 }
 

@@ -70,3 +70,13 @@ test('st alias: a re-render with new fenced blocks marks the row, a stable one d
   applyStAlias(doc);
   expect(row.getAttribute(RENDER_MARK)).toBe(first);
 });
+
+test('st alias: the bubble around the text is .mes_block, and clear removes it', () => {
+  const doc = document.implementation.createHTMLDocument('');
+  doc.body.innerHTML = `<div><div data-message-id="a" data-message-index="0"><div class="_card_x"><div class="_bubble_x"><div class="_content_x"><div class="_prose_x">hi</div></div></div></div></div></div>`;
+  applyStAlias(doc);
+  expect(doc.querySelector('.mes[mesid="0"] .mes_text')?.closest('.mes_block')?.className).toContain('_bubble_x');
+  clearStAlias(doc);
+  expect(doc.querySelectorAll('.mes_block').length).toBe(0);
+  expect(doc.querySelectorAll('._bubble_x').length).toBe(1);
+});

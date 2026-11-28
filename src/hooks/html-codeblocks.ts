@@ -10,6 +10,9 @@ import { resolveMacrosBatch } from '../core/macro-resolver';
 const ROW = '[data-message-id]';
 const CODEBLOCK = '[class*="_codeBlock_"]';
 const WRAP_ATTR = 'data-vishrun-codeblock';
+// Lumiverse patches message HTML by reusing nodes of the same tag, so a div
+// wrapper could be taken over as its own block. A custom tag never is.
+const WRAP_TAG = 'vishrun-codeblock';
 const SOURCE_ATTR = 'data-vishrun-codeblock-source';
 
 // Same test JS-Slash-Runner uses to call code "frontend".
@@ -55,7 +58,8 @@ export function installHtmlCodeblocks(ctx: SpindleFrontendContext): () => void {
       const messageId = row.getAttribute('data-message-id') ?? '';
       const iframe = await buildWidgetIframe(html, 'html code block', `codeblock-${index}`, messageId, ctx);
       if (!block.isConnected || frames.has(block)) { destroyWidgetIframe(iframe, 'codeblock-stale'); return; }
-      const wrap = document.createElement('div');
+      const wrap = document.createElement(WRAP_TAG);
+      wrap.style.display = 'block';
       wrap.setAttribute(WRAP_ATTR, '');
       wrap.appendChild(iframe);
       block.before(wrap);
@@ -71,7 +75,8 @@ export function installHtmlCodeblocks(ctx: SpindleFrontendContext): () => void {
 
   const scan = () => {
     timer = null;
-    for (const [block] of frames) if (!block.isConnected) restore(block);
+    // Rebuild when a host re-render dropped the block or the wrapper.
+    for (const [block, { wrap }] of frames) if (!block.isConnected || !wrap.isConnected) restore(block);
     for (const wrap of document.querySelectorAll(`[${WRAP_ATTR}]`)) {
       const next = wrap.nextElementSibling as HTMLElement | null;
       if (!next || !frames.has(next)) wrap.remove();

@@ -4,8 +4,12 @@
 
 const norm = (s: unknown) => String(s ?? '').replace(/\r\n?/g, '\n').trim();
 
+// SillyTavern drops an empty first_mes when the card has alternates, so the
+// first alternate is swipe 0.
 export function cardGreetings(card: { firstMes: string | null; alternateGreetings: string[] } | null): string[] {
-  return card ? [card.firstMes ?? '', ...card.alternateGreetings] : [];
+  if (!card) return [];
+  const all = [card.firstMes ?? '', ...card.alternateGreetings];
+  return all.length > 1 && !all[0] ? all.slice(1) : all;
 }
 
 // Index of the greeting shown, or -1 when the text matches none (edited).

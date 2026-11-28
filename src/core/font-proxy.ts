@@ -45,7 +45,8 @@ function absolute(url: string, base: string): string | null {
 }
 
 const descriptor = (body: string, name: string) =>
-  new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`, 'i').exec(body)?.[1].trim();
+  // url(...) may hold a ';' (data: URLs).
+  new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*((?:url\\([^)]*\\)|[^;])+)`, 'i').exec(body)?.[1].trim();
 
 // woff2 first, then any other format the browser accepts.
 function fontSource(src: string, base: string): string | null {
@@ -59,14 +60,15 @@ function fontSource(src: string, base: string): string | null {
   return (urls.find((u) => u.woff2) ?? urls[0])?.url ?? null;
 }
 
-export function parseFontFaces(css: string, base: string): VishrunFontEntry[] {
+// remoteOnly: frames load fonts through the proxy, which only fetches http(s).
+export function parseFontFaces(css: string, base: string, remoteOnly = true): VishrunFontEntry[] {
   const out: VishrunFontEntry[] = [];
   for (const m of css.matchAll(FONT_FACE_RE)) {
     const body = m[1];
     const family = descriptor(body, 'font-family')?.replace(/^['"]|['"]$/g, '').trim();
     const src = descriptor(body, 'src');
     const url = src ? fontSource(src, base) : null;
-    if (!family || !url || !/^https?:/i.test(url)) continue;
+    if (!family || !url || (remoteOnly && !/^https?:/i.test(url))) continue;
     const entry: VishrunFontEntry = { family, url };
     const weight = descriptor(body, 'font-weight');
     const style = descriptor(body, 'font-style');
@@ -132,7 +134,25 @@ const external = (u: string) => (/^https?:\/\//i.test(u) ? u : null);
 
 const isStylesheetLink = (tag: string) => /\bstylesheet\b/i.test(attr(tag, 'rel') ?? '');
 
-export async function transformHtmlForStylesheets(html: string, fetchText: TextFetch): Promise<string> {
+// @font-face rules with remote files in a widget's own <style> blocks: the
+// sandbox image proxy refuses fonts, so they go through the font proxy too.
+// Blocks inside <script> are template text and stay as they are.
+const SCRIPT_RE = /<script\b[\s\S]*?<\/script>/gi;
+const remoteFonts = (css: string) => parseFontFaces(css, 'about:blank');
+
+export function moveFontFaces(html: string): string {
+  if (!/@font-face/i.test(html)) return html;
+  const scripts = [...html.matchAll(SCRIPT_RE)].map((m) => [m.index!, m.index! + m[0].length]);
+  return html.replace(STYLE_BLOCK_RE, (block: string, _css: string, at: number) => {
+    if (scripts.some(([a, b]) => at > a && at < b)) return block;
+    const fonts = remoteFonts(block);
+    if (!fonts.length) return block;
+    return fontScript(fonts) + block.replace(FONT_FACE_RE, (rule) => (remoteFonts(rule).length ? '' : rule));
+  });
+}
+
+export async function transformHtmlForStylesheets(source: string, fetchText: TextFetch): Promise<string> {
+  const html = moveFontFaces(source);
   if (!/<link\b|@import/i.test(html)) return html;
   const load = (url: string) =>
     fetchSheet(url, fetchText).catch((err) => {

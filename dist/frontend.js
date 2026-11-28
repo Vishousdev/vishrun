@@ -669,6 +669,23 @@ function expand(html, script, allScripts, processing, depth) {
   return out;
 }
 
+// src/core/greetings.ts
+var norm = (s) => String(s ?? "").replace(/\r\n?/g, `
+`).trim();
+function cardGreetings(card) {
+  if (!card)
+    return [];
+  const all = [card.firstMes ?? "", ...card.alternateGreetings];
+  return all.length > 1 && !all[0] ? all.slice(1) : all;
+}
+function greetingIndex(content, greetings) {
+  const shown = norm(content);
+  return greetings.findIndex((g) => norm(g) === shown);
+}
+function greetingSwipes(index, isUser, content, greetings) {
+  return index === 0 && !isUser && greetings.length > 1 ? { swipe_id: greetingIndex(content, greetings), swipes: [...greetings] } : { swipe_id: 0, swipes: [content] };
+}
+
 // src/core/dispatch-slash.ts
 function isDispatchSlashResponse(p, requestId) {
   if (!p || typeof p !== "object")
@@ -1470,7 +1487,7 @@ function absolute(url, base) {
     return null;
   }
 }
-var descriptor = (body, name) => new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`, "i").exec(body)?.[1].trim();
+var descriptor = (body, name) => new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*((?:url\\([^)]*\\)|[^;])+)`, "i").exec(body)?.[1].trim();
 function fontSource(src, base) {
   const urls = [];
   for (const part of src.split(/,(?![^()]*\))/)) {
@@ -1483,14 +1500,14 @@ function fontSource(src, base) {
   }
   return (urls.find((u) => u.woff2) ?? urls[0])?.url ?? null;
 }
-function parseFontFaces(css, base) {
+function parseFontFaces(css, base, remoteOnly = true) {
   const out = [];
   for (const m of css.matchAll(FONT_FACE_RE)) {
     const body = m[1];
     const family = descriptor(body, "font-family")?.replace(/^['"]|['"]$/g, "").trim();
     const src = descriptor(body, "src");
     const url = src ? fontSource(src, base) : null;
-    if (!family || !url || !/^https?:/i.test(url))
+    if (!family || !url || remoteOnly && !/^https?:/i.test(url))
       continue;
     const entry = { family, url };
     const weight = descriptor(body, "font-weight");
@@ -1542,7 +1559,23 @@ var fontScript = (fonts) => fonts.length ? `<script type="application/vishrun-fo
 var inlined = (sheet) => fontScript(sheet.fonts) + (sheet.css.trim() ? `<style>${sheet.css}</style>` : "");
 var external = (u) => /^https?:\/\//i.test(u) ? u : null;
 var isStylesheetLink = (tag) => /\bstylesheet\b/i.test(attr(tag, "rel") ?? "");
-async function transformHtmlForStylesheets(html, fetchText) {
+var SCRIPT_RE = /<script\b[\s\S]*?<\/script>/gi;
+var remoteFonts = (css) => parseFontFaces(css, "about:blank");
+function moveFontFaces(html) {
+  if (!/@font-face/i.test(html))
+    return html;
+  const scripts = [...html.matchAll(SCRIPT_RE)].map((m) => [m.index, m.index + m[0].length]);
+  return html.replace(STYLE_BLOCK_RE, (block, _css, at) => {
+    if (scripts.some(([a, b]) => at > a && at < b))
+      return block;
+    const fonts = remoteFonts(block);
+    if (!fonts.length)
+      return block;
+    return fontScript(fonts) + block.replace(FONT_FACE_RE, (rule) => remoteFonts(rule).length ? "" : rule);
+  });
+}
+async function transformHtmlForStylesheets(source, fetchText) {
+  const html = moveFontFaces(source);
   if (!/<link\b|@import/i.test(html))
     return html;
   const load = (url) => fetchSheet(url, fetchText).catch((err) => {
@@ -1901,6 +1934,7 @@ var zod_3_25_76_v4_min_js_default = "(()=>{var as=Object.defineProperty;var us=(
 // src/preset-scripts/st-dom-alias.ts
 var ROW_SELECTOR = "[data-message-id][data-message-index]";
 var TEXT_SELECTORS = ['[class*="_prose_"]', '[class*="_content_"]'];
+var BLOCK_SELECTOR = '[class*="_bubble_"]';
 var MARK = "data-vishrun-st-alias";
 var PRE_MARK = "data-vishrun-st-pre";
 var RENDER_MARK = "data-vishrun-st-render";
@@ -1950,6 +1984,12 @@ function applyStAlias(doc = document) {
     for (const el of row.querySelectorAll(".mes_text"))
       if (el !== text)
         el.classList.remove("mes_text");
+    const block = text?.closest(BLOCK_SELECTOR) ?? null;
+    for (const el of row.querySelectorAll(".mes_block"))
+      if (el !== block)
+        el.classList.remove("mes_block");
+    if (block && !block.classList.contains("mes_block"))
+      block.classList.add("mes_block");
     if (text) {
       if (!text.classList.contains("mes_text"))
         text.classList.add("mes_text");
@@ -1969,8 +2009,8 @@ function clearStAlias(doc = document) {
     row.removeAttribute("mesid");
     row.removeAttribute(RENDER_MARK);
   }
-  for (const el of doc.querySelectorAll(".mes_text"))
-    el.classList.remove("mes_text");
+  for (const el of doc.querySelectorAll(".mes_text, .mes_block"))
+    el.classList.remove("mes_text", "mes_block");
   for (const pre of doc.querySelectorAll(`pre[${PRE_MARK}]`))
     pre.replaceWith(...pre.childNodes);
 }
@@ -2221,20 +2261,6 @@ function applyMvuSchema(data) {
   }
 }
 
-// src/core/greetings.ts
-var norm = (s) => String(s ?? "").replace(/\r\n?/g, `
-`).trim();
-function cardGreetings(card) {
-  return card ? [card.firstMes ?? "", ...card.alternateGreetings] : [];
-}
-function greetingIndex(content, greetings) {
-  const shown = norm(content);
-  return greetings.findIndex((g) => norm(g) === shown);
-}
-function greetingSwipes(index, isUser, content, greetings) {
-  return index === 0 && !isUser && greetings.length > 1 ? { swipe_id: greetingIndex(content, greetings), swipes: [...greetings] } : { swipe_id: 0, swipes: [content] };
-}
-
 // src/preset-scripts/worldbook-format.ts
 var uidOf = (e) => e.st_uid ?? e.id;
 function hostIdOf(uid, entries) {
@@ -2477,7 +2503,7 @@ function hasMacros(html) {
 }
 
 // src/core/takeover-policy.ts
-var SCRIPT_RE = /<script\b/i;
+var SCRIPT_RE2 = /<script\b/i;
 var EVENT_HANDLER_RE = /\son[a-z]+\s*=/i;
 var JS_URL_RE = /javascript\s*:/i;
 var BLOCKED_TAG_RE = /<(?:iframe|frame|object|embed|meta|base|link|form|math)\b|\ssrcdoc\s*=/i;
@@ -2486,7 +2512,7 @@ var DOLLAR_ZERO_ALL_RE = /\$0(?!\d)/g;
 var HTML_FENCE_RE = /```(?:html)?[ \t]*\r?\n\s*</i;
 function takeoverReasons(replaceString) {
   const r = [];
-  if (SCRIPT_RE.test(replaceString))
+  if (SCRIPT_RE2.test(replaceString))
     r.push("script");
   if (EVENT_HANDLER_RE.test(replaceString))
     r.push("event-handler");
@@ -4860,16 +4886,10 @@ function buildHeadInjection(iframeCtx) {
     currentMessageId: iframeCtx.messageId,
     chatId: iframeCtx.chatId,
     messagesSnapshot: iframeCtx.messagesSnapshot,
-    greetings: cardGreetings2()
+    greetings: cardGreetings(getActiveCard())
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
   return viewportVarShim() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + triggerSlashShim() + eventEmitShim() + externalImageProxyHelper() + cssUrlProxyShim() + audioProxyHelper() + fetchBridgeShim() + fontLoaderShim() + jquery + lodash + thHelpers + mvu;
-}
-function cardGreetings2() {
-  const card = getActiveCard();
-  if (!card)
-    return [];
-  return [card.firstMes ?? "", ...card.alternateGreetings];
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -5289,15 +5309,8 @@ async function handleSetChatMessages(iframe, payload, ctx) {
         hasCard: !!card
       }));
     }
-    let targetContent;
-    let targetGreetingIndex = -1;
-    if (swipeId === 0) {
-      targetContent = card.firstMes ?? undefined;
-      targetGreetingIndex = 0;
-    } else if (swipeId >= 1) {
-      targetContent = card.alternateGreetings[swipeId - 1];
-      targetGreetingIndex = swipeId;
-    }
+    const targetContent = cardGreetings(card)[swipeId];
+    const targetGreetingIndex = swipeId;
     if (typeof targetContent !== "string" || !targetContent) {
       console.warn(`[vishrun] setChatMessages: out-of-range swipe_id=${swipeId} ` + `(have first_mes=${card.firstMes ? "yes" : "no"}, ` + `alternate_greetings.length=${card.alternateGreetings.length}), aborting entry`);
       continue;
@@ -5358,6 +5371,36 @@ function inlineBlock(html) {
 ${s.textContent}
 }`;
   return t.content;
+}
+
+// src/render/island-fonts.ts
+var seen = new WeakMap;
+var added = new Set;
+function registerIslandFonts(root, fonts = document.fonts) {
+  if (!fonts || typeof FontFace === "undefined")
+    return;
+  for (const style of deepQuerySelectorAll(root, "style")) {
+    const css = style.textContent ?? "";
+    if (!css.includes("@font-face") || seen.get(style) === css)
+      continue;
+    if (!(style.getRootNode() instanceof ShadowRoot))
+      continue;
+    seen.set(style, css);
+    for (const f of parseFontFaces(css, "about:blank", false)) {
+      const key = [f.family, f.url, f.weight, f.style, f.range].join("\x00");
+      if (added.has(key))
+        continue;
+      added.add(key);
+      try {
+        fonts.add(new FontFace(f.family, `url("${f.url}")`, {
+          ...f.weight ? { weight: f.weight } : {},
+          ...f.style ? { style: f.style } : {},
+          ...f.display ? { display: f.display } : {},
+          ...f.range ? { unicodeRange: f.range } : {}
+        }));
+      } catch {}
+    }
+  }
 }
 
 // src/hooks/tag-interceptor.ts
@@ -5820,6 +5863,7 @@ async function processNodeNow(root, scripts, ctx) {
     return 0;
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
+  registerIslandFonts(root);
   try {
     await refreshStrippedTagCaptures(target, scripts, messageId, ctx);
     await reconcileNestedTagCaptures(scripts, messageId, ctx);
@@ -6987,6 +7031,7 @@ function requestRegexTakeover(ctx, characterId, scripts) {
 var ROW = "[data-message-id]";
 var CODEBLOCK = '[class*="_codeBlock_"]';
 var WRAP_ATTR = "data-vishrun-codeblock";
+var WRAP_TAG = "vishrun-codeblock";
 var SOURCE_ATTR = "data-vishrun-codeblock-source";
 function isFrontendCode(text) {
   return /html>|<head>|<body/i.test(text);
@@ -7031,7 +7076,8 @@ function installHtmlCodeblocks(ctx) {
         destroyWidgetIframe(iframe, "codeblock-stale");
         return;
       }
-      const wrap = document.createElement("div");
+      const wrap = document.createElement(WRAP_TAG);
+      wrap.style.display = "block";
       wrap.setAttribute(WRAP_ATTR, "");
       wrap.appendChild(iframe);
       block.before(wrap);
@@ -7046,8 +7092,8 @@ function installHtmlCodeblocks(ctx) {
   };
   const scan = () => {
     timer = null;
-    for (const [block] of frames)
-      if (!block.isConnected)
+    for (const [block, { wrap }] of frames)
+      if (!block.isConnected || !wrap.isConnected)
         restore(block);
     for (const wrap of document.querySelectorAll(`[${WRAP_ATTR}]`)) {
       const next = wrap.nextElementSibling;

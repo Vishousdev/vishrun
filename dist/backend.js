@@ -1104,6 +1104,34 @@ function installDispatchSlashHandler() {
   });
 }
 
+// src/core/greetings.ts
+var norm = (s) => String(s ?? "").replace(/\r\n?/g, `
+`).trim();
+function cardGreetings(card) {
+  if (!card)
+    return [];
+  const all = [card.firstMes ?? "", ...card.alternateGreetings];
+  return all.length > 1 && !all[0] ? all.slice(1) : all;
+}
+function greetingIndex(content, greetings) {
+  const shown = norm(content);
+  return greetings.findIndex((g) => norm(g) === shown);
+}
+
+// src/backend/card-cache.ts
+var caches = new WeakMap;
+function cachedCard(characterId, userId, characters = api.characters) {
+  let cache = caches.get(characters);
+  if (!cache)
+    caches.set(characters, cache = new Map);
+  const hit = cache.get(characterId);
+  if (hit && Date.now() - hit.at < 30000)
+    return hit.card;
+  const card = characters.get(characterId, userId).then((c) => c ?? null, () => null);
+  cache.set(characterId, { at: Date.now(), card });
+  return card;
+}
+
 // node_modules/js-yaml/dist/js-yaml.mjs
 /*! js-yaml 4.1.0 https://github.com/nodeca/js-yaml @license MIT */
 function isNothing(subject) {
@@ -5489,17 +5517,14 @@ async function fetchChatCharacter(messages, chatId, userId, chats, characters) {
   }
   if (!charId)
     return null;
-  return await characters.get(charId, userId) ?? null;
+  return cachedCard(charId, userId, characters);
 }
 function greetingsOf(card) {
   if (!card)
     return [];
   const first = typeof card.first_mes === "string" ? card.first_mes : "";
   const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
-  return [first, ...alt];
-}
-async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
-  return greetingsOf(await fetchChatCharacter(messages, chatId, userId, chats, characters));
+  return cardGreetings({ firstMes: first, alternateGreetings: alt });
 }
 async function initvarSeedFor(card, userId, worldBooks = api.world_books) {
   if (!card)
@@ -5527,18 +5552,23 @@ async function initvarSeedFor(card, userId, worldBooks = api.world_books) {
 async function handleGetMessagesSnapshot(chatId, userId, chat = api.chat, chats = api.chats, characters = api.characters) {
   const messages = await chat.getMessages(chatId);
   const snapshot = messages.map((m) => shapeSnapshotMessage(m));
-  if (snapshot.length > 0 && snapshot[0].role !== "user" && snapshot[0].swipes.length <= 1) {
+  const first = snapshot[0];
+  if (first && first.role !== "user") {
     try {
-      const greetings = await fetchCharacterGreetings(messages, chatId, userId, chats, characters);
-      if (greetings.length > 1) {
-        const activeIdx = snapshot[0].swipe_id >= 0 && snapshot[0].swipe_id < greetings.length ? snapshot[0].swipe_id : 0;
+      const card = await fetchChatCharacter(messages, chatId, userId, chats, characters);
+      const greetings = greetingsOf(card);
+      const known = card ? [card.first_mes ?? "", ...card.alternate_greetings ?? []] : [];
+      const derived = first.swipes.length <= 1 || first.swipes.every((s) => greetingIndex(s, known) >= 0);
+      if (greetings.length > 1 && derived) {
+        const shown = greetingIndex(first.message, greetings);
+        const activeIdx = shown >= 0 ? shown : first.swipe_id >= 0 && first.swipe_id < greetings.length ? first.swipe_id : 0;
         const aligned = greetings.slice();
-        aligned[activeIdx] = snapshot[0].message;
-        snapshot[0].swipes = aligned;
-        try {
-          await chat.updateMessage(chatId, messages[0].id, { swipes: aligned, swipe_id: activeIdx });
-        } catch (persistErr) {
-          log.warn("initial-message swipes persist failed (read serves derived):", persistErr instanceof Error ? persistErr.message : String(persistErr));
+        aligned[activeIdx] = first.message;
+        const changed = activeIdx !== first.swipe_id || aligned.length !== first.swipes.length || aligned.some((g, i) => g !== first.swipes[i]);
+        first.swipes = aligned;
+        first.swipe_id = activeIdx;
+        if (changed) {
+          await chat.updateMessage(chatId, messages[0].id, { swipes: aligned, swipe_id: activeIdx }).catch((e) => log.warn("initial-message swipes persist failed (read serves derived):", e instanceof Error ? e.message : String(e)));
         }
       }
     } catch (err) {
@@ -6025,15 +6055,7 @@ function stDecisions(entries, messages, sources, globalDepth) {
 }
 
 // src/backend/st-prompt.ts
-var cards = new Map;
-async function cardOf(characterId, userId) {
-  const hit = cards.get(characterId);
-  if (hit && Date.now() - hit.at < 30000)
-    return hit.card;
-  const card = await api.characters.get(characterId, userId).catch(() => null);
-  cards.set(characterId, { at: Date.now(), card });
-  return card;
-}
+var cardOf = (characterId, userId) => cachedCard(characterId, userId);
 function depthPromptOf(card) {
   const d = card?.extensions?.depth_prompt;
   if (typeof d?.prompt !== "string" || !d.prompt.trim())

@@ -13,6 +13,7 @@ import {
   setWidgetSource,
 } from './widget-iframe';
 import { inlineBlock } from './inline-block';
+import { registerIslandFonts } from './island-fonts';
 import { getCapturesForMessage, syncStrippedTagCaptures } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
@@ -181,6 +182,7 @@ async function processNodeNow(
   // an iframe but didn't unmount the host's sandboxFrames record.
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
+  registerIslandFonts(root);
 
   // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
   // widget HTML before any widget is built. Always returns a map; missing
