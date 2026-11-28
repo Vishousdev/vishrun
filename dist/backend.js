@@ -1118,6 +1118,20 @@ function greetingIndex(content, greetings) {
   return greetings.findIndex((g) => norm(g) === shown);
 }
 
+// src/backend/card-cache.ts
+var caches = new WeakMap;
+function cachedCard(characterId, userId, characters = api.characters) {
+  let cache = caches.get(characters);
+  if (!cache)
+    caches.set(characters, cache = new Map);
+  const hit = cache.get(characterId);
+  if (hit && Date.now() - hit.at < 30000)
+    return hit.card;
+  const card = characters.get(characterId, userId).then((c) => c ?? null, () => null);
+  cache.set(characterId, { at: Date.now(), card });
+  return card;
+}
+
 // node_modules/js-yaml/dist/js-yaml.mjs
 /*! js-yaml 4.1.0 https://github.com/nodeca/js-yaml @license MIT */
 function isNothing(subject) {
@@ -5503,7 +5517,7 @@ async function fetchChatCharacter(messages, chatId, userId, chats, characters) {
   }
   if (!charId)
     return null;
-  return await characters.get(charId, userId) ?? null;
+  return cachedCard(charId, userId, characters);
 }
 function greetingsOf(card) {
   if (!card)
@@ -6041,15 +6055,7 @@ function stDecisions(entries, messages, sources, globalDepth) {
 }
 
 // src/backend/st-prompt.ts
-var cards = new Map;
-async function cardOf(characterId, userId) {
-  const hit = cards.get(characterId);
-  if (hit && Date.now() - hit.at < 30000)
-    return hit.card;
-  const card = await api.characters.get(characterId, userId).catch(() => null);
-  cards.set(characterId, { at: Date.now(), card });
-  return card;
-}
+var cardOf = (characterId, userId) => cachedCard(characterId, userId);
 function depthPromptOf(card) {
   const d = card?.extensions?.depth_prompt;
   if (typeof d?.prompt !== "string" || !d.prompt.trim())

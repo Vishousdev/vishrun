@@ -1487,7 +1487,7 @@ function absolute(url, base) {
     return null;
   }
 }
-var descriptor = (body, name) => new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*([^;]+)`, "i").exec(body)?.[1].trim();
+var descriptor = (body, name) => new RegExp(`(?:^|;|\\s)${name}\\s*:\\s*((?:url\\([^)]*\\)|[^;])+)`, "i").exec(body)?.[1].trim();
 function fontSource(src, base) {
   const urls = [];
   for (const part of src.split(/,(?![^()]*\))/)) {
@@ -1500,14 +1500,14 @@ function fontSource(src, base) {
   }
   return (urls.find((u) => u.woff2) ?? urls[0])?.url ?? null;
 }
-function parseFontFaces(css, base) {
+function parseFontFaces(css, base, remoteOnly = true) {
   const out = [];
   for (const m of css.matchAll(FONT_FACE_RE)) {
     const body = m[1];
     const family = descriptor(body, "font-family")?.replace(/^['"]|['"]$/g, "").trim();
     const src = descriptor(body, "src");
     const url = src ? fontSource(src, base) : null;
-    if (!family || !url || !/^https?:/i.test(url))
+    if (!family || !url || remoteOnly && !/^https?:/i.test(url))
       continue;
     const entry = { family, url };
     const weight = descriptor(body, "font-weight");
@@ -5373,6 +5373,36 @@ ${s.textContent}
   return t.content;
 }
 
+// src/render/island-fonts.ts
+var seen = new WeakMap;
+var added = new Set;
+function registerIslandFonts(root, fonts = document.fonts) {
+  if (!fonts || typeof FontFace === "undefined")
+    return;
+  for (const style of deepQuerySelectorAll(root, "style")) {
+    const css = style.textContent ?? "";
+    if (!css.includes("@font-face") || seen.get(style) === css)
+      continue;
+    if (!(style.getRootNode() instanceof ShadowRoot))
+      continue;
+    seen.set(style, css);
+    for (const f of parseFontFaces(css, "about:blank", false)) {
+      const key = [f.family, f.url, f.weight, f.style, f.range].join("\x00");
+      if (added.has(key))
+        continue;
+      added.add(key);
+      try {
+        fonts.add(new FontFace(f.family, `url("${f.url}")`, {
+          ...f.weight ? { weight: f.weight } : {},
+          ...f.style ? { style: f.style } : {},
+          ...f.display ? { display: f.display } : {},
+          ...f.range ? { unicodeRange: f.range } : {}
+        }));
+      } catch {}
+    }
+  }
+}
+
 // src/hooks/tag-interceptor.ts
 var capturesByMessage = new Map;
 function getCapturesForMessage(messageId) {
@@ -5833,6 +5863,7 @@ async function processNodeNow(root, scripts, ctx) {
     return 0;
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
+  registerIslandFonts(root);
   try {
     await refreshStrippedTagCaptures(target, scripts, messageId, ctx);
     await reconcileNestedTagCaptures(scripts, messageId, ctx);
